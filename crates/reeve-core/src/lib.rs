@@ -11,6 +11,7 @@ pub mod distro;
 pub mod error;
 pub mod ledger;
 pub mod llm;
+pub mod memory;
 pub mod policy;
 pub mod receipts;
 pub mod report;

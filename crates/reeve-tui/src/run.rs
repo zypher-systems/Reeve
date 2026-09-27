@@ -31,6 +31,7 @@ use reeve_core::agent::{Agent, AgentEvent, ApprovalRequest, Approver, Decision};
 use reeve_core::config::{self, Config};
 use reeve_core::ledger::{self, Totals};
 use reeve_core::llm::{HttpProvider, ModelInfo, Provider};
+use reeve_core::memory::{Layer, Memory, NoteStatus};
 use reeve_core::policy::Tier;
 use reeve_core::receipts::Receipt;
 use reeve_core::receipts::ReceiptBook;
@@ -53,6 +54,10 @@ enum Work {
     /// Rebuild the agent from this config (new key, connection, or model).
     Connect(Box<Config>),
     NewSession,
+    /// Re-run the machine survey.
+    Survey,
+    /// Reflect on the current session now.
+    Reflect,
     /// Undo a receipt (may need sudo, so it runs on the worker).
     Undo {
         seq: u64,
@@ -89,6 +94,8 @@ enum UiMsg {
     Approval(Box<ApprovalRequest>, tokio::sync::oneshot::Sender<Decision>),
     /// sudo needs the password.
     Password(String, tokio::sync::oneshot::Sender<Option<String>>),
+    /// Memory changed on disk (survey, reflection, a tool).
+    MemoryChanged,
     /// An undo finished.
     Undone {
         seq: u64,
@@ -151,6 +158,7 @@ struct App {
     pw_used: Option<Instant>,
     /// The approved action a password request belongs to.
     last_action: String,
+    memory: Memory,
 }
 
 /// Run the TUI until the user quits.
@@ -191,6 +199,7 @@ pub fn run(cfg: Config, home: PathBuf) -> io::Result<()> {
     );
     spawn_unit_watch(ui_tx);
 
+    let home_for_memory = home.clone();
     let mut app = App {
         cfg,
         home,
@@ -204,7 +213,9 @@ pub fn run(cfg: Config, home: PathBuf) -> io::Result<()> {
         pw_cache: None,
         pw_used: None,
         last_action: String::new(),
+        memory: Memory::new(&home_for_memory),
     };
+    view.memory = app.memory.counts();
     app.connect_quietly(&mut view);
 
     let mouse = app.cfg.ui.mouse;
@@ -221,6 +232,14 @@ fn setup(mouse: bool) -> io::Result<Term> {
         restore(true);
         hook(info);
     }));
+    enter(mouse)?;
+    let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    term.clear()?;
+    Ok(term)
+}
+
+/// Take the terminal: raw mode, alternate screen, paste, mouse.
+fn enter(mouse: bool) -> io::Result<()> {
     enable_raw_mode()?;
     let mut out = io::stdout();
     out.execute(EnterAlternateScreen)?;
@@ -228,9 +247,7 @@ fn setup(mouse: bool) -> io::Result<Term> {
     if mouse {
         let _ = out.execute(EnableMouseCapture);
     }
-    let mut term = Terminal::new(CrosstermBackend::new(out))?;
-    term.clear()?;
-    Ok(term)
+    Ok(())
 }
 
 fn restore(mouse: bool) {
@@ -290,6 +307,26 @@ fn event_loop(
                 }
             }
         }
+        if let Some((layer, id)) = view.edit_request.take() {
+            let path = app.memory.path(layer, &id);
+            let before = std::fs::read_to_string(&path).ok();
+            restore(app.cfg.ui.mouse);
+            let editor = std::env::var("VISUAL")
+                .or_else(|_| std::env::var("EDITOR"))
+                .unwrap_or_else(|_| "nano".into());
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{editor} \"$1\""))
+                .arg("sh")
+                .arg(&path)
+                .status();
+            enter(app.cfg.ui.mouse)?;
+            term.clear()?;
+            match status {
+                Ok(_) => app.edited(view, layer, &id, before),
+                Err(e) => view.push(Speaker::Error, format!("couldn't run {editor}: {e}")),
+            }
+        }
         if view.quit {
             return Ok(());
         }
@@ -300,20 +337,26 @@ impl App {
     fn receive(&mut self, view: &mut View, msg: UiMsg) {
         match msg {
             UiMsg::Agent(ev) => {
+                let mut remembered = false;
                 if let AgentEvent::ToolFinished {
                     receipt: Some(r), ..
                 } = &ev
                 {
                     self.session.clone_from(&r.session);
+                    remembered = r.tool == "memory_write";
                 }
                 let ended = matches!(ev, AgentEvent::TurnDone { .. } | AgentEvent::Error(_));
                 view.apply(ev);
+                if remembered {
+                    self.memory_changed(view);
+                }
                 if ended {
                     // A turn that ended under an open card answers it no.
                     self.reply = None;
                 }
             }
             UiMsg::Password(prompt, reply) => self.password_asked(view, prompt, reply),
+            UiMsg::MemoryChanged => self.memory_changed(view),
             UiMsg::Undone { seq, result } => self.undone(view, seq, result),
             UiMsg::Approval(req, reply) => {
                 self.last_action.clone_from(&req.summary);
@@ -544,6 +587,18 @@ impl App {
                 }));
             }
             "/help" => view.overlays.push(Overlay::Help),
+            "/memory" => view
+                .overlays
+                .push(Overlay::Memory(crate::overlay::MemoryPanel::load(
+                    &self.memory,
+                ))),
+            "/reflect" => {
+                if view.busy {
+                    view.push(Speaker::System, "Stop the running turn first (esc).");
+                } else {
+                    let _ = self.work.send(Work::Reflect);
+                }
+            }
             "/quit" => view.quit = true,
             _ => {}
         }
@@ -634,6 +689,40 @@ impl App {
                     seq,
                     session: self.session.clone(),
                 });
+            }
+            Action::MemoryAccept(layer, id) => {
+                let msg = self.set_note_status(layer, &id, |s| match s {
+                    NoteStatus::Retired => NoteStatus::Retired,
+                    _ => NoteStatus::Active,
+                });
+                self.memory_note(view, msg);
+            }
+            Action::MemoryRetire(layer, id) => {
+                let msg = self.set_note_status(layer, &id, |s| {
+                    if s == NoteStatus::Retired {
+                        NoteStatus::Active
+                    } else {
+                        NoteStatus::Retired
+                    }
+                });
+                self.memory_note(view, msg);
+            }
+            Action::MemoryDelete(layer, id) => {
+                let msg = self
+                    .memory
+                    .delete(layer, &id)
+                    .map(|()| format!("deleted {id}"))
+                    .map_err(|e| e.to_string());
+                self.memory_note(view, msg);
+            }
+            Action::MemoryEdit(layer, id) => view.edit_request = Some((layer, id)),
+            Action::Survey => {
+                let _ = self.work.send(Work::Survey);
+                self.memory_note(view, Ok("surveying the machine (read-only)…".into()));
+            }
+            Action::Reflect => {
+                let _ = self.work.send(Work::Reflect);
+                self.memory_note(view, Ok("reflecting on this session…".into()));
             }
             Action::VerifyReceipts => {
                 let v = ReceiptBook::new(&self.home).verify();
@@ -844,6 +933,78 @@ impl App {
             }));
     }
 
+    fn set_note_status(
+        &self,
+        layer: Layer,
+        id: &str,
+        f: impl FnOnce(NoteStatus) -> NoteStatus,
+    ) -> Result<String, String> {
+        let path = self.memory.path(layer, id);
+        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let mut n = reeve_core::memory::Note::parse(layer, id, &text);
+        n.status = f(n.status);
+        self.memory.put(&mut n, true).map_err(|e| e.to_string())?;
+        Ok(match (n.status, n.rule.is_some()) {
+            (NoteStatus::Active, true) => {
+                format!("{id} is in effect: its rule applies from the next turn")
+            }
+            (NoteStatus::Active, false) => format!("{id} accepted"),
+            (NoteStatus::Retired, _) => format!("{id} retired (x again restores it)"),
+            _ => format!("{id} updated"),
+        })
+    }
+
+    fn memory_note(&self, view: &mut View, msg: Result<String, String>) {
+        view.memory = self.memory.counts();
+        if let Some(Overlay::Memory(p)) = view
+            .overlays
+            .iter_mut()
+            .rev()
+            .find(|o| matches!(o, Overlay::Memory(_)))
+        {
+            p.reload(&self.memory);
+            p.note = Some(msg);
+        }
+    }
+
+    fn memory_changed(&self, view: &mut View) {
+        view.memory = self.memory.counts();
+        if let Some(Overlay::Memory(p)) = view
+            .overlays
+            .iter_mut()
+            .rev()
+            .find(|o| matches!(o, Overlay::Memory(_)))
+        {
+            p.reload(&self.memory);
+        }
+    }
+
+    /// After `$EDITOR`: an edited note becomes the owner's.
+    fn edited(&self, view: &mut View, layer: Layer, id: &str, before: Option<String>) {
+        let path = self.memory.path(layer, id);
+        let after = std::fs::read_to_string(&path).ok();
+        let msg = match (before, after) {
+            (Some(b), Some(a)) if a != b => {
+                let mut n = reeve_core::memory::Note::parse(layer, id, &a);
+                n.source = "user".into();
+                if n.status == NoteStatus::New {
+                    n.status = NoteStatus::Active;
+                }
+                self.memory
+                    .put(&mut n, true)
+                    .map(|_| {
+                        format!(
+                            "saved your edit to {id}; it's yours now (reflection won't rewrite it)"
+                        )
+                    })
+                    .map_err(|e| e.to_string())
+            }
+            (_, None) => Err(format!("{id} is gone")),
+            _ => Ok("no changes".into()),
+        };
+        self.memory_note(view, msg);
+    }
+
     /// An undo came back from the worker.
     fn undone(&mut self, view: &mut View, seq: u64, result: Result<Box<Receipt>, String>) {
         let book = ReceiptBook::new(&self.home);
@@ -957,6 +1118,7 @@ enum AgentWork {
     Send(String),
     Connect(Box<Config>),
     NewSession,
+    Reflect,
 }
 
 fn spawn_worker(
@@ -993,6 +1155,9 @@ fn spawn_worker(
             let cfg = config::load_at(&home).unwrap_or_default();
             let mut tools = ToolCtx::new(home.clone(), reeve_core::agent::secret_env(&cfg));
             tools.askpass = askpass.clone();
+            if cfg.memory.survey && reeve_core::memory::survey::due(&tools.memory) {
+                tokio::spawn(survey(tools.clone(), home.clone(), tx.clone(), true));
+            }
             let (agent_tx, agent_rx) = unbounded_channel::<AgentWork>();
             let agent_task = tokio::spawn(agent_loop(
                 home.clone(),
@@ -1010,6 +1175,12 @@ fn spawn_worker(
                     }
                     Work::NewSession => {
                         let _ = agent_tx.send(AgentWork::NewSession);
+                    }
+                    Work::Survey => {
+                        tokio::spawn(survey(tools.clone(), home.clone(), tx.clone(), false));
+                    }
+                    Work::Reflect => {
+                        let _ = agent_tx.send(AgentWork::Reflect);
                     }
                     Work::Undo { seq, session } => {
                         let (tx, tools, home) = (tx.clone(), tools.clone(), home.clone());
@@ -1078,6 +1249,8 @@ async fn agent_loop(
     askpass: Option<Askpass>,
 ) {
     let mut agent: Option<Agent> = None;
+    let mut auto_reflect = true;
+    let mut caught_up = false;
     let emit_tx = tx.clone();
     let emit = move |e: AgentEvent| {
         let _ = emit_tx.send(UiMsg::Agent(e));
@@ -1096,8 +1269,20 @@ async fn agent_loop(
                 }
                 let _ = tx.send(UiMsg::Totals(ledger::totals(&home, Local::now())));
             }
+            AgentWork::Reflect => match agent.as_mut() {
+                Some(a) => reflect_now(a, &tx).await,
+                None => {
+                    let _ = tx.send(UiMsg::Notice(
+                        Speaker::Error,
+                        "not connected: open /providers".into(),
+                    ));
+                }
+            },
             AgentWork::NewSession => {
                 if let Some(a) = agent.as_mut() {
+                    if auto_reflect && a.has_actions() {
+                        reflect_now(a, &tx).await;
+                    }
                     match a.reset() {
                         Ok(()) => {
                             let _ = tx.send(UiMsg::SessionReset);
@@ -1107,10 +1292,30 @@ async fn agent_loop(
                 }
             }
             AgentWork::Connect(cfg) => {
+                auto_reflect = cfg.memory.auto_reflect;
                 connect(&mut agent, *cfg, &home, &profile, &tx).await;
                 if let Some(a) = agent.as_mut() {
                     a.set_approver(approver.clone());
                     a.tools_mut().askpass = askpass.clone();
+                    // Sessions that ended without reflecting (Reeve was closed).
+                    if auto_reflect && !caught_up {
+                        caught_up = true;
+                        for dir in a.unreflected(2) {
+                            match a.reflect_dir(&dir).await {
+                                Ok(r) if r.facts + r.runbooks + r.preferences > 0 => {
+                                    let _ = tx.send(UiMsg::Notice(
+                                        Speaker::System,
+                                        format!(
+                                            "Learned from an earlier session: {}.",
+                                            r.summary()
+                                        ),
+                                    ));
+                                    let _ = tx.send(UiMsg::MemoryChanged);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1191,4 +1396,63 @@ async fn connect(
             ));
         }
     }
+}
+
+/// Reflect on the agent's current session and say what was learned.
+async fn reflect_now(a: &mut Agent, tx: &Sender<UiMsg>) {
+    let _ = tx.send(UiMsg::Notice(
+        Speaker::System,
+        "Reflecting on this session…".into(),
+    ));
+    match a.reflect().await {
+        Ok(r) => {
+            let _ = tx.send(UiMsg::Notice(
+                Speaker::System,
+                format!("Memory: {}. See /memory.", r.summary()),
+            ));
+            let _ = tx.send(UiMsg::MemoryChanged);
+        }
+        Err(e) => {
+            let _ = tx.send(UiMsg::Notice(
+                Speaker::Error,
+                format!("reflection failed: {e}"),
+            ));
+        }
+    }
+}
+
+/// Run the read-only survey and receipt it.
+async fn survey(tools: ToolCtx, home: PathBuf, tx: Sender<UiMsg>, first: bool) {
+    let os = tools.os.clone();
+    let n = reeve_core::memory::survey::run(&tools, &tools.memory, &os).await;
+    let mut r = reeve_core::receipts::Receipt::draft(
+        "survey",
+        "memory_survey",
+        serde_json::json!({}),
+        Tier::T0,
+    );
+    r.approved_by = "policy".into();
+    r.why = Some("learn the basics of this machine (read-only)".into());
+    r.outcome.summary = format!("{n} facts recorded");
+    if let Ok(sealed) = ReceiptBook::new(&home).append(r) {
+        let _ = tx.send(UiMsg::Agent(AgentEvent::ToolFinished {
+            id: String::new(),
+            status: reeve_core::receipts::Status::Ok,
+            summary: sealed.outcome.summary.clone(),
+            diff: None,
+            receipt: Some(Box::new(sealed)),
+        }));
+    }
+    if first {
+        let _ = tx.send(UiMsg::Notice(
+            Speaker::System,
+            format!("Surveyed this machine: {n} facts in memory (read-only; see /memory)."),
+        ));
+    } else {
+        let _ = tx.send(UiMsg::Notice(
+            Speaker::System,
+            format!("Survey done: {n} facts refreshed."),
+        ));
+    }
+    let _ = tx.send(UiMsg::MemoryChanged);
 }

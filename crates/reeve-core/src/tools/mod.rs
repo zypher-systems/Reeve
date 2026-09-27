@@ -2,6 +2,7 @@
 //! [`prepare`] (parse, assess, preview) → approval → [`execute`] → receipt.
 
 mod fs;
+mod mem;
 mod shell;
 mod sys;
 
@@ -35,11 +36,20 @@ pub struct ToolCtx {
     pub distro: crate::distro::Distro,
     /// Snapper config for `/`, once looked up.
     pub snapper: std::sync::Arc<tokio::sync::OnceCell<Option<String>>>,
+    /// Reeve's memory.
+    pub memory: crate::memory::Memory,
+    /// Rules from the owner's confirmed preferences.
+    pub rules: Vec<crate::memory::Rule>,
+    /// Session writing memories.
+    pub session: String,
+    /// `Fedora 44`, for tagging memories.
+    pub os: String,
 }
 
 impl ToolCtx {
     /// For this machine and user.
     pub fn new(reeve_home: PathBuf, secret_env: Vec<String>) -> Self {
+        let reeve_home_for_memory = reeve_home.clone();
         Self {
             undo: UndoStore::new(&reeve_home),
             paths: PathCtx::current(reeve_home),
@@ -49,6 +59,10 @@ impl ToolCtx {
             exe: std::env::current_exe().unwrap_or_else(|_| "reeve".into()),
             distro: crate::distro::Distro::detect(),
             snapper: Default::default(),
+            memory: crate::memory::Memory::new(&reeve_home_for_memory),
+            rules: Vec::new(),
+            session: String::new(),
+            os: crate::distro::os_label(),
         }
     }
 }
@@ -100,6 +114,9 @@ enum Call {
     Delete(fs::DeleteArgs),
     Shell(shell::ShellArgs),
     Sys(sys::SysCall),
+    MemSearch(mem::SearchArgs),
+    MemRead(mem::ReadArgs),
+    MemWrite(mem::WriteArgs),
 }
 
 #[derive(Deserialize)]
@@ -132,6 +149,11 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
             "fs_move" => Call::Move(serde_json::from_value(args.clone()).map_err(parse)?),
             "fs_delete" => Call::Delete(serde_json::from_value(args.clone()).map_err(parse)?),
             "shell" => Call::Shell(serde_json::from_value(args.clone()).map_err(parse)?),
+            "memory_search" => {
+                Call::MemSearch(serde_json::from_value(args.clone()).map_err(parse)?)
+            }
+            "memory_read" => Call::MemRead(serde_json::from_value(args.clone()).map_err(parse)?),
+            "memory_write" => Call::MemWrite(serde_json::from_value(args.clone()).map_err(parse)?),
             other => return Err(format!("there is no tool named {other}")),
         }
     };
@@ -146,7 +168,30 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
         Call::Delete(a) => fs::plan_delete(ctx, a),
         Call::Shell(a) => shell::plan(ctx, a),
         Call::Sys(c) => sys::plan(ctx, c),
+        Call::MemSearch(a) => (
+            Assessment::new(crate::policy::Tier::T0),
+            format!("search memory for {}", a.query()),
+            None,
+            false,
+            None,
+        ),
+        Call::MemRead(a) => (
+            Assessment::new(crate::policy::Tier::T0),
+            format!("read memory {}", a.id()),
+            None,
+            false,
+            None,
+        ),
+        Call::MemWrite(a) => (
+            Assessment::new(crate::policy::Tier::T0),
+            a.summary(),
+            None,
+            false,
+            None,
+        ),
     };
+    let mut assessment = assessment;
+    apply_rules(ctx, &call, &args, &mut assessment);
     Ok(Plan {
         tool: tool.to_string(),
         args,
@@ -173,6 +218,35 @@ pub async fn execute(ctx: &ToolCtx, plan: &Plan) -> Executed {
         Call::Delete(a) => fs::delete(ctx, a).await,
         Call::Shell(a) => shell::run(ctx, a, plan.assessment.sudo).await,
         Call::Sys(c) => sys::run(ctx, c, plan.assessment.sudo).await,
+        Call::MemSearch(a) => mem::search(ctx, a),
+        Call::MemRead(a) => mem::read(ctx, a),
+        Call::MemWrite(a) => mem::write(ctx, a),
+    }
+}
+
+/// Refuse changes the owner's confirmed preferences forbid.
+fn apply_rules(ctx: &ToolCtx, call: &Call, args: &Value, a: &mut Assessment) {
+    if ctx.rules.is_empty() || a.tier == crate::policy::Tier::T0 {
+        return;
+    }
+    let paths: Vec<PathBuf> = ["path", "from", "to"]
+        .iter()
+        .filter_map(|k| args.get(*k).and_then(Value::as_str))
+        .map(|p| ctx.paths.resolve(p))
+        .collect();
+    let command = match call {
+        Call::Shell(_) => args
+            .get("command")
+            .and_then(Value::as_str)
+            .map(String::from),
+        Call::Sys(c) => Some(c.command.clone()),
+        _ => None,
+    };
+    for r in &ctx.rules {
+        if let Some(why) = r.blocks(&paths, command.as_deref()) {
+            a.refuse(why);
+            return;
+        }
     }
 }
 
@@ -382,6 +456,24 @@ pub fn specs() -> Vec<ToolSpec> {
             "Send a signal to a process (TERM by default). Other users' processes need root.",
             json!({"pid": {"type": "integer"}, "signal": {"type": "string", "enum": ["TERM", "KILL", "HUP", "INT", "STOP", "CONT", "USR1", "USR2"]}}),
             &["pid"],
+        ),
+        spec(
+            "memory_search",
+            "Search Reeve's memory of this machine: facts, runbooks (past fixes and how often they worked), and the owner's preferences. Do this before diagnosing a problem from scratch.",
+            json!({"query": {"type": "string"}, "layer": {"type": "string", "enum": ["fact", "runbook", "preference"]}}),
+            &["query"],
+        ),
+        spec(
+            "memory_read",
+            "Read one memory in full.",
+            json!({"id": {"type": "string"}}),
+            &["id"],
+        ),
+        spec(
+            "memory_write",
+            "Remember something for future sessions. fact: true about this machine, seen in tool output (never secrets). runbook: a problem and the steps that fixed it; write it only after checking the fix worked, and record later uses with outcome worked/failed (give its id). preference: how the owner wants things done, in their words; it stays pending until they confirm it. A rule (preferences only) is `deny-path: <glob>` or `deny-command: <glob>`.",
+            json!({"layer": {"type": "string", "enum": ["fact", "runbook", "preference"]}, "title": {"type": "string"}, "body": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}, "id": {"type": "string", "description": "Update this memory instead of adding one"}, "rule": {"type": "string"}, "outcome": {"type": "string", "enum": ["worked", "failed"]}}),
+            &["layer"],
         ),
         spec(
             "shell",

@@ -178,6 +178,7 @@ mod tests {
             started: Utc::now(),
             connection: "openrouter".into(),
             model: "m".into(),
+            reflected: None,
         };
         let t = vec![
             Message::new("user", "tidy my downloads"),

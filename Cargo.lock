@@ -1224,6 +1224,7 @@ dependencies = [
  "ratatui",
  "reeve-core",
  "reeve-observer",
+ "serde_json",
  "tokio",
  "unicode-width 0.2.0",
 ]

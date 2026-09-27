@@ -148,7 +148,8 @@ pub struct Agent {
     connection: String,
     local: bool,
     model: String,
-    system: String,
+    machine_profile: String,
+    memory: crate::memory::Memory,
     transcript: Vec<Message>,
     tally: Tally,
     tools: ToolCtx,
@@ -197,6 +198,7 @@ impl Agent {
             provider,
             book: PriceBook::from_config(&cfg),
             tools: ToolCtx::new(home.clone(), secret_env(&cfg)),
+            memory: crate::memory::Memory::new(&home),
             receipts: ReceiptBook::new(&home),
             cfg,
             home,
@@ -204,7 +206,8 @@ impl Agent {
             connection,
             local,
             model,
-            system: system_prompt(machine_profile),
+            machine_profile: machine_profile.to_string(),
+
             transcript: Vec::new(),
             tally: Tally::default(),
             approver: Arc::new(DenyAll),
@@ -287,6 +290,87 @@ impl Agent {
         }
     }
 
+    /// Reflect on this session: propose memories from what happened.
+    pub async fn reflect(&mut self) -> Result<crate::memory::reflect::Reflected> {
+        let dir = self.session.dir.clone();
+        let out = self.reflect_dir(&dir).await?;
+        self.session.meta.reflected = Some(Utc::now());
+        Ok(out)
+    }
+
+    /// Reflect on a past session's files (after a restart).
+    pub async fn reflect_dir(
+        &mut self,
+        dir: &std::path::Path,
+    ) -> Result<crate::memory::reflect::Reflected> {
+        let mut meta =
+            crate::session::load_meta(dir).ok_or_else(|| Error::Io("no such session".into()))?;
+        let transcript = if dir == self.session.dir {
+            self.transcript.clone()
+        } else {
+            crate::session::load_transcript(dir)
+        };
+        let receipts: Vec<Receipt> = self
+            .receipts
+            .all()
+            .into_iter()
+            .filter(|r| r.session == meta.id)
+            .collect();
+        let out = crate::memory::reflect::reflect(
+            self.provider.as_ref(),
+            &self.model,
+            &transcript,
+            &receipts,
+            &self.memory,
+            &meta.id,
+            &self.tools.os,
+        )
+        .await?;
+        let (usd, priced_by) = match out.reported_usd {
+            Some(c) => (Some(c), Some("provider")),
+            None if self.local => (Some(0.0), Some("local")),
+            None => {
+                let c = self.book.cost(&self.model, out.usage);
+                (c, c.map(|_| "book"))
+            }
+        };
+        ledger::record(
+            &self.home,
+            &SpendRecord {
+                ts: Utc::now(),
+                session: meta.id.clone(),
+                connection: self.connection.clone(),
+                model: self.model.clone(),
+                usage: out.usage,
+                usd,
+                priced_by: priced_by.map(Into::into),
+            },
+        )?;
+        meta.reflected = Some(Utc::now());
+        crate::session::save_meta(dir, &meta)?;
+        Ok(out)
+    }
+
+    /// The last few sessions that did something and were never reflected on.
+    pub fn unreflected(&self, max: usize) -> Vec<std::path::PathBuf> {
+        let acted: HashSet<String> = self.receipts.all().into_iter().map(|r| r.session).collect();
+        crate::session::list(&self.home)
+            .into_iter()
+            .filter(|d| *d != self.session.dir)
+            .filter_map(|d| {
+                let m = crate::session::load_meta(&d)?;
+                let recent = Utc::now() - m.started < chrono::Duration::days(7);
+                (m.reflected.is_none() && recent && acted.contains(&m.id)).then_some(d)
+            })
+            .take(max)
+            .collect()
+    }
+
+    /// Whether this session has anything to reflect on.
+    pub fn has_actions(&self) -> bool {
+        self.transcript.iter().any(|m| m.role == "tool")
+    }
+
     /// Rewrite this session's `report.md`.
     pub fn write_report(&self) -> Result<PathBuf> {
         let mine: Vec<Receipt> = self
@@ -310,6 +394,9 @@ impl Agent {
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<bool> {
         repair_unanswered(&mut self.transcript);
+        // Preferences the owner confirmed since the last turn apply now.
+        self.tools.rules = self.memory.rules(&self.tools.paths.home);
+        self.tools.session.clone_from(&self.session.meta.id);
         let msg = Message::new("user", user);
         self.session.append(&msg)?;
         self.transcript.push(msg);
@@ -323,7 +410,10 @@ impl Agent {
             }
             let req = CompletionRequest {
                 model: self.model.clone(),
-                system: Some(self.system.clone()),
+                system: Some(system_prompt(
+                    &self.machine_profile,
+                    &self.memory.profile(3500),
+                )),
                 messages: self.transcript.clone(),
                 tools: tools::specs(),
                 max_tokens: None,
@@ -625,7 +715,7 @@ pub fn repair_unanswered(transcript: &mut Vec<Message>) {
 
 /// Reeve's standing instructions. The machine profile grows into the
 /// memory layer's summary in M3.
-pub fn system_prompt(machine_profile: &str) -> String {
+pub fn system_prompt(machine_profile: &str, memory: &str) -> String {
     format!(
         "You are Reeve, an operator agent that manages this computer for its owner. \
 You are not a coding assistant: your job is the health, tidiness, and configuration \
@@ -655,7 +745,14 @@ actions also get a snapper snapshot pair when snapper is set up for /. If a pass
 isn't given, don't retry; say what you needed.\n\
 Each result ends with its receipt number; mention it when you change something, so the \
 owner can undo it.\n\n\
-Machine:\n{machine_profile}"
+## Memory\n\
+You remember this machine between sessions. Before diagnosing a problem, memory_search \
+for a runbook. After a fix you've checked, record it (memory_write runbook, or its outcome \
+on the runbook you used). Save facts you learn from tool output that will matter again. \
+When the owner tells you how they want things done, save it as a preference in their \
+words: it takes effect once they confirm it. Never store secrets.\n\n\
+Machine:\n{machine_profile}\n\n\
+{memory}"
     )
 }
 

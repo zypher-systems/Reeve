@@ -197,6 +197,22 @@ impl Distro {
     }
 }
 
+/// `Fedora 44`, `Arch`: the distribution and major version, for memories.
+pub fn os_label() -> String {
+    let os = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let field = |k: &str| {
+        os.lines()
+            .find_map(|l| l.strip_prefix(k)?.strip_prefix('='))
+            .map(|v| v.trim_matches('"').to_string())
+            .unwrap_or_default()
+    };
+    let name = field("NAME");
+    let short = name.split_whitespace().next().unwrap_or("Linux");
+    format!("{short} {}", field("VERSION_ID"))
+        .trim()
+        .to_string()
+}
+
 /// Single-quote for bash.
 pub fn quote(s: &str) -> String {
     if !s.is_empty()

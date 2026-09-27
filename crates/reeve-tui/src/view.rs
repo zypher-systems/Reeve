@@ -152,6 +152,10 @@ pub struct View {
     pub approval: Option<Pending>,
     /// Newest receipts first.
     pub receipts: Vec<Receipt>,
+    /// Memory notes in use, and new or pending ones.
+    pub memory: (usize, usize),
+    /// A memory to open in `$EDITOR` (the loop hands over the terminal).
+    pub edit_request: Option<(reeve_core::memory::Layer, String)>,
 }
 
 /// Spending caps, USD; 0 is off.
@@ -198,6 +202,8 @@ impl View {
             palette_sel: 0,
             approval: None,
             receipts: Vec::new(),
+            memory: (0, 0),
+            edit_request: None,
         }
     }
 

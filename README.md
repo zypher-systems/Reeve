@@ -4,12 +4,11 @@ An **operator harness**: an agent that runs on your computer and manages it for 
 coding agent. It keeps the machine healthy, tidy, and configured. It gives receipts for everything
 it does, and it learns how your system behaves.
 
-> **Status: M2 (sysadmin).** Reeve reads, searches, and changes files anywhere on the machine,
-> including root-owned ones. It manages packages (dnf5 on Fedora, pacman on Arch), systemd units, the
-> journal, and processes, and it runs shell commands, `sudo` included: you approve the action, then type
-> your password into Reeve. Every action is classified by risk and gets a hash-chained receipt. File,
-> package, and service changes can be undone. Root changes get a snapper snapshot pair when snapper is
-> set up for `/`. Each session writes a report. See [`design.md`](design.md) and [`DECISIONS.md`](DECISIONS.md).
+> **Status: M3 (memory).** Everything from M2 (files anywhere including root-owned ones, packages,
+> services, logs, processes, shell with `sudo` through Reeve's own password prompt, risk tiers, receipts,
+> undo, snapper pairs, session reports), plus memory. Reeve surveys the machine and keeps facts,
+> runbooks of fixes that worked (and how often), and your preferences as plain Markdown files it reads
+> every session. See [`design.md`](design.md) and [`DECISIONS.md`](DECISIONS.md).
 
 ## Quick start
 
@@ -58,6 +57,23 @@ sudo and nowhere else: not to the model, a log, or a receipt. You can let Reeve 
   the numbers for `snapper undochange`. Reeve won't create a snapper config unless you ask.
 - `reeve undo N` from a terminal asks for sudo there.
 
+## Memory
+
+`~/.reeve/memory/{facts,runbooks,preferences,baselines}/*.md`: plain Markdown with a short header. Read,
+edit, or delete any of it, by hand or in `/memory`.
+
+- **Facts** come from a read-only survey on first run (refreshed weekly), from the model's `memory_write`,
+  and from reflection. A fact you edit becomes yours, and reflection won't rewrite it.
+- **Runbooks** are fixes, with how many times they worked and failed. Reeve searches them before
+  diagnosing from scratch.
+- **Preferences** are your rules. Ones Reeve proposes stay *pending* until you accept them (`a` in
+  `/memory`). A preference can carry a rule, `deny-path: ~/.config/hypr/**` or `deny-command: docker restart*`,
+  which the policy then enforces for every tool.
+- **Reflection:** at `/new` (or `/reflect`), one model call reads the session and proposes memories. After a
+  restart, recent sessions that were never reflected on are caught up. `[memory] auto_reflect = false` turns
+  this off.
+- **Baselines** arrive with the observer in M4.
+
 Each session keeps `~/.reeve/sessions/<id>/report.md`: what you asked, what was done, what can be undone,
 and what it cost.
 
@@ -70,7 +86,7 @@ Set `REEVE_HOME` to use a different state directory.
 | key | does |
 | --- | --- |
 | `⏎` / `alt+⏎` | send / newline |
-| `/` | commands: `/providers`, `/model`, `/receipts`, `/new`, `/yolo`, `/help`, `/quit` |
+| `/` | commands: `/providers`, `/model`, `/memory`, `/reflect`, `/receipts`, `/new`, `/yolo`, `/help`, `/quit` |
 | `^p` / `^r` | `/providers` / `/receipts` (`u` undo, `v` verify) |
 | `⏎` `a` `n` | on an approval card: approve, allow for session, deny |
 | `esc` | stop the running turn, or clear the composer |

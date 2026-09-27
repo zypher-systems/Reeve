@@ -27,6 +27,14 @@ pub const COMMANDS: &[Command] = &[
         about: "choose the model (live prices)",
     },
     Command {
+        name: "/memory",
+        about: "what Reeve knows: facts, runbooks, preferences",
+    },
+    Command {
+        name: "/reflect",
+        about: "learn from this session now",
+    },
+    Command {
         name: "/receipts",
         about: "everything Reeve did; undo and verify",
     },
@@ -96,6 +104,18 @@ pub enum Action {
     Password(Option<(String, bool)>),
     /// Check the whole receipt chain.
     VerifyReceipts,
+    /// Put a new or pending memory in effect.
+    MemoryAccept(reeve_core::memory::Layer, String),
+    /// Retire (or restore) a memory.
+    MemoryRetire(reeve_core::memory::Layer, String),
+    /// Delete a memory's file.
+    MemoryDelete(reeve_core::memory::Layer, String),
+    /// Open a memory in `$EDITOR`.
+    MemoryEdit(reeve_core::memory::Layer, String),
+    /// Re-run the survey.
+    Survey,
+    /// Reflect on this session now.
+    Reflect,
     /// Save a new connection.
     AddConnection {
         /// Name (also the key's file name).
@@ -120,6 +140,8 @@ pub enum Overlay {
     Receipts(ReceiptsPanel),
     /// sudo's password.
     Password(PasswordEntry),
+    /// `/memory`.
+    Memory(MemoryPanel),
     /// `/help`.
     Help,
 }
@@ -137,6 +159,7 @@ impl Overlay {
             Self::Add(a) => a.on_key(k),
             Self::Receipts(r) => r.on_key(k),
             Self::Password(p) => p.on_key(k),
+            Self::Memory(m) => m.on_key(k),
             Self::Help => Action::Close,
         }
     }
@@ -298,6 +321,102 @@ impl ReceiptsPanel {
             _ => {}
         }
         Action::None
+    }
+}
+
+// ── /memory ─────────────────────────────────────────────────────────────────
+
+/// The memory browser: one tab per layer.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MemoryPanel {
+    /// Index into [`reeve_core::memory::Layer::ALL`].
+    pub tab: usize,
+    /// Notes of every layer, by tab.
+    pub notes: Vec<Vec<reeve_core::memory::Note>>,
+    /// Selected row in the current tab.
+    pub sel: usize,
+    /// Last action's result.
+    pub note: Option<Result<String, String>>,
+    /// Delete asked once; asking again deletes.
+    pub confirm_delete: Option<String>,
+}
+
+impl MemoryPanel {
+    /// Load every layer.
+    pub fn load(mem: &reeve_core::memory::Memory) -> Self {
+        let mut p = Self::default();
+        p.reload(mem);
+        p
+    }
+
+    /// Re-read from disk, keeping the tab and (where possible) the selection.
+    pub fn reload(&mut self, mem: &reeve_core::memory::Memory) {
+        let keep = self.selected().map(|n| n.id.clone());
+        self.notes = reeve_core::memory::Layer::ALL
+            .iter()
+            .map(|l| mem.list(*l))
+            .collect();
+        if let Some(id) = keep {
+            if let Some(i) = self.current().iter().position(|n| n.id == id) {
+                self.sel = i;
+            }
+        }
+        self.sel = self.sel.min(self.current().len().saturating_sub(1));
+    }
+
+    /// Notes on the current tab.
+    pub fn current(&self) -> &[reeve_core::memory::Note] {
+        self.notes.get(self.tab).map_or(&[], Vec::as_slice)
+    }
+
+    /// The selected note.
+    pub fn selected(&self) -> Option<&reeve_core::memory::Note> {
+        self.current().get(self.sel)
+    }
+
+    fn on_key(&mut self, k: KeyEvent) -> Action {
+        let n = self.current().len();
+        let tabs = reeve_core::memory::Layer::ALL.len();
+        if !matches!(k.code, KeyCode::Char('D')) {
+            self.confirm_delete = None;
+        }
+        match k.code {
+            KeyCode::Left | KeyCode::BackTab => {
+                self.tab = (self.tab + tabs - 1) % tabs;
+                self.sel = 0;
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                self.tab = (self.tab + 1) % tabs;
+                self.sel = 0;
+            }
+            KeyCode::Up => self.sel = self.sel.saturating_sub(1),
+            KeyCode::Down => self.sel = (self.sel + 1).min(n.saturating_sub(1)),
+            KeyCode::Char('s') => return Action::Survey,
+            KeyCode::Char('r') => return Action::Reflect,
+            _ => {}
+        }
+        let Some(note) = self.selected() else {
+            return Action::None;
+        };
+        let (layer, id) = (note.layer, note.id.clone());
+        match k.code {
+            KeyCode::Char('a') | KeyCode::Enter => Action::MemoryAccept(layer, id),
+            KeyCode::Char('x') => Action::MemoryRetire(layer, id),
+            KeyCode::Char('e') => Action::MemoryEdit(layer, id),
+            KeyCode::Char('D') => {
+                if self.confirm_delete.as_deref() == Some(id.as_str()) {
+                    self.confirm_delete = None;
+                    Action::MemoryDelete(layer, id)
+                } else {
+                    self.note = Some(Err(format!(
+                        "press D again to delete {id} for good (x retires it instead)"
+                    )));
+                    self.confirm_delete = Some(id);
+                    Action::None
+                }
+            }
+            _ => Action::None,
+        }
     }
 }
 

@@ -32,6 +32,8 @@ pub struct Config {
     pub approvals: ApprovalConfig,
     /// Filesystem snapshots around root changes.
     pub snapshots: SnapshotConfig,
+    /// Memory: survey and reflection.
+    pub memory: MemoryConfig,
     /// TUI presentation.
     pub ui: UiConfig,
 }
@@ -47,6 +49,7 @@ impl Default for Config {
             spend: SpendConfig::default(),
             approvals: ApprovalConfig::default(),
             snapshots: SnapshotConfig::default(),
+            memory: MemoryConfig::default(),
             ui: UiConfig::default(),
         }
     }
@@ -141,6 +144,26 @@ pub struct SnapshotConfig {
 impl Default for SnapshotConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// `[memory]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// Survey the machine on first run and weekly after (read-only commands).
+    pub survey: bool,
+    /// Reflect on a session when it ends (`/new`) or, after a restart, on
+    /// recent sessions that weren't. One model call each.
+    pub auto_reflect: bool,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            survey: true,
+            auto_reflect: true,
+        }
     }
 }
 

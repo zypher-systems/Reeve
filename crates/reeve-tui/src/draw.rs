@@ -86,6 +86,18 @@ fn draw_header(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
         right.push(Span::styled(short_model(&v.model), t.muted()));
         right.push(Span::styled(format!(" via {}  ", v.connection), t.ghost()));
     }
+    let (notes, fresh) = v.memory;
+    if notes + fresh > 0 {
+        right.push(Span::styled("◈ ", Style::default().fg(t.teal)));
+        right.push(Span::styled(format!("{notes}"), t.muted()));
+        if fresh > 0 {
+            right.push(Span::styled(
+                format!(" · {fresh} new"),
+                Style::default().fg(t.amber),
+            ));
+        }
+        right.push(Span::raw("  "));
+    }
     right.push(Span::styled("observer ", t.ghost()));
     right.push(Span::styled("○ local  ", Style::default().fg(t.dim)));
     if v.yolo {

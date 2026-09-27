@@ -32,6 +32,10 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
             area.height.saturating_sub(4),
         ),
         Overlay::Password(_) => (80, 13),
+        Overlay::Memory(_) => (
+            area.width.saturating_sub(6).min(130),
+            area.height.saturating_sub(4),
+        ),
         Overlay::Help => (72, 24),
     };
     let r = centered(area, w, h);
@@ -43,6 +47,7 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::Add(_) => "add a connection",
         Overlay::Receipts(_) => "receipts",
         Overlay::Password(_) => "sudo",
+        Overlay::Memory(_) => "memory",
         Overlay::Help => "help",
     };
     let block = panel(title, t, true);
@@ -61,6 +66,7 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::Add(a) => add_form(f, inner, a, t),
         Overlay::Receipts(r) => receipts(f, inner, r, t),
         Overlay::Password(p) => password(f, inner, p, t),
+        Overlay::Memory(m) => memory(f, inner, m, t),
         Overlay::Help => help(f, inner, t),
     }
 }
@@ -641,6 +647,175 @@ fn receipts(f: &mut Frame, r: Rect, p: &ReceiptsPanel, t: &Theme) {
             ("↑↓", "move"),
             ("u", "undo"),
             ("v", "verify the chain"),
+            ("esc", "close"),
+        ],
+        t,
+    ));
+    f.render_widget(Paragraph::new(lines), r);
+}
+
+fn memory(f: &mut Frame, r: Rect, p: &crate::overlay::MemoryPanel, t: &Theme) {
+    use reeve_core::memory::{Layer, NoteStatus};
+    let w = r.width as usize;
+    let mut lines = Vec::new();
+    // Tabs.
+    let mut tabs = Vec::new();
+    for (i, l) in Layer::ALL.iter().enumerate() {
+        let notes = p.notes.get(i).map_or(0, Vec::len);
+        let fresh = p.notes.get(i).map_or(0, |v| {
+            v.iter()
+                .filter(|n| matches!(n.status, NoteStatus::New | NoteStatus::Pending))
+                .count()
+        });
+        let label = format!(
+            " {} {notes}{} ",
+            l.dir(),
+            if fresh > 0 {
+                format!(" · {fresh} new")
+            } else {
+                String::new()
+            }
+        );
+        let style = if i == p.tab {
+            Style::default()
+                .fg(t.bg)
+                .bg(t.brass)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            t.muted()
+        };
+        tabs.push(Span::styled(label, style));
+        tabs.push(Span::raw("  "));
+    }
+    lines.push(Line::from(tabs));
+    lines.push(Line::raw(""));
+    let list_h = (r.height as usize).saturating_sub(6) * 2 / 5;
+    let cur = p.current();
+    if cur.is_empty() {
+        let empty = match Layer::ALL[p.tab] {
+            Layer::Facts => "No facts yet. `s` surveys the machine (read-only).",
+            Layer::Runbooks => {
+                "No runbooks yet. They're written after fixes that were checked to work."
+            }
+            Layer::Preferences => {
+                "No preferences. Tell Reeve how you want things done, or add a file here."
+            }
+            Layer::Baselines => "Baselines come from the observer (reeved), which arrives in M4.",
+        };
+        lines.push(Line::from(Span::styled(format!("   {empty}"), t.muted())));
+    }
+    let start = p.sel.saturating_sub(list_h.saturating_sub(1));
+    for (i, n) in cur.iter().enumerate().skip(start).take(list_h) {
+        let on = i == p.sel;
+        let bg = if on { t.input } else { t.panel };
+        let (mark, mc) = match n.status {
+            NoteStatus::New => ("● new    ", t.amber),
+            NoteStatus::Pending => ("? confirm", t.bad),
+            NoteStatus::Active => ("✓        ", t.dim),
+            NoteStatus::Retired => ("✗ retired", t.faint),
+        };
+        let track = if n.layer == Layer::Runbooks {
+            format!("{}✓ {}✗", n.successes, n.failures)
+        } else {
+            String::new()
+        };
+        let src = n.source.split(':').next().unwrap_or("").to_string();
+        let title_w = w.saturating_sub(3 + 10 + 10 + 9);
+        let title_style = if n.status == NoteStatus::Retired {
+            t.ghost().add_modifier(Modifier::CROSSED_OUT)
+        } else if on {
+            Style::default().fg(t.amber).add_modifier(Modifier::BOLD)
+        } else {
+            t.text()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if on { " ▸ " } else { "   " },
+                Style::default().fg(t.brass).bg(bg),
+            ),
+            Span::styled(format!("{mark} "), Style::default().fg(mc).bg(bg)),
+            Span::styled(
+                pad(&truncate(&n.title, title_w), title_w),
+                title_style.bg(bg),
+            ),
+            Span::styled(pad(&track, 10), Style::default().fg(t.teal).bg(bg)),
+            Span::styled(pad(&src, 9), t.ghost().bg(bg)),
+        ]));
+    }
+    while lines.len() < list_h + 2 {
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::from(Span::styled("─".repeat(w), t.ghost())));
+    if let Some(n) = p.selected() {
+        let tags = if n.tags.is_empty() {
+            String::new()
+        } else {
+            format!("  #{}", n.tags.join(" #"))
+        };
+        lines.push(Line::from(vec![
+            Span::styled(n.title.clone(), t.accent()),
+            Span::styled(tags, Style::default().fg(t.teal)),
+        ]));
+        let when = n
+            .observed
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut meta = format!(
+            "{} · {} · confidence {:.0}%",
+            n.source,
+            when,
+            n.confidence * 100.0
+        );
+        if let Some(os) = &n.os {
+            meta.push_str(&format!(" · {os}"));
+        }
+        lines.push(Line::from(Span::styled(meta, t.ghost())));
+        if let Some(rule) = &n.rule {
+            let live = n.status.in_use();
+            lines.push(Line::from(vec![
+                Span::styled("rule ", t.ghost()),
+                Span::styled(
+                    rule.clone(),
+                    Style::default()
+                        .fg(if live { t.bad } else { t.dim })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if live {
+                        "  (enforced)"
+                    } else {
+                        "  (not in effect until you accept it)"
+                    },
+                    t.ghost(),
+                ),
+            ]));
+        }
+        lines.push(Line::raw(""));
+        let body_room = (r.height as usize).saturating_sub(lines.len() + 2);
+        for l in n.body.lines().take(body_room) {
+            lines.push(Line::from(Span::styled(truncate(l, w), t.muted())));
+        }
+    }
+    let footer_at = r.height.saturating_sub(2) as usize;
+    lines.truncate(footer_at);
+    while lines.len() < footer_at {
+        lines.push(Line::raw(""));
+    }
+    lines.push(match &p.note {
+        Some(Ok(m)) => Line::from(Span::styled(format!("✓ {m}"), Style::default().fg(t.good))),
+        Some(Err(m)) => Line::from(Span::styled(format!("! {m}"), Style::default().fg(t.warn))),
+        None => Line::raw(""),
+    });
+    lines.push(hints(
+        &[
+            ("←→", "layer"),
+            ("a", "accept"),
+            ("x", "retire"),
+            ("e", "edit"),
+            ("D", "delete"),
+            ("s", "survey"),
+            ("r", "reflect"),
             ("esc", "close"),
         ],
         t,

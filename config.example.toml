@@ -44,6 +44,10 @@ yolo = false                            # ^y toggles per session; the safeguard 
 [snapshots]
 enabled = true                          # snapper pre/post around root actions, when snapper covers /
 
+[memory]
+survey = true                           # read-only survey on first run, weekly after
+auto_reflect = true                     # one model call per finished session to propose memories
+
 [ui]
 theme = "brass"
 colors = "auto"                         # auto | truecolor | 256 | 16 ; NO_COLOR wins

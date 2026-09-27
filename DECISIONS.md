@@ -2,6 +2,31 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-27: Memory is Markdown notes; the owner has the last word
+- **Decision:**
+  - Four layers under `~/.reeve/memory/`, one Markdown file per note with a short header (source, observed, confidence, status, OS, runbook counts, rule).
+  - Search is keyword and tag scoring. Runbooks are weighted by their track record, and notes from another OS version rank lower.
+  - A compact profile (preferences in effect, fact one-liners, a runbook count) goes into every system prompt, capped at about 3.5k characters.
+  - Writers:
+    - the read-only survey (weekly)
+    - the model through `memory_write` (T0, receipted)
+    - reflection (one model call per finished session, or catch-up after a restart)
+    - the owner
+  - The owner's notes, and survey facts the owner edited, are never rewritten by the model: a new note is added instead.
+  - Preferences from the model or reflection stay `pending` until the owner accepts them.
+  - `deny-path` and `deny-command` rules from accepted preferences are enforced in `tools::prepare`, for every tool and every tier except reads.
+- **Chosen vs rejected:**
+  - Rejected a vector store: opaque, and nobody can edit an embedding.
+  - Rejected putting all memory in the prompt: it grows without bound, so the rest is found through `memory_search`.
+  - Rejected auto-accepting preferences: a prompt-injected "preference" could otherwise disable a safeguard.
+  - Rejected reflecting only on quit: quitting would hang on a model call, and a crash would lose the session's lessons.
+- **Why:** Reeve should get better on this machine over time, and the owner must be able to see and correct what it learned.
+- **Where:** `reeve-core/src/memory/` (`mod.rs`, `survey.rs`, `reflect.rs`), `tools/mem.rs`, `tools/mod.rs` (`apply_rules`), `agent.rs` (profile, `reflect`, `unreflected`), `reeve-tui/src/overlay.rs` (`MemoryPanel`)
+- **Residual risk:**
+  - Tool output can contain text written to mislead (a log line). A fact or runbook learned from it is marked `new` and shown, but it's in use until the owner retires it.
+  - "Never store secrets" is an instruction to the model, not a filter. Memory files are 0600, but their text is sent to the model provider with every prompt.
+  - Reflection costs one model call per session with actions.
+
 ### 2026-09-27: The sudo password is typed into Reeve, and only answers while armed
 - **Decision:**
   - Root commands run with `~/.reeve/bin` first on `PATH`. A `sudo` wrapper there adds `-A`, and `SUDO_ASKPASS` points at `reeve-askpass` (a link to this binary).
