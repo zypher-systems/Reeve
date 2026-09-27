@@ -13,16 +13,23 @@ it does, and it learns how your system behaves.
 
 ```sh
 cargo build --release
-./target/release/reeve key set openrouter   # or: export OPENROUTER_API_KEY=…
-./target/release/reeve                      # the TUI
+./target/release/reeve
 ```
+
+Inside, type `/providers` (or press `^p`), choose a connection, and paste its key. The key is stored
+in `~/.reeve/keys/<connection>` (mode 0600). It is never drawn, logged, or sent to a model. Reeve checks the
+key with the provider; OpenRouter also shows how much of its limit is used. Then pick a model from the live
+price list. You can add any OpenAI-compatible endpoint, or a local server, with `a` in the same panel.
+
+From the shell, `reeve key set openrouter` does the same thing, and `OPENROUTER_API_KEY` / `OPENAI_API_KEY` also work.
 
 Other commands:
 
 - `reeve models [filter]` lists a connection's models with live prices, including cache read and write rates.
 - `reeve spend` shows today and this month, across every Reeve session.
 
-Configuration lives in `~/.reeve/config.toml` (see [`config.example.toml`](config.example.toml)).
+Configuration lives in `~/.reeve/config.toml` (see [`config.example.toml`](config.example.toml)). Reeve never
+rewrites that file. Choices made in the TUI go to `~/.reeve/settings.toml`, which is layered on top.
 Set `REEVE_HOME` to use a different state directory.
 
 ## Keys in the TUI
@@ -30,6 +37,8 @@ Set `REEVE_HOME` to use a different state directory.
 | key | does |
 | --- | --- |
 | `⏎` / `alt+⏎` | send / newline |
+| `/` | commands: `/providers`, `/model`, `/new`, `/yolo`, `/help`, `/quit` |
+| `^p` | `/providers` |
 | `esc` | stop the running turn, or clear the composer |
 | `^y` | YOLO: auto-approve T0–T2 actions. The safeguard floor still asks. |
 | `^b` | on narrow terminals, switch between the chat and the live rail |

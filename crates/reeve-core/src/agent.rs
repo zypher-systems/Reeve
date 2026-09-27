@@ -89,6 +89,41 @@ impl Agent {
         })
     }
 
+    /// Move to another connection or model, keeping the conversation.
+    /// Prices already learned stay in the book.
+    pub fn switch(
+        &mut self,
+        provider: Box<dyn Provider>,
+        cfg: Config,
+        connection: String,
+        model: String,
+    ) {
+        self.local = cfg
+            .connections
+            .get(&connection)
+            .is_some_and(|c| c.is_local());
+        let mut book = PriceBook::from_config(&cfg);
+        book.absorb(&self.book);
+        self.book = book;
+        self.provider = provider;
+        self.cfg = cfg;
+        self.connection = connection;
+        self.model = model;
+    }
+
+    /// Start a fresh session: new directory, empty transcript, spend from zero.
+    pub fn reset(&mut self) -> Result<()> {
+        self.session = Session::create(&self.home, &self.connection, &self.model)?;
+        self.transcript.clear();
+        self.tally = Tally::default();
+        Ok(())
+    }
+
+    /// Model id in use.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     /// Session id.
     pub fn session_id(&self) -> &str {
         &self.session.meta.id

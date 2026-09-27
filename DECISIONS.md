@@ -2,6 +2,21 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-27: Keys and models are set up inside the TUI
+- **Decision:**
+  - `/providers` lists every connection with where its key comes from (`keys/<name>`, `$VAR`, `config.toml`), and lets you set, check, or forget a key, add a connection, and pick a model.
+  - The TUI's choices go to `settings.toml`, which is layered over `config.toml`.
+  - Keys go only to `keys/<name>` (0600). The masked entry never draws the key, and its `Debug` prints only the length.
+- **Chosen vs rejected:**
+  - Rejected writing `config.toml` from the TUI: it's the user's file, comments and all.
+  - Rejected storing keys in `settings.toml`: it would put a plaintext key in a file the user may copy around. `Settings::save` strips `api_key` even if one got in.
+  - Rejected a key check that only lists models: OpenRouter's catalog is public, so listing succeeds with any key. `GET /key` actually authenticates, and it reports usage against the limit.
+- **Why:** The user wants to open the binary, add the key through `/providers`, and start testing.
+- **Where:** `reeve-core/src/settings.rs`, `config.rs` (`secret_source`, `remove_secret_at`), `llm/http.rs` (`verify`), `reeve-tui/src/overlay.rs`, `panels.rs`, `run.rs` (`App::perform`)
+- **Residual risk:**
+  - A key being typed sits in memory as a plain `String` until it is saved or the panel closes.
+  - A key rejected by the check stays stored, so the user can fix a typo. The connection still switches, and the first turn then fails with the provider's error.
+
 ### 2026-09-27: Chat Completions only, with real cache prices
 - **Decision:**
   - The copied provider layer keeps only Chat Completions.

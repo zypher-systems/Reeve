@@ -98,6 +98,39 @@ impl HttpProvider {
         }
     }
 
+    /// Check that the key works, and say what the provider knows about it.
+    /// OpenRouter has a key endpoint (usage and limit); elsewhere, an
+    /// authenticated `/models` call is the check.
+    pub async fn verify(&self) -> Result<String> {
+        if self.kind == "openrouter" {
+            let resp = self
+                .client
+                .get(format!("{}/key", self.base_url))
+                .headers(self.headers()?)
+                .send()
+                .await
+                .map_err(|e| Error::Provider(e.to_string()))?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Err(Error::Provider(key_error(status.as_u16(), &text)));
+            }
+            return Ok(describe_openrouter_key(&text));
+        }
+        let n = self.list_models().await.map_err(|e| {
+            Error::Provider(match e {
+                Error::Provider(m) if m.contains("401") || m.contains("403") => {
+                    "the provider rejected this key".into()
+                }
+                other => other.to_string(),
+            })
+        })?;
+        Ok(match n.len() {
+            1 => "key works · 1 model".to_string(),
+            k => format!("key works · {k} models"),
+        })
+    }
+
     fn headers(&self) -> Result<HeaderMap> {
         let mut h = HeaderMap::new();
         h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -451,6 +484,34 @@ fn tools_openai(tools: &[ToolSpec]) -> Value {
         .collect()
 }
 
+fn key_error(status: u16, body: &str) -> String {
+    match status {
+        401 | 403 => "the provider rejected this key".into(),
+        _ => format!(
+            "http {status}: {}",
+            body.chars().take(200).collect::<String>()
+        ),
+    }
+}
+
+/// `key works · $1.23 used of $20.00` from OpenRouter's `GET /key`.
+fn describe_openrouter_key(text: &str) -> String {
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let d = &v["data"];
+    let used = d["usage"].as_f64();
+    let limit = d["limit"].as_f64();
+    let mut out = "key works".to_string();
+    match (used, limit) {
+        (Some(u), Some(l)) => out.push_str(&format!(" · ${u:.2} used of ${l:.2}")),
+        (Some(u), None) => out.push_str(&format!(" · ${u:.2} used, no limit")),
+        _ => {}
+    }
+    if d["is_free_tier"].as_bool() == Some(true) {
+        out.push_str(" · free tier");
+    }
+    out
+}
+
 /// Per-token price string → per-million, or `None`. OpenRouter uses `"-1"`
 /// for "varies by request" (routers), which is not a price.
 fn per_million(v: Option<&Value>) -> Option<f64> {
@@ -637,6 +698,22 @@ mod tests {
         assert_eq!(sonnet.tools, Some(true));
         assert_eq!(models[1].cache_read_per_million, None);
         assert_eq!(models[2].input_per_million, None);
+    }
+
+    #[test]
+    fn openrouter_key_info_reads_well() {
+        let j =
+            r#"{"data":{"label":"sk-or-v1-abc","usage":1.234,"limit":20,"is_free_tier":false}}"#;
+        assert_eq!(
+            describe_openrouter_key(j),
+            "key works · $1.23 used of $20.00"
+        );
+        let j = r#"{"data":{"usage":0.5,"limit":null}}"#;
+        assert_eq!(
+            describe_openrouter_key(j),
+            "key works · $0.50 used, no limit"
+        );
+        assert_eq!(key_error(401, "nope"), "the provider rejected this key");
     }
 
     #[test]

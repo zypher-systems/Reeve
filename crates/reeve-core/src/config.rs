@@ -233,9 +233,15 @@ pub fn home_dir() -> PathBuf {
         .join(".reeve")
 }
 
-/// Defaults, then `home/config.toml` if it exists. User connections merge
-/// over the built-in ones by name.
+/// Defaults, then `home/config.toml`, then the TUI's `settings.toml`.
+/// User connections merge over the built-in ones by name.
 pub fn load_at(home: &Path) -> Result<Config> {
+    let mut cfg = load_config_file(home)?;
+    crate::settings::Settings::load(home)?.apply(&mut cfg);
+    Ok(cfg)
+}
+
+fn load_config_file(home: &Path) -> Result<Config> {
     let path = home.join("config.toml");
     let mut cfg = Config::default();
     if !path.exists() {
@@ -329,6 +335,55 @@ pub fn resolve_secret_with(
     )))
 }
 
+/// Where a connection's key would come from, without reading it out:
+/// `config.toml`, `$VAR`, or `keys/<name>`. `None` when there is none.
+pub fn secret_source(cfg: &Config, home: &Path, connection: &str) -> Option<String> {
+    secret_source_with(cfg, home, connection, |k| std::env::var(k).ok())
+}
+
+fn secret_source_with(
+    cfg: &Config,
+    home: &Path,
+    connection: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let conn = cfg.connections.get(connection)?;
+    let set = |v: Option<String>| v.is_some_and(|s| !s.trim().is_empty());
+    if set(conn.api_key.clone()) {
+        return Some("config.toml".into());
+    }
+    if let Some(var) = conn.env_key.as_deref() {
+        if set(env(var)) {
+            return Some(format!("${var}"));
+        }
+    }
+    if set(fs::read_to_string(key_path(home, connection)).ok()) {
+        return Some(format!("keys/{connection}"));
+    }
+    if conn.is_local() {
+        return Some("none needed".into());
+    }
+    let fallback = match conn.kind.as_str() {
+        "openrouter" => Some("OPENROUTER_API_KEY"),
+        "openai" => Some("OPENAI_API_KEY"),
+        _ => None,
+    }?;
+    set(env(fallback)).then(|| format!("${fallback}"))
+}
+
+/// Forget a stored key. Keys from the environment or `config.toml` are
+/// not Reeve's to remove.
+pub fn remove_secret_at(home: &Path, connection: &str) -> Result<bool> {
+    if !crate::settings::valid_connection_name(connection) {
+        return Err(Error::Config(format!("bad connection name {connection:?}")));
+    }
+    match fs::remove_file(key_path(home, connection)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Whether a connection has a key, without returning it.
 pub fn has_secret(cfg: &Config, home: &Path, connection: &str) -> bool {
     resolve_secret(cfg, home, connection).is_ok()
@@ -345,7 +400,7 @@ pub fn store_secret_at(home: &Path, connection: &str, secret: &str) -> Result<Pa
     if secret.is_empty() {
         return Err(Error::Config("empty API key".into()));
     }
-    if connection.contains(['/', '\\']) || connection.starts_with('.') {
+    if !crate::settings::valid_connection_name(connection) {
         return Err(Error::Config(format!("bad connection name {connection:?}")));
     }
     let dir = home.join("keys");
@@ -428,6 +483,19 @@ daily_usd = 2.0
             assert_eq!(mode & 0o777, 0o600);
         }
         assert!(store_secret_at(home.path(), "../x", "k").is_err());
+        assert_eq!(
+            secret_source_with(&cfg, home.path(), "openrouter", no_env).as_deref(),
+            Some("keys/openrouter")
+        );
+        assert!(remove_secret_at(home.path(), "openrouter").unwrap());
+        assert_eq!(
+            secret_source_with(&cfg, home.path(), "openrouter", no_env),
+            None
+        );
+        assert_eq!(
+            secret_source_with(&cfg, home.path(), "openrouter", fallback).as_deref(),
+            Some("$OPENROUTER_API_KEY")
+        );
     }
 
     #[cfg(unix)]

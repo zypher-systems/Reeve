@@ -34,6 +34,8 @@ pub struct Entry {
     pub text: String,
     /// When it began.
     pub at: DateTime<Local>,
+    /// Setup chatter that goes away once Reeve is connected.
+    pub transient: bool,
 }
 
 /// The last call's cost details, for the Spend panel.
@@ -98,6 +100,10 @@ pub struct View {
     pub ready: bool,
     /// Asked to quit.
     pub quit: bool,
+    /// Floating panels, top last.
+    pub overlays: Vec<crate::overlay::Overlay>,
+    /// Selected row of the slash-command palette.
+    pub palette_sel: usize,
 }
 
 /// Spending caps, USD; 0 is off.
@@ -140,6 +146,8 @@ impl View {
             last: None,
             ready: false,
             quit: false,
+            overlays: Vec::new(),
+            palette_sel: 0,
         }
     }
 
@@ -150,8 +158,22 @@ impl View {
             who,
             text: text.into(),
             at: Local::now(),
+            transient: false,
         });
         self.scroll = 0;
+    }
+
+    /// A setup note, dropped by [`View::drop_transient`].
+    pub fn push_transient(&mut self, text: impl Into<String>) {
+        self.push(Speaker::System, text);
+        if let Some(e) = self.entries.last_mut() {
+            e.transient = true;
+        }
+    }
+
+    /// Forget setup notes (Reeve is connected now).
+    pub fn drop_transient(&mut self) {
+        self.entries.retain(|e| !e.transient);
     }
 
     /// Fold in a new reading.

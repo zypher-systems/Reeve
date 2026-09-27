@@ -10,6 +10,7 @@ pub mod error;
 pub mod ledger;
 pub mod llm;
 pub mod session;
+pub mod settings;
 pub mod spend;
 
 pub use error::{Error, Result};

@@ -159,6 +159,14 @@ impl PriceBook {
         n
     }
 
+    /// Keep another book's catalog rows (not its overrides) where this one
+    /// has none.
+    pub fn absorb(&mut self, other: &PriceBook) {
+        for (k, v) in &other.catalog {
+            self.catalog.entry(k.clone()).or_insert(*v);
+        }
+    }
+
     /// Rates for `model`, if known.
     pub fn rates(&self, model: &str) -> Option<Rates> {
         self.overrides
@@ -233,7 +241,8 @@ pub fn format_rates(rates: Option<Rates>) -> String {
     }
 }
 
-fn trim_rate(v: f64) -> String {
+/// `3`, `0.3`, `1.25`: a per-million rate without trailing zeros.
+pub fn trim_rate(v: f64) -> String {
     if (v - v.round()).abs() < 1e-9 {
         format!("{}", v.round() as i64)
     } else {

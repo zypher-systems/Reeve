@@ -46,6 +46,7 @@ pub fn draw(f: &mut Frame, v: &View, t: &Theme) {
     } else {
         draw_chat(f, body, v, t);
     }
+    crate::panels::draw_overlay(f, v, t);
 }
 
 // ── header & footer ─────────────────────────────────────────────────────────
@@ -132,6 +133,7 @@ fn draw_footer(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
     } else {
         &[
             ("⏎", "send"),
+            ("/", "commands"),
             ("alt+⏎", "newline"),
             ("^y", "yolo"),
             ("^b", "rail"),
@@ -168,7 +170,7 @@ fn put_split(f: &mut Frame, area: Rect, left: Vec<Span>, right: Vec<Span>, bg: C
 
 // ── conversation ────────────────────────────────────────────────────────────
 
-fn panel<'a>(title: &'a str, t: &Theme, hot: bool) -> Block<'a> {
+pub(crate) fn panel<'a>(title: &'a str, t: &Theme, hot: bool) -> Block<'a> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -234,6 +236,7 @@ fn draw_chat(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
         );
     }
     draw_composer(f, composer, v, t, text_w);
+    crate::panels::draw_palette(f, composer, v, t);
 }
 
 fn draw_composer(f: &mut Frame, area: Rect, v: &View, t: &Theme, text_w: usize) {
@@ -262,7 +265,7 @@ fn draw_composer(f: &mut Frame, area: Rect, v: &View, t: &Theme, text_w: usize) 
         } else if v.ready {
             "Ask Reeve to check, explain, or plan something on this machine…"
         } else {
-            "Set up a key first — see above."
+            "Type /providers to add an API key and pick a model."
         };
         lines.push(Line::from(vec![
             prompt,
@@ -288,7 +291,7 @@ fn draw_composer(f: &mut Frame, area: Rect, v: &View, t: &Theme, text_w: usize) 
         Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>()),
         body,
     );
-    if !v.busy {
+    if !v.busy && v.overlays.is_empty() {
         let (row, col) = cursor_pos(&v.input[..v.cursor], text_w);
         let row = row.saturating_sub(skip);
         f.set_cursor_position(Position::new(
@@ -1060,7 +1063,7 @@ fn cursor_pos(before: &str, width: usize) -> (usize, usize) {
     }
 }
 
-fn pad(s: &str, w: usize) -> String {
+pub(crate) fn pad(s: &str, w: usize) -> String {
     let sw = s.width();
     if sw >= w {
         s.to_string()
@@ -1069,7 +1072,7 @@ fn pad(s: &str, w: usize) -> String {
     }
 }
 
-fn truncate(s: &str, w: usize) -> String {
+pub(crate) fn truncate(s: &str, w: usize) -> String {
     if s.width() <= w {
         return s.to_string();
     }
@@ -1122,7 +1125,7 @@ fn uptime(secs: u64) -> String {
 }
 
 /// `anthropic/claude-sonnet-4.6` → `claude-sonnet-4.6`.
-fn short_model(m: &str) -> String {
+pub(crate) fn short_model(m: &str) -> String {
     m.rsplit('/').next().unwrap_or(m).to_string()
 }
 
