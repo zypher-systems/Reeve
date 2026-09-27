@@ -1,0 +1,48 @@
+# Copy to ~/.reeve/config.toml. Keys belong in `reeve key set <connection>`
+# (stored at ~/.reeve/keys/<connection>, mode 0600), not here.
+
+default_connection = "openrouter"
+# model = "anthropic/claude-sonnet-5"   # overrides the connection's default_model
+reasoning = "medium"                    # low | medium | high | default (send nothing)
+
+[connections.openrouter]
+kind = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY"
+default_model = "anthropic/claude-sonnet-5"
+
+[connections.openai]
+kind = "openai"                         # any OpenAI-compatible endpoint
+base_url = "https://api.openai.com/v1"
+env_key = "OPENAI_API_KEY"
+default_model = "gpt-5-mini"
+
+# A model server on this machine: no key, priced at $0.
+# [connections.ollama]
+# kind = "local"
+# base_url = "http://localhost:11434/v1"
+# default_model = "qwen3:32b"
+
+# Prices come live from each connection's /models list (OpenRouter includes
+# cache read/write prices). A cost the provider reports always wins.
+# Override a model here, USD per million tokens:
+# [pricing."my/model"]
+# input_per_million = 1.0
+# output_per_million = 4.0
+# cache_read_per_million = 0.1
+# cache_write_per_million = 1.25
+
+[spend]                                 # 0 = off. Caps stop work; they don't warn.
+session_usd = 0
+daily_usd = 0                           # all of Reeve, TUI and daemon
+monthly_usd = 0
+warn_usd = 1.00
+
+[approvals]
+yolo = false                            # ^y toggles per session; the safeguard floor always asks
+
+[ui]
+theme = "brass"
+colors = "auto"                         # auto | truecolor | 256 | 16 ; NO_COLOR wins
+mouse = true
+animate = true

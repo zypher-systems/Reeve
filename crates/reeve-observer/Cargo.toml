@@ -1,0 +1,15 @@
+[package]
+name = "reeve-observer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "System sampling for Reeve (and, from M4, the reeved observer)"
+
+[dependencies]
+rustix.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

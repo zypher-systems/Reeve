@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = ["crates/reeve-core", "crates/reeve-observer", "crates/reeve-tui", "crates/reeve-cli"]
+default-members = ["crates/reeve-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+authors = ["Zypher Systems"]
+
+[workspace.dependencies]
+reeve-core = { path = "crates/reeve-core" }
+reeve-observer = { path = "crates/reeve-observer" }
+reeve-tui = { path = "crates/reeve-tui" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+dirs = "6"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+async-trait = "0.1"
+bytes = "1"
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+rustix = { version = "1", features = ["fs"] }
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["bracketed-paste"] }
+unicode-width = "0.2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "allow"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }

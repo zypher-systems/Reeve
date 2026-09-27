@@ -1,0 +1,23 @@
+[package]
+name = "reeve-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Reeve: an operator agent for your computer"
+
+[[bin]]
+name = "reeve"
+path = "src/main.rs"
+
+[dependencies]
+reeve-core.workspace = true
+reeve-tui.workspace = true
+clap.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+crossterm.workspace = true
+
+[lints]
+workspace = true

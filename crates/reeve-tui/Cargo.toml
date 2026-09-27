@@ -1,0 +1,20 @@
+[package]
+name = "reeve-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Mission-control TUI for Reeve"
+
+[dependencies]
+reeve-core.workspace = true
+reeve-observer.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+tokio.workspace = true
+unicode-width.workspace = true
+chrono.workspace = true
+
+[lints]
+workspace = true
