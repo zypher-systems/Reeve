@@ -311,15 +311,13 @@ fn models(f: &mut Frame, r: Rect, m: &ModelPicker, t: &Theme) {
     } else if hits.is_empty() && !m.loading {
         let msg = if m.query.is_empty() {
             "   This server lists no models. Type an id and press ⏎.".to_string()
+        } else if m.query.trim().contains(char::is_whitespace) {
+            "   Nothing matches.".to_string()
         } else {
-            if m.query.trim().contains(char::is_whitespace) {
-                "   Nothing matches.".to_string()
-            } else {
-                format!(
-                    "   Nothing matches. ⏎ uses \"{}\" as the model id.",
-                    m.query.trim()
-                )
-            }
+            format!(
+                "   Nothing matches. ⏎ uses \"{}\" as the model id.",
+                m.query.trim()
+            )
         };
         lines.push(Line::from(Span::styled(msg, t.muted())));
     }
