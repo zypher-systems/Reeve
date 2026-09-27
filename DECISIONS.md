@@ -2,6 +2,27 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-27: Standing orders: every part of a command must be allowed
+- **Decision:**
+  - An order's run is an ordinary agent turn with an approver that allows T0, and T1/T2 only inside the order's scope. It never allows T3.
+  - Commands are split into their simple commands (the policy's own tokenizer), and each part must match a scope glob or be a pure read on its own.
+  - `*` in a command glob stays within one word.
+  - Write redirects and `$(…)` are refused for unattended runs.
+  - A refusal tells the model to stop and say what it needs. The run ends `blocked`, and its report becomes a proposal on the finding (or an `order-blocked:<id>` finding).
+  - Each occurrence of a finding triggers an order at most once, and runs per day and a cooldown bound it.
+  - Order files and Reeve's `config.toml`/`settings.toml` are floor files for tools.
+- **Chosen vs rejected:**
+  - Rejected whole-line globs: `sudo journalctl --vacuum-size=*` matched `… && sudo dnf remove x` (a test caught it before it shipped).
+  - Rejected wildcard sudoers rules from `reeve orders sudoers`: a `*` in a sudoers argument allows more than it looks like.
+  - Rejected letting an order run T3 with a flag: the floor is where "nobody is watching" is least acceptable.
+  - Rejected T1 protection for order files: a YOLO session could otherwise approve a model writing itself an order.
+- **Why:** This is the one way Reeve acts without the owner. The user asked for scheduled autonomous work that can act on findings; an order's scope and budget have to hold even against a model misled by log text.
+- **Where:** `reeve-core/src/orders.rs` (`Scope::allows`, `command_glob`, `Schedule`), `policy/shell.rs` (`simple_commands`), `policy/paths.rs`, `reeve-observer/src/orders.rs` (`OrderApprover`, `run`), `daemon.rs` (`orders_tick`), `reeve-cli` (`orders`), `reeve-tui` (`/orders`)
+- **Residual risk:**
+  - A scope glob can still be written too broadly (`sudo *`). The panel shows each order's scope, but it doesn't judge it.
+  - A run blocked partway leaves the changes made before the block. Each has its own receipt and undo.
+  - Root in orders depends on sudoers rules the owner writes, and a careless one is a standing grant outside Reeve's control.
+
 ### 2026-09-27: One archive, three ways in: installer, RPM, PKGBUILD
 - **Decision:**
   - Releases build static musl binaries for x86_64 and aarch64 and package them once (`packaging/dist.sh`, used by CI and by hand) with the user unit, the installer, and docs.
