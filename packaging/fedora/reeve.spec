@@ -10,7 +10,7 @@
 %global __brp_mangle_shebangs_exclude_from ^/usr/src/debug/.*$
 
 Name:           reeve
-Version:        0.1.1
+Version:        0.1.2
 Release:        1%{?dist}
 Summary:        An operator agent that manages this computer, with receipts
 
@@ -77,6 +77,9 @@ install -Dpm 0644 packaging/systemd/reeved.service %{buildroot}%{_userunitdir}/r
 %{_userunitdir}/reeved.service
 
 %changelog
+* Sun Sep 27 2026 Zypher Systems <zypher@zyphersystems.com> - 0.1.2-1
+- The observer reports quietly; popups only when a proposed fix is ready.
+
 * Sun Sep 27 2026 Zypher Systems <zypher@zyphersystems.com> - 0.1.1-1
 - Standing orders; one finding per crashing program; paced notifications;
   the agent sees reeved's findings.
