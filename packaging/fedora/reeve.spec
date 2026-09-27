@@ -1,0 +1,81 @@
+# Build from source, offline, with the vendored crates each release ships
+# (reeve-<version>-vendor.tar.xz). Works with rpmbuild, mock, and COPR.
+#
+#   spectool -g -R packaging/fedora/reeve.spec && rpmbuild -ba packaging/fedora/reeve.spec
+#
+# The release also ships a prebuilt RPM (static binary) for quick installs.
+
+# Rust attributes (`#![deny(...)]`) in vendored sources look like shebangs
+# to the checker that scans the debug sources.
+%global __brp_mangle_shebangs_exclude_from ^/usr/src/debug/.*$
+
+Name:           reeve
+Version:        0.1.0
+Release:        1%{?dist}
+Summary:        An operator agent that manages this computer, with receipts
+
+License:        Apache-2.0
+URL:            https://github.com/zypher-systems/reeve
+Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
+Source1:        %{url}/releases/download/v%{version}/%{name}-%{version}-vendor.tar.xz
+
+BuildRequires:  cargo >= 1.88
+BuildRequires:  rust >= 1.88
+BuildRequires:  gcc
+BuildRequires:  systemd-rpm-macros
+
+Requires:       bash
+Requires:       sudo
+Requires:       util-linux
+Requires:       systemd
+Recommends:     libnotify
+Recommends:     snapper
+
+%description
+Reeve is an operator harness: an agent that runs on your computer and
+manages it. It installs and removes packages, fixes services, reads logs,
+tidies disks, and edits configuration across the whole filesystem. Every
+action is classified by risk and approved by you where it should be, and
+each one leaves a hash-chained receipt. File, package, and service changes
+can be undone. The reeved user service watches the machine, learns what
+normal looks like, and tells you when something needs a look.
+
+%prep
+%autosetup -n %{name}-%{version}
+tar -xJf %{SOURCE1}
+mkdir -p .cargo
+cat > .cargo/config.toml <<'CARGO'
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+CARGO
+# rust-toolchain.toml pins the developers' toolchain; build with Fedora's.
+rm -f rust-toolchain.toml
+
+%build
+cargo build --release --locked --offline -p reeve-cli
+
+%install
+install -Dpm 0755 target/release/reeve %{buildroot}%{_bindir}/reeve
+install -Dpm 0644 packaging/systemd/reeved.service %{buildroot}%{_userunitdir}/reeved.service
+
+%check
+%{buildroot}%{_bindir}/reeve --version
+
+%post
+%systemd_user_post reeved.service
+
+%preun
+%systemd_user_preun reeved.service
+
+%files
+%license LICENSE
+%doc README.md config.example.toml DECISIONS.md design.md
+%{_bindir}/reeve
+%{_userunitdir}/reeved.service
+
+%changelog
+* Sun Sep 27 2026 Zypher Systems <zypher@zyphersystems.com> - 0.1.0-1
+- First package: the TUI, tools, receipts, memory, and the reeved observer.

@@ -384,6 +384,15 @@ mod tests {
 
     #[tokio::test]
     async fn no_terminal_means_sudo_fails_fast() {
+        // CI runners have passwordless sudo: nothing to prove there.
+        let passwordless = std::process::Command::new("sudo")
+            .args(["-n", "true"])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if passwordless {
+            return;
+        }
         let (_d, c) = ctx();
         let p = prepare(
             &c,

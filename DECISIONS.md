@@ -2,6 +2,24 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-27: One archive, three ways in: installer, RPM, PKGBUILD
+- **Decision:**
+  - Releases build static musl binaries for x86_64 and aarch64 and package them once (`packaging/dist.sh`, used by CI and by hand) with the user unit, the installer, and docs.
+  - From that: `install.sh` (checksum-verified; `/usr/local` by default, `--user` to stay in `~`), a prebuilt RPM (`cargo generate-rpm`), and an Arch `reeve-bin` PKGBUILD with the checksums filled in.
+  - A source spec (Fedora, offline with a vendored-crates tarball) and a source PKGBUILD are in `packaging/`.
+  - The unit ships in `/usr/lib/systemd/user` (packages) or `/usr/local/lib/systemd/user` (installer), and `reeve daemon install` enables that one instead of writing its own.
+  - Releases are drafts: a person publishes them.
+- **Chosen vs rejected:**
+  - Rejected glibc binaries: they tie the release to the build machine's glibc, and static musl runs on any distribution.
+  - Rejected auto-enabling the service from package scriptlets for every user: Fedora's presets decide that, and the owner turns it on.
+  - Rejected `--user` as the installer's default: `sudo reeve root` runs the binary as root, so by default it should live where only root can write (`reeve doctor` warns otherwise).
+  - Rejected installing without checksums when the SHA256SUMS download fails: the installer refuses.
+- **Why:** The user wants one script that installs the binary and the reeved service together, and proper packages before running the observer on their machine.
+- **Where:** `install.sh`, `packaging/`, `.github/workflows/{ci,release}.yml`, `crates/reeve-cli/Cargo.toml` (`generate-rpm`), `reeve-observer/src/service.rs` (`packaged_unit`), `reeve-cli` (`doctor`)
+- **Residual risk:**
+  - The prebuilt artifacts aren't signed. The checksums come from the same release, so they protect against corruption, not against a compromised release.
+  - The source PKGBUILD's checksum is `SKIP` until it's published to the AUR with a real tarball.
+
 ### 2026-09-27: reeved shares files with the TUI, and is the same binary
 - **Decision:**
   - The observer writes findings (one JSON file each) and a heartbeat file. The TUI polls them every second, and the owner's acknowledge and dismiss are written to the same files.

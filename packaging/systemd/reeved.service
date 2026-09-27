@@ -1,0 +1,17 @@
+# Reeve's observer. A user service: enable it for yourself with
+#   systemctl --user enable --now reeved
+# (or `reeve daemon install`, which does the same when this file is present).
+[Unit]
+Description=Reeve observer: watches this machine, never changes it on its own
+Documentation=https://github.com/zypher-systems/reeve
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/reeve daemon run
+Restart=on-failure
+RestartSec=15
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

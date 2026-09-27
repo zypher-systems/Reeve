@@ -35,6 +35,8 @@ enum Cmd {
     },
     /// Show what Reeve has spent today and this month.
     Spend,
+    /// Check the install: binary, keys, sudo, journal, observer, snapper, receipts.
+    Doctor,
     /// List, inspect, or verify receipts.
     Receipts {
         #[command(subcommand)]
@@ -146,6 +148,10 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Some(Cmd::Models { connection, filter }) => models(&cfg, &home, connection, filter),
         Some(Cmd::Daemon { cmd }) => daemon(&home, cmd),
+        Some(Cmd::Doctor) => {
+            doctor(&cfg, &home);
+            Ok(())
+        }
         Some(Cmd::Receipts { cmd }) => receipts(&home, cmd.unwrap_or(ReceiptsCmd::List { n: 30 })),
         Some(Cmd::Undo { seq, yes }) => {
             let book = ReceiptBook::new(&home);
@@ -313,6 +319,135 @@ fn daemon(home: &std::path::Path, cmd: DaemonCmd) -> Result<(), String> {
                 once,
             ))
         }
+    }
+}
+
+/// Plain checks, each one line: ✓ fine, ! worth fixing, ✗ broken.
+fn doctor(cfg: &Config, home: &std::path::Path) {
+    use std::os::unix::fs::MetadataExt;
+    let ok = |m: String| println!("  ✓ {m}");
+    let warn = |m: String| println!("  ! {m}");
+    let bad = |m: String| println!("  ✗ {m}");
+    let has = |b: &str| {
+        std::process::Command::new("sh")
+            .args(["-c", &format!("command -v {b}")])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    println!("reeve {}", env!("CARGO_PKG_VERSION"));
+
+    println!("binary");
+    match std::env::current_exe() {
+        Ok(exe) => match std::fs::metadata(&exe) {
+            Ok(m) if m.uid() == 0 && m.mode() & 0o022 == 0 => ok(format!(
+                "{} is owned by root and not writable by others",
+                exe.display()
+            )),
+            Ok(_) => warn(format!(
+                "{} is writable by you: `sudo reeve root` runs it as root for file edits. Install system-wide (install.sh, or a package) for daily use.",
+                exe.display()
+            )),
+            Err(e) => bad(format!("{}: {e}", exe.display())),
+        },
+        Err(e) => bad(format!("can't find this binary: {e}")),
+    }
+
+    println!("model");
+    match cfg.route() {
+        Ok((name, _, model)) => {
+            ok(format!("{model} via {name}"));
+            match config::secret_source(cfg, home, &name) {
+                Some(src) => ok(format!("key for {name}: {src}")),
+                None => bad(format!(
+                    "no key for {name}: run `reeve`, then /providers (or `reeve key set {name}`)"
+                )),
+            }
+        }
+        Err(e) => bad(e.to_string()),
+    }
+
+    println!("tools");
+    for b in ["bash", "setsid", "sudo", "journalctl", "systemctl"] {
+        if has(b) {
+            ok(b.to_string())
+        } else {
+            bad(format!("{b} is missing"))
+        }
+    }
+    if !has("notify-send") {
+        warn(
+            "notify-send is missing: findings won't pop up on the desktop (install libnotify)"
+                .into(),
+        );
+    }
+    let distro = reeve_core::distro::Distro::detect();
+    match distro.package_block() {
+        None => ok(format!("{} package tools", distro.name())),
+        Some(why) => warn(why),
+    }
+
+    println!("observer");
+    let journal = std::process::Command::new("journalctl")
+        .args(["--system", "-n", "1", "-q", "--no-pager"])
+        .output()
+        .is_ok_and(|o| o.status.success() && o.stderr.is_empty());
+    if journal {
+        ok("the system journal is readable".into())
+    } else {
+        warn("the system journal isn't readable: add yourself to the systemd-journal group".into())
+    }
+    let unit = reeve_observer::service::packaged_unit()
+        .or_else(|| Some(reeve_observer::service::unit_path()).filter(|p| p.exists()));
+    match &unit {
+        Some(u) => {
+            ok(format!("unit {}", u.display()));
+            let runs = reeve_observer::service::unit_exec(u);
+            let me = std::env::current_exe().ok();
+            match (runs, me) {
+                (Some(r), Some(m)) if r != m => warn(format!(
+                    "the unit runs {}, not this binary ({})",
+                    r.display(),
+                    m.display()
+                )),
+                _ => {}
+            }
+        }
+        None => {
+            warn("reeved isn't installed (install.sh does it; or `reeve daemon install`)".into())
+        }
+    }
+    match reeve_core::findings::ObserverStatus::load(home) {
+        Some(s) if s.alive(chrono::Utc::now()) => ok(format!("reeved is running (pid {})", s.pid)),
+        _ if unit.is_some() => warn(format!(
+            "reeved isn't running ({}): systemctl --user start reeved",
+            reeve_observer::service::state()
+        )),
+        _ => {}
+    }
+
+    println!("safety");
+    let snapper = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "snapper --csvout list-configs 2>/dev/null | tail -n +2 | grep -c ',/$'",
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if snapper.parse::<u32>().unwrap_or(0) > 0 {
+        ok("snapper covers /: root actions get snapshot pairs".into());
+    } else if has("snapper") {
+        warn(
+            "snapper has no config for /: root actions get no snapshots (ask Reeve to set it up)"
+                .into(),
+        );
+    } else {
+        warn("snapper isn't installed: root actions get no snapshots".into());
+    }
+    let v = ReceiptBook::new(home).verify();
+    match v.problem {
+        None => ok(format!("{} receipts, chain intact", v.count)),
+        Some(p) => bad(format!("receipt chain: {p}")),
     }
 }
 

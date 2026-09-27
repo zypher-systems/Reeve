@@ -9,6 +9,8 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 authors = ["Zypher Systems"]
+repository = "https://github.com/zypher-systems/reeve"
+homepage = "https://github.com/zypher-systems/reeve"
 
 [workspace.dependencies]
 reeve-core = { path = "crates/reeve-core" }

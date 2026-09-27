@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Reeve: an operator agent for your computer"
 
 [[bin]]
@@ -23,3 +25,28 @@ serde_json.workspace = true
 
 [lints]
 workspace = true
+
+# `cargo generate-rpm -p crates/reeve-cli --target <triple>` (the release
+# workflow does this): the binary, the user unit, and the docs.
+[package.metadata.generate-rpm]
+name = "reeve"
+summary = "An operator agent that manages this computer, with receipts"
+license = "Apache-2.0"
+url = "https://github.com/zypher-systems/reeve"
+assets = [
+    { source = "target/release/reeve", dest = "/usr/bin/reeve", mode = "755" },
+    { source = "packaging/systemd/reeved.service", dest = "/usr/lib/systemd/user/reeved.service", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/reeve/LICENSE", mode = "644", doc = true },
+    { source = "README.md", dest = "/usr/share/doc/reeve/README.md", mode = "644", doc = true },
+    { source = "config.example.toml", dest = "/usr/share/doc/reeve/config.example.toml", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+bash = "*"
+sudo = "*"
+util-linux = "*"
+systemd = "*"
+
+[package.metadata.generate-rpm.recommends]
+libnotify = "*"
+snapper = "*"

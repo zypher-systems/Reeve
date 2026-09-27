@@ -1,0 +1,29 @@
+# Maintainer: Zypher Systems <zypher@zyphersystems.com>
+#
+# The prebuilt static binary from the GitHub release. The release workflow
+# fills in the version and checksums and attaches this file to the release.
+pkgname=reeve-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="An operator agent that manages this computer, with receipts"
+arch=('x86_64' 'aarch64')
+url="https://github.com/zypher-systems/reeve"
+license=('Apache-2.0')
+depends=('bash' 'sudo' 'util-linux' 'systemd')
+optdepends=('libnotify: desktop notifications for findings'
+            'snapper: snapshots around root changes')
+provides=('reeve')
+conflicts=('reeve')
+source_x86_64=("$url/releases/download/v$pkgver/reeve-x86_64-unknown-linux-musl.tar.gz")
+source_aarch64=("$url/releases/download/v$pkgver/reeve-aarch64-unknown-linux-musl.tar.gz")
+sha256sums_x86_64=('@SHA256_X86_64@')
+sha256sums_aarch64=('@SHA256_AARCH64@')
+
+package() {
+    cd "reeve-$CARCH-unknown-linux-musl"
+    install -Dm755 reeve "$pkgdir/usr/bin/reeve"
+    install -Dm644 reeved.service "$pkgdir/usr/lib/systemd/user/reeved.service"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 config.example.toml "$pkgdir/usr/share/doc/$pkgname/config.example.toml"
+}

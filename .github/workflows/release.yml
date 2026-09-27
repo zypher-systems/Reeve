@@ -1,0 +1,137 @@
+name: release
+
+# Pushing a tag like v0.1.0 builds the Linux binaries, RPMs, and the source
+# vendor tarball, and opens a *draft* release with them, the installer, the
+# checksums, and a ready AUR PKGBUILD. A person reviews and publishes it.
+#
+# Running it by hand (Actions → release → Run workflow), or a pull request
+# that changes packaging, builds everything as artifacts without a release:
+# a dry run, installer included.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - install.sh
+      - packaging/**
+      - Cargo.toml
+      - Cargo.lock
+      - crates/reeve-cli/Cargo.toml
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static musl binaries: they run on any Linux, whatever its glibc.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: build
+        run: cargo build --release --locked -p reeve-cli --target ${{ matrix.target }}
+      - name: smoke test
+        run: |
+          target/${{ matrix.target }}/release/reeve --version
+          target/${{ matrix.target }}/release/reeve doctor || true
+      - name: archive
+        run: packaging/dist.sh ${{ matrix.target }} dist
+      - name: installer, end to end
+        # Install from the archive just built, into a scratch home, exactly
+        # as a user would; then uninstall.
+        run: |
+          set -eu
+          export HOME="$RUNNER_TEMP/home"
+          mkdir -p "$HOME"
+          ./install.sh --from dist/reeve-${{ matrix.target }}.tar.gz --user --no-start
+          "$HOME/.local/bin/reeve" --version
+          grep -q "ExecStart=$HOME/.local/bin/reeve daemon run" "$HOME/.local/share/systemd/user/reeved.service"
+          ./install.sh --user --uninstall
+          test ! -e "$HOME/.local/bin/reeve"
+      - name: rpm
+        run: |
+          set -eu
+          cargo install cargo-generate-rpm --locked --version 0.16.1
+          cargo generate-rpm -p crates/reeve-cli --target ${{ matrix.target }} -o dist/
+          ls -l dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reeve-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/*.rpm
+
+  source:
+    # Crates vendored for offline builds (the Fedora spec, COPR).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+      - name: vendor
+        run: |
+          set -eu
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="reeve-cli"))')
+          cargo vendor --locked vendor >/dev/null
+          mkdir -p dist
+          tar -cJf "dist/reeve-$version-vendor.tar.xz" vendor
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reeve-source
+          path: dist/*.tar.xz
+
+  release:
+    needs: [build, source]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums and PKGBUILD
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          cp install.sh dist/
+          (cd dist && sha256sum *.tar.gz *.rpm *.tar.xz install.sh > SHA256SUMS)
+          sum() { grep " $1\$" dist/SHA256SUMS | awk '{print $1}'; }
+          sed -e "s/@VERSION@/$version/" \
+              -e "s/@SHA256_X86_64@/$(sum reeve-x86_64-unknown-linux-musl.tar.gz)/" \
+              -e "s/@SHA256_AARCH64@/$(sum reeve-aarch64-unknown-linux-musl.tar.gz)/" \
+              packaging/arch/reeve-bin/PKGBUILD > dist/PKGBUILD
+          cat dist/SHA256SUMS
+      - name: draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          notes="docs/releases/${tag}.md"
+          if [ -f "$notes" ]; then flag=(--notes-file "$notes"); else flag=(--generate-notes); fi
+          gh release create "$tag" --draft --title "Reeve ${tag}" "${flag[@]}" \
+            dist/*.tar.gz dist/*.rpm dist/*.tar.xz dist/SHA256SUMS dist/install.sh dist/PKGBUILD
