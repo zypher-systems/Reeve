@@ -40,6 +40,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<ReceiptsCmd>,
     },
+    /// The background observer (reeved).
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCmd,
+    },
     /// Undo the action on a receipt.
     Undo {
         /// Receipt number.
@@ -47,6 +52,22 @@ enum Cmd {
         /// Don't ask for confirmation.
         #[arg(short, long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonCmd {
+    /// Install reeved as a systemd user service and start it.
+    Install,
+    /// Stop and remove the service.
+    Uninstall,
+    /// Is it running, and what has it found.
+    Status,
+    /// Run the observer in the foreground (what the service runs).
+    Run {
+        /// One detection pass, then exit.
+        #[arg(long)]
+        once: bool,
     },
 }
 
@@ -124,6 +145,7 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Some(Cmd::Models { connection, filter }) => models(&cfg, &home, connection, filter),
+        Some(Cmd::Daemon { cmd }) => daemon(&home, cmd),
         Some(Cmd::Receipts { cmd }) => receipts(&home, cmd.unwrap_or(ReceiptsCmd::List { n: 30 })),
         Some(Cmd::Undo { seq, yes }) => {
             let book = ReceiptBook::new(&home);
@@ -225,6 +247,71 @@ fn receipts(home: &std::path::Path, cmd: ReceiptsCmd) -> Result<(), String> {
                 }
                 Some(p) => Err(format!("✗ after {} good receipts: {p}", v.count)),
             }
+        }
+    }
+}
+
+fn daemon(home: &std::path::Path, cmd: DaemonCmd) -> Result<(), String> {
+    use reeve_core::findings::{FindingStore, ObserverStatus};
+    use reeve_observer::service;
+    match cmd {
+        DaemonCmd::Install => {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let custom = std::env::var_os("REEVE_HOME").map(std::path::PathBuf::from);
+            println!("{}", service::install(&exe, custom.as_deref())?);
+            if exe.starts_with(std::env::var("HOME").unwrap_or_default()) {
+                println!(
+                    "note: the service runs {} from your home; after rebuilding, restart it (systemctl --user restart reeved).",
+                    exe.display()
+                );
+            }
+            Ok(())
+        }
+        DaemonCmd::Uninstall => {
+            println!("{}", service::uninstall()?);
+            Ok(())
+        }
+        DaemonCmd::Status => {
+            println!("service: {}", service::state());
+            match ObserverStatus::load(home) {
+                Some(s) if s.alive(chrono::Utc::now()) => println!(
+                    "reeved: running (pid {}), system journal {}, drafter {} (${:.2} today, {} drafts)",
+                    s.pid,
+                    if s.journal {
+                        "readable"
+                    } else {
+                        "NOT readable (add yourself to the systemd-journal group)"
+                    },
+                    if s.drafter { "on" } else { "off" },
+                    s.drafter_usd_today,
+                    s.drafts_today
+                ),
+                Some(_) => println!("reeved: not running (last heartbeat is old)"),
+                None => println!("reeved: has never run"),
+            }
+            let live: Vec<_> = FindingStore::new(home)
+                .list()
+                .into_iter()
+                .filter(|f| f.is_live())
+                .collect();
+            if live.is_empty() {
+                println!("no open findings");
+            }
+            for f in live {
+                println!("[{}] {}  ({})", f.severity.as_str(), f.title, f.id);
+            }
+            Ok(())
+        }
+        DaemonCmd::Run { once } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .build()
+                .map_err(|e| e.to_string())?;
+            rt.block_on(reeve_observer::daemon::run_observer(
+                home.to_path_buf(),
+                once,
+            ))
         }
     }
 }

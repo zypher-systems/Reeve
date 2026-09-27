@@ -2,6 +2,22 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-27: reeved shares files with the TUI, and is the same binary
+- **Decision:**
+  - The observer writes findings (one JSON file each) and a heartbeat file. The TUI polls them every second, and the owner's acknowledge and dismiss are written to the same files.
+  - The service's `ExecStart` is `reeve daemon run`, and one instance runs at a time (a lock file).
+  - Failed units are grouped by template (`drkonqi-coredump-processor@.service`), so a crashing app is one finding, not one per crash.
+  - Journal spikes are measured against each unit's learned rate: 10× normal, and at least 30 in 10 minutes.
+- **Chosen vs rejected:**
+  - Rejected the socket in the original design: the TUI would need reconnect logic and still read the files for history. Files work with `reeved` down, and can be inspected with `cat`.
+  - Rejected a separate `reeved` binary: two binaries to install and keep at the same version.
+  - Rejected one finding per failed unit instance: KDE's crash processor makes a new unit per crash.
+- **Why:** The observer must be simple enough to trust running all the time.
+- **Where:** `reeve-core/src/findings.rs`, `reeve-observer/src/{daemon,detect,baselines,journal,notify,drafter,service}.rs`, `reeve-cli` (`daemon`), `reeve-tui/src/run.rs` (`poll_observer`)
+- **Residual risk:**
+  - The TUI and `reeved` can both write a finding file at the same moment, and the last write wins (an acknowledge could be lost to a tick). Writes are atomic, so a file is never torn.
+  - The service runs the binary wherever `reeve daemon install` found it. After a rebuild in `target/`, restart it.
+
 ### 2026-09-27: Background drafting is a separate, budgeted role, off by default
 - **Decision:**
   - `reeved` watches with rules and no model.
@@ -12,7 +28,7 @@ Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / W
   - Rejected drafting on by default: a noisy journal could spend money while nobody is at the machine.
   - Rejected sharing the main session's budget: the owner can't tell or cap what the background costs.
 - **Why:** The user wants a way to turn it on, "with its own budget like an auditor" (Ryter's auditor seat).
-- **Where:** `design.md` §8 (to be built in M4)
+- **Where:** `reeve-observer/src/drafter.rs`, `reeve-tui` (`/observer`), `reeve-core/src/ledger.rs` (`role_today`)
 - **Residual risk:** Findings are built from journal text any process can write, and the drafter reads that text. With T0-only tools, the worst outcome is a misleading proposal that the owner still has to approve.
 
 ### 2026-09-27: Memory is Markdown notes; the owner has the last word

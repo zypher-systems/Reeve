@@ -4,11 +4,12 @@ An **operator harness**: an agent that runs on your computer and manages it for 
 coding agent. It keeps the machine healthy, tidy, and configured. It gives receipts for everything
 it does, and it learns how your system behaves.
 
-> **Status: M3 (memory).** Everything from M2 (files anywhere including root-owned ones, packages,
+> **Status: M4 (observer).** Everything from M3 (files anywhere including root-owned ones, packages,
 > services, logs, processes, shell with `sudo` through Reeve's own password prompt, risk tiers, receipts,
-> undo, snapper pairs, session reports), plus memory. Reeve surveys the machine and keeps facts,
-> runbooks of fixes that worked (and how often), and your preferences as plain Markdown files it reads
-> every session. See [`design.md`](design.md) and [`DECISIONS.md`](DECISIONS.md).
+> undo, snapper pairs, session reports, memory), plus `reeved`. It's a background observer that watches
+> the machine with rules (no model, no cost), learns what's normal, notifies you of findings, and can
+> pre-draft fixes with its own budget if you turn that on. See [`design.md`](design.md) and
+> [`DECISIONS.md`](DECISIONS.md).
 
 ## Quick start
 
@@ -74,6 +75,30 @@ edit, or delete any of it, by hand or in `/memory`.
   this off.
 - **Baselines** arrive with the observer in M4.
 
+## The observer (`reeved`)
+
+```sh
+reeve daemon install     # systemd user service, started now and at login
+reeve daemon status      # running? what has it found?
+reeve daemon uninstall
+```
+
+(or `i` / `u` in `/observer`). It samples every 5 s and follows the journal. It raises findings for:
+
+- full or fast-filling disks
+- swap nearly full, sustained memory pressure, heat, or load
+- failed units (grouped, so one finding covers every instance of a crashing template)
+- journal spikes against each unit's normal rate, and critical messages
+- a newer kernel waiting for a reboot, and security updates
+
+Findings notify the desktop (rate-limited) and wait in `/findings`. There, `d` asks Reeve to look into one,
+`p` carries out a drafted fix, `a` marks it seen, and `x` dismisses it for good. Baselines of what's normal
+appear in `/memory`'s Baselines tab.
+
+The observer never changes the machine. The optional **drafter** pre-drafts a fix for each finding while
+you're away. It's off by default, and when on it uses read-only tools and its own model and budget
+(`/observer`, or `[observer.drafter]`). Its spend counts toward your global caps too.
+
 Each session keeps `~/.reeve/sessions/<id>/report.md`: what you asked, what was done, what can be undone,
 and what it cost.
 
@@ -86,7 +111,7 @@ Set `REEVE_HOME` to use a different state directory.
 | key | does |
 | --- | --- |
 | `⏎` / `alt+⏎` | send / newline |
-| `/` | commands: `/providers`, `/model`, `/memory`, `/reflect`, `/receipts`, `/new`, `/yolo`, `/help`, `/quit` |
+| `/` | commands: `/providers`, `/model`, `/findings`, `/observer`, `/memory`, `/reflect`, `/receipts`, `/new`, `/yolo`, `/help`, `/quit` |
 | `^p` / `^r` | `/providers` / `/receipts` (`u` undo, `v` verify) |
 | `⏎` `a` `n` | on an approval card: approve, allow for session, deny |
 | `esc` | stop the running turn, or clear the composer |
@@ -99,7 +124,7 @@ Set `REEVE_HOME` to use a different state directory.
 
 ```
 crates/reeve-core      config, keys, providers, pricing, ledger, agent, policy (tiers), tools, receipts, undo
-crates/reeve-observer  /proc + /sys sampler (becomes the `reeved` observer in M4)
+crates/reeve-observer  sampler, journal follower, baselines, detectors, notifications, drafter, the reeved loop
 crates/reeve-tui       mission-control UI
 crates/reeve-cli       the `reeve` binary
 ```

@@ -48,6 +48,20 @@ enabled = true                          # snapper pre/post around root actions, 
 survey = true                           # read-only survey on first run, weekly after
 auto_reflect = true                     # one model call per finished session to propose memories
 
+[observer]                              # reeved: `reeve daemon install`
+notify = true                           # desktop notifications for findings
+disk_warn = 0.90
+temp_warn = 90.0
+
+[observer.drafter]                      # pre-drafts fixes; off by default, own budget
+enabled = false
+# connection = "openrouter"             # default: the main connection
+# model = "…"                           # default: the main model; a cheap one is plenty
+daily_usd = 0.25
+per_draft_usd = 0.05
+max_drafts_per_day = 10
+min_severity = "warning"
+
 [ui]
 theme = "brass"
 colors = "auto"                         # auto | truecolor | 256 | 16 ; NO_COLOR wins

@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 reeve-core.workspace = true
 reeve-tui.workspace = true
+reeve-observer.workspace = true
 clap.workspace = true
 tokio.workspace = true
 chrono.workspace = true

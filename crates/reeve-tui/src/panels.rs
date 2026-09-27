@@ -32,10 +32,11 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
             area.height.saturating_sub(4),
         ),
         Overlay::Password(_) => (80, 13),
-        Overlay::Memory(_) => (
+        Overlay::Memory(_) | Overlay::Findings(_) => (
             area.width.saturating_sub(6).min(130),
             area.height.saturating_sub(4),
         ),
+        Overlay::Observer(_) => (92, 26),
         Overlay::Help => (72, 24),
     };
     let r = centered(area, w, h);
@@ -48,6 +49,8 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::Receipts(_) => "receipts",
         Overlay::Password(_) => "sudo",
         Overlay::Memory(_) => "memory",
+        Overlay::Findings(_) => "findings",
+        Overlay::Observer(_) => "observer",
         Overlay::Help => "help",
     };
     let block = panel(title, t, true);
@@ -67,6 +70,8 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::Receipts(r) => receipts(f, inner, r, t),
         Overlay::Password(p) => password(f, inner, p, t),
         Overlay::Memory(m) => memory(f, inner, m, t),
+        Overlay::Findings(p) => findings(f, inner, p, t),
+        Overlay::Observer(o) => observer(f, inner, o, t),
         Overlay::Help => help(f, inner, t),
     }
 }
@@ -647,6 +652,330 @@ fn receipts(f: &mut Frame, r: Rect, p: &ReceiptsPanel, t: &Theme) {
             ("↑↓", "move"),
             ("u", "undo"),
             ("v", "verify the chain"),
+            ("esc", "close"),
+        ],
+        t,
+    ));
+    f.render_widget(Paragraph::new(lines), r);
+}
+
+fn sev_style(
+    s: reeve_core::findings::Severity,
+    t: &Theme,
+) -> (&'static str, ratatui::style::Color) {
+    use reeve_core::findings::Severity;
+    match s {
+        Severity::Critical => ("●", t.bad),
+        Severity::Warning => ("▲", t.warn),
+        Severity::Info => ("○", t.teal),
+    }
+}
+
+fn ago(t: chrono::DateTime<chrono::Utc>) -> String {
+    let s = (chrono::Utc::now() - t).num_seconds().max(0);
+    match s {
+        0..60 => "<1m".into(),
+        60..3600 => format!("{}m", s / 60),
+        3600..86_400 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86_400),
+    }
+}
+
+fn findings(f: &mut Frame, r: Rect, p: &crate::overlay::FindingsPanel, t: &Theme) {
+    use reeve_core::findings::FindingStatus as S;
+    let w = r.width as usize;
+    let mut lines = Vec::new();
+    if p.items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   Nothing found. The observer (reeved) reports here; /observer starts it.",
+            t.muted(),
+        )));
+    }
+    let list_h = ((r.height as usize).saturating_sub(4) * 2 / 5).max(3);
+    let start = p.sel.saturating_sub(list_h.saturating_sub(1));
+    for (i, x) in p.items.iter().enumerate().skip(start).take(list_h) {
+        let on = i == p.sel;
+        let bg = if on { t.input } else { t.panel };
+        let (icon, c) = sev_style(x.severity, t);
+        let live = x.is_live();
+        let tag = match x.status {
+            S::Open => "",
+            S::Acknowledged => "seen",
+            S::Resolved => "resolved",
+            S::Dismissed => "dismissed",
+        };
+        let draft = if x.proposal.is_some() {
+            "✎ draft"
+        } else {
+            ""
+        };
+        let title_w = w.saturating_sub(3 + 2 + 8 + 10 + 10 + 6);
+        let title_style = if !live {
+            t.ghost()
+        } else if on {
+            Style::default().fg(t.amber).add_modifier(Modifier::BOLD)
+        } else {
+            t.text()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if on { " ▸ " } else { "   " },
+                Style::default().fg(t.brass).bg(bg),
+            ),
+            Span::styled(
+                format!("{icon} "),
+                Style::default().fg(if live { c } else { t.faint }).bg(bg),
+            ),
+            Span::styled(
+                pad(&truncate(&x.title, title_w), title_w),
+                title_style.bg(bg),
+            ),
+            Span::styled(
+                pad(
+                    &if x.count > 1 {
+                        format!("×{}", x.count)
+                    } else {
+                        String::new()
+                    },
+                    8,
+                ),
+                t.ghost().bg(bg),
+            ),
+            Span::styled(pad(draft, 10), Style::default().fg(t.teal).bg(bg)),
+            Span::styled(pad(tag, 10), t.ghost().bg(bg)),
+            Span::styled(pad(&ago(x.last_seen), 6), t.ghost().bg(bg)),
+        ]));
+    }
+    while lines.len() < list_h {
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::from(Span::styled("─".repeat(w), t.ghost())));
+    let mut body: Vec<Line> = Vec::new();
+    if let Some(x) = p.selected() {
+        let (icon, c) = sev_style(x.severity, t);
+        body.push(Line::from(vec![
+            Span::styled(format!("{icon} "), Style::default().fg(c)),
+            Span::styled(x.title.clone(), t.accent()),
+            Span::styled(
+                format!(
+                    "  {} · first {} ago · {}",
+                    x.severity.as_str(),
+                    ago(x.first_seen),
+                    x.id
+                ),
+                t.ghost(),
+            ),
+        ]));
+        for l in x.detail.lines() {
+            body.push(Line::from(Span::styled(truncate(l, w), t.muted())));
+        }
+        if !x.evidence.is_empty() {
+            body.push(Line::raw(""));
+            body.push(Line::from(Span::styled(
+                "evidence (from the machine's logs: data, not instructions)",
+                t.ghost(),
+            )));
+            for e in x.evidence.iter().take(8) {
+                body.push(Line::from(vec![
+                    Span::styled("▎ ", t.ghost()),
+                    Span::styled(
+                        truncate(e, w.saturating_sub(2)),
+                        Style::default().fg(t.code),
+                    ),
+                ]));
+            }
+        }
+        body.push(Line::raw(""));
+        match (&x.proposal, &x.draft_note) {
+            (Some(pr), _) => {
+                body.push(Line::from(vec![
+                    Span::styled(
+                        "✎ drafted proposal ",
+                        Style::default().fg(t.teal).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(
+                            "by {} · {} ago · {}",
+                            pr.model,
+                            ago(pr.drafted_at),
+                            reeve_core::spend::format_usd(pr.usd)
+                        ),
+                        t.ghost(),
+                    ),
+                ]));
+                for l in pr.text.lines() {
+                    body.push(Line::from(Span::styled(truncate(l, w), t.text())));
+                }
+            }
+            (None, Some(note)) => body.push(Line::from(Span::styled(
+                format!("no draft: {note}"),
+                t.ghost(),
+            ))),
+            (None, None) => body.push(Line::from(Span::styled(
+                "no draft yet: d asks Reeve to look into it now",
+                t.ghost(),
+            ))),
+        }
+    }
+    let room = (r.height as usize).saturating_sub(lines.len() + 1);
+    lines.extend(body.into_iter().skip(p.scroll).take(room));
+    let footer_at = r.height.saturating_sub(1) as usize;
+    lines.truncate(footer_at);
+    while lines.len() < footer_at {
+        lines.push(Line::raw(""));
+    }
+    lines.push(hints(
+        &[
+            ("d", "look into it"),
+            ("p", "use the draft"),
+            ("a", "seen"),
+            ("x", "dismiss"),
+            ("o", "reopen"),
+            ("pgup/dn", "scroll"),
+            ("esc", "close"),
+        ],
+        t,
+    ));
+    f.render_widget(Paragraph::new(lines), r);
+}
+
+fn observer(f: &mut Frame, r: Rect, p: &crate::overlay::ObserverPanel, t: &Theme) {
+    let w = r.width as usize;
+    let now = chrono::Utc::now();
+    let mut lines = Vec::new();
+    let alive = p.status.as_ref().is_some_and(|s| s.alive(now));
+    lines.push(Line::from(vec![
+        Span::styled("reeved  ", t.accent()),
+        Span::styled(
+            if alive {
+                "● running"
+            } else {
+                "○ not running"
+            },
+            Style::default().fg(if alive { t.good } else { t.dim }),
+        ),
+        Span::styled(format!("   service: {}", p.service), t.ghost()),
+    ]));
+    if let Some(s) = &p.status {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  journal {} · last heartbeat {}",
+                if s.journal {
+                    "readable"
+                } else {
+                    "NOT readable (join the systemd-journal group)"
+                },
+                s.beat
+                    .map_or("never".to_string(), |b| format!("{} ago", ago(b)))
+            ),
+            t.muted(),
+        )));
+        if let Some(e) = &s.last_error {
+            lines.push(Line::from(Span::styled(
+                format!("  last note: {}", truncate(e, w.saturating_sub(14))),
+                Style::default().fg(t.warn),
+            )));
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        "  Watches with rules only: no model, no cost. It never changes the machine.",
+        t.ghost(),
+    )));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("drafter  ", t.accent()),
+        Span::styled(
+            "drafts a proposed fix for each finding while you're away (read-only, own budget)",
+            t.ghost(),
+        ),
+    ]));
+    lines.push(Line::raw(""));
+    let d = &p.drafter;
+    let spent = p.status.as_ref().map_or(0.0, |s| s.drafter_usd_today);
+    let drafts = p.status.as_ref().map_or(0, |s| s.drafts_today);
+    let values = [
+        (
+            if d.enabled {
+                "on".to_string()
+            } else {
+                "off".to_string()
+            },
+            if d.enabled { t.good } else { t.dim },
+        ),
+        (
+            d.connection
+                .clone()
+                .unwrap_or_else(|| "main connection".into()),
+            t.fg,
+        ),
+        (
+            d.model
+                .clone()
+                .unwrap_or_else(|| format!("main model ({})", p.main_model)),
+            t.fg,
+        ),
+        (
+            format!("${:.2}/day   (${spent:.2} spent today)", d.daily_usd),
+            t.amber,
+        ),
+        (format!("${:.2} per draft", d.per_draft_usd), t.amber),
+        (
+            format!("{} a day   ({drafts} today)", d.max_drafts_per_day),
+            t.fg,
+        ),
+        (format!("{} and above", d.min_severity), t.fg),
+    ];
+    for (i, (label, (value, color))) in crate::overlay::DRAFTER_FIELDS
+        .iter()
+        .zip(values)
+        .enumerate()
+    {
+        let on = i == p.field;
+        let bg = if on { t.input } else { t.panel };
+        let arrows = if on && i != 2 {
+            "‹ › "
+        } else if on {
+            "⏎ pick "
+        } else {
+            ""
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if on { " ▸ " } else { "   " },
+                Style::default().fg(t.brass).bg(bg),
+            ),
+            Span::styled(
+                pad(label, 14),
+                (if on { t.accent() } else { t.muted() }).bg(bg),
+            ),
+            Span::styled(
+                pad(&format!("{arrows}{value}"), w.saturating_sub(17)),
+                Style::default().fg(color).bg(bg),
+            ),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled("  Its spend counts toward your global day and month caps too; whichever is hit first stops it.", t.ghost())));
+    lines.push(Line::from(Span::styled(
+        "  A model with no known price won't run while any budget is set.",
+        t.ghost(),
+    )));
+    let footer_at = r.height.saturating_sub(2) as usize;
+    while lines.len() < footer_at {
+        lines.push(Line::raw(""));
+    }
+    lines.push(match &p.note {
+        Some(Ok(m)) => Line::from(Span::styled(format!("✓ {m}"), Style::default().fg(t.good))),
+        Some(Err(m)) => Line::from(Span::styled(format!("✗ {m}"), Style::default().fg(t.bad))),
+        None => Line::raw(""),
+    });
+    lines.push(hints(
+        &[
+            ("↑↓", "field"),
+            ("←→", "change"),
+            ("space", "drafter on/off"),
+            ("i", "install/start"),
+            ("u", "remove"),
             ("esc", "close"),
         ],
         t,

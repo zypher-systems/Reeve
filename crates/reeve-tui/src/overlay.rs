@@ -27,6 +27,14 @@ pub const COMMANDS: &[Command] = &[
         about: "choose the model (live prices)",
     },
     Command {
+        name: "/findings",
+        about: "what the observer noticed; drafted fixes",
+    },
+    Command {
+        name: "/observer",
+        about: "reeved service and the drafter's budget",
+    },
+    Command {
         name: "/memory",
         about: "what Reeve knows: facts, runbooks, preferences",
     },
@@ -114,6 +122,27 @@ pub enum Action {
     MemoryEdit(reeve_core::memory::Layer, String),
     /// Re-run the survey.
     Survey,
+    /// Ask Reeve to investigate a finding, in the chat.
+    Diagnose(String),
+    /// Carry out a finding's drafted proposal, in the chat.
+    UseProposal(String),
+    /// Set a finding's status.
+    FindingStatus(String, reeve_core::findings::FindingStatus),
+    /// Install and start reeved.
+    InstallDaemon,
+    /// Stop and remove reeved.
+    UninstallDaemon,
+    /// Save the drafter's settings.
+    SaveDrafter(reeve_core::config::DrafterConfig),
+    /// Pick the drafter's model.
+    DrafterModel(String),
+    /// Use this model for the drafter.
+    ChooseDrafterModel {
+        /// Connection.
+        connection: String,
+        /// Model id.
+        model: String,
+    },
     /// Reflect on this session now.
     Reflect,
     /// Save a new connection.
@@ -142,6 +171,10 @@ pub enum Overlay {
     Password(PasswordEntry),
     /// `/memory`.
     Memory(MemoryPanel),
+    /// `/findings`.
+    Findings(FindingsPanel),
+    /// `/observer`.
+    Observer(ObserverPanel),
     /// `/help`.
     Help,
 }
@@ -160,6 +193,8 @@ impl Overlay {
             Self::Receipts(r) => r.on_key(k),
             Self::Password(p) => p.on_key(k),
             Self::Memory(m) => m.on_key(k),
+            Self::Findings(f) => f.on_key(k),
+            Self::Observer(o) => o.on_key(k),
             Self::Help => Action::Close,
         }
     }
@@ -321,6 +356,178 @@ impl ReceiptsPanel {
             _ => {}
         }
         Action::None
+    }
+}
+
+// ── /findings ───────────────────────────────────────────────────────────────
+
+/// The findings inbox.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FindingsPanel {
+    /// Findings, live first.
+    pub items: Vec<reeve_core::findings::Finding>,
+    /// Selected row.
+    pub sel: usize,
+    /// Detail scroll.
+    pub scroll: usize,
+}
+
+impl FindingsPanel {
+    /// The selected finding.
+    pub fn selected(&self) -> Option<&reeve_core::findings::Finding> {
+        self.items.get(self.sel)
+    }
+
+    /// New list, same selection.
+    pub fn refresh(&mut self, items: Vec<reeve_core::findings::Finding>) {
+        let keep = self.selected().map(|f| f.id.clone());
+        self.items = items;
+        if let Some(id) = keep {
+            if let Some(i) = self.items.iter().position(|f| f.id == id) {
+                self.sel = i;
+            }
+        }
+        self.sel = self.sel.min(self.items.len().saturating_sub(1));
+    }
+
+    fn on_key(&mut self, k: KeyEvent) -> Action {
+        use reeve_core::findings::FindingStatus as S;
+        let n = self.items.len();
+        match k.code {
+            KeyCode::Up => {
+                self.sel = self.sel.saturating_sub(1);
+                self.scroll = 0;
+            }
+            KeyCode::Down => {
+                self.sel = (self.sel + 1).min(n.saturating_sub(1));
+                self.scroll = 0;
+            }
+            KeyCode::PageDown => self.scroll += 5,
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(5),
+            _ => {}
+        }
+        let Some(f) = self.selected() else {
+            return Action::None;
+        };
+        let id = f.id.clone();
+        match k.code {
+            KeyCode::Char('d') | KeyCode::Enter => Action::Diagnose(id),
+            KeyCode::Char('p') if f.proposal.is_some() => Action::UseProposal(id),
+            KeyCode::Char('a') => Action::FindingStatus(id, S::Acknowledged),
+            KeyCode::Char('x') => Action::FindingStatus(id, S::Dismissed),
+            KeyCode::Char('o') => Action::FindingStatus(id, S::Open),
+            _ => Action::None,
+        }
+    }
+}
+
+// ── /observer ───────────────────────────────────────────────────────────────
+
+/// Drafter fields, in order.
+pub const DRAFTER_FIELDS: &[&str] = &[
+    "drafter",
+    "connection",
+    "model",
+    "daily budget",
+    "per draft",
+    "drafts/day",
+    "severity",
+];
+
+/// The observer panel: service state and the drafter's settings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObserverPanel {
+    /// `active`, `inactive`, `not installed`…
+    pub service: String,
+    /// The last heartbeat, if any.
+    pub status: Option<reeve_core::findings::ObserverStatus>,
+    /// Drafter settings being edited.
+    pub drafter: reeve_core::config::DrafterConfig,
+    /// Connections to choose from.
+    pub connections: Vec<String>,
+    /// The main model (the drafter's default).
+    pub main_model: String,
+    /// Selected field.
+    pub field: usize,
+    /// Last result.
+    pub note: Option<Result<String, String>>,
+}
+
+impl ObserverPanel {
+    fn on_key(&mut self, k: KeyEvent) -> Action {
+        let d = &mut self.drafter;
+        let step = |v: &mut f64, by: f64, up: bool| {
+            *v = if up { *v + by } else { (*v - by).max(0.0) };
+            *v = (*v * 100.0).round() / 100.0;
+        };
+        let changed = match k.code {
+            KeyCode::Up => {
+                self.field = self.field.saturating_sub(1);
+                false
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.field = (self.field + 1).min(DRAFTER_FIELDS.len() - 1);
+                false
+            }
+            KeyCode::Char('i') => return Action::InstallDaemon,
+            KeyCode::Char('u') => return Action::UninstallDaemon,
+            KeyCode::Enter | KeyCode::Char(' ') if self.field == 0 => {
+                d.enabled = !d.enabled;
+                true
+            }
+            KeyCode::Enter | KeyCode::Char('m') if self.field == 2 => {
+                let conn = d.connection.clone().unwrap_or_default();
+                return Action::DrafterModel(conn);
+            }
+            KeyCode::Left | KeyCode::Right => {
+                let up = k.code == KeyCode::Right;
+                match self.field {
+                    0 => d.enabled = !d.enabled,
+                    1 if !self.connections.is_empty() => {
+                        let cur = d
+                            .connection
+                            .as_ref()
+                            .and_then(|c| self.connections.iter().position(|x| x == c));
+                        let n = self.connections.len();
+                        let next = match (cur, up) {
+                            (None, true) => 0,
+                            (None, false) => n - 1,
+                            (Some(i), true) => (i + 1) % n,
+                            (Some(i), false) => (i + n - 1) % n,
+                        };
+                        d.connection = Some(self.connections[next].clone());
+                        d.model = None;
+                    }
+                    3 => step(&mut d.daily_usd, 0.05, up),
+                    4 => step(&mut d.per_draft_usd, 0.01, up),
+                    5 => {
+                        d.max_drafts_per_day = if up {
+                            d.max_drafts_per_day + 1
+                        } else {
+                            d.max_drafts_per_day.saturating_sub(1)
+                        }
+                    }
+                    6 => {
+                        let order = ["info", "warning", "critical"];
+                        let i = order.iter().position(|x| *x == d.min_severity).unwrap_or(1);
+                        d.min_severity = order[if up {
+                            (i + 1).min(2)
+                        } else {
+                            i.saturating_sub(1)
+                        }]
+                        .into();
+                    }
+                    _ => return Action::None,
+                }
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            Action::SaveDrafter(self.drafter.clone())
+        } else {
+            Action::None
+        }
     }
 }
 
@@ -554,6 +761,8 @@ pub struct ModelPicker {
     pub error: Option<String>,
     /// The model in use on this connection.
     pub current: Option<String>,
+    /// Choosing for the drafter, not the main agent.
+    pub for_drafter: bool,
 }
 
 impl ModelPicker {
@@ -632,6 +841,12 @@ impl ModelPicker {
                         (!q.is_empty() && !q.contains(char::is_whitespace)).then(|| q.to_string())
                     });
                 if let Some(model) = chosen {
+                    if self.for_drafter {
+                        return Action::ChooseDrafterModel {
+                            connection: self.connection.clone(),
+                            model,
+                        };
+                    }
                     return Action::ChooseModel {
                         connection: self.connection.clone(),
                         model,

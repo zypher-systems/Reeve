@@ -5,11 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "System sampling for Reeve (and, from M4, the reeved observer)"
+description = "System sampling for Reeve, and the reeved observer"
 
 [dependencies]
+reeve-core.workspace = true
 rustix.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

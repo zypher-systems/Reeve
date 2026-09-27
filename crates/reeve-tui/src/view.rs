@@ -156,6 +156,12 @@ pub struct View {
     pub memory: (usize, usize),
     /// A memory to open in `$EDITOR` (the loop hands over the terminal).
     pub edit_request: Option<(reeve_core::memory::Layer, String)>,
+    /// reeved has a fresh heartbeat.
+    pub observer_alive: bool,
+    /// Open findings.
+    pub findings: Vec<reeve_core::findings::Finding>,
+    /// Drafter spend today and its cap, when it's on.
+    pub drafter: Option<(f64, f64)>,
 }
 
 /// Spending caps, USD; 0 is off.
@@ -204,6 +210,9 @@ impl View {
             receipts: Vec::new(),
             memory: (0, 0),
             edit_request: None,
+            observer_alive: false,
+            findings: Vec::new(),
+            drafter: None,
         }
     }
 

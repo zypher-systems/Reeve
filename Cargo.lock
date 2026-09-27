@@ -1177,6 +1177,7 @@ dependencies = [
  "clap",
  "crossterm",
  "reeve-core",
+ "reeve-observer",
  "reeve-tui",
  "serde_json",
  "tokio",
@@ -1210,8 +1211,13 @@ dependencies = [
 name = "reeve-observer"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "reeve-core",
  "rustix 1.1.5",
  "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

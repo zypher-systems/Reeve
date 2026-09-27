@@ -98,8 +98,24 @@ fn draw_header(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
         }
         right.push(Span::raw("  "));
     }
+    if let Some(worst) = v.findings.iter().map(|f| f.severity).max() {
+        use reeve_core::findings::Severity;
+        let c = match worst {
+            Severity::Critical => t.bad,
+            Severity::Warning => t.warn,
+            Severity::Info => t.teal,
+        };
+        right.push(Span::styled(
+            format!("⚑ {}  ", v.findings.len()),
+            Style::default().fg(c).add_modifier(Modifier::BOLD),
+        ));
+    }
     right.push(Span::styled("observer ", t.ghost()));
-    right.push(Span::styled("○ local  ", Style::default().fg(t.dim)));
+    if v.observer_alive {
+        right.push(Span::styled("● live  ", Style::default().fg(t.good)));
+    } else {
+        right.push(Span::styled("○ off  ", Style::default().fg(t.dim)));
+    }
     if v.yolo {
         // The badge breathes so nobody forgets that nothing is being asked.
         let pulse = if v.animate {
@@ -668,6 +684,16 @@ fn spend_lines(v: &View, t: &Theme, w: usize) -> Vec<Line<'static>> {
         t,
     ));
 
+    if let Some((spent, cap)) = v.drafter {
+        out.push(capped_line(
+            "drafter",
+            &format_usd(Some(spent)),
+            spent,
+            cap,
+            w,
+            t,
+        ));
+    }
     if v.totals.by_day.iter().any(|d| *d > 0.0) {
         let mut spans = vec![lbl("by day")];
         spans.extend(sparkline(&v.totals.by_day, w.saturating_sub(9), t));

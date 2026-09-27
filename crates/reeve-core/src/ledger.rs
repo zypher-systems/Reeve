@@ -34,6 +34,9 @@ pub struct SpendRecord {
     /// or `local` (free).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priced_by: Option<String>,
+    /// Who spent it, when not the main agent: `drafter`, `reflect`, `order:<name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 /// Ledger file for a month.
@@ -107,6 +110,26 @@ pub fn totals(home: &Path, now: DateTime<Local>) -> Totals {
     t
 }
 
+/// Today's spend by one role.
+pub fn role_today(home: &Path, role: &str, now: DateTime<Local>) -> Tally {
+    let path = month_path(home, now.year(), now.month());
+    let mut t = Tally::default();
+    let Ok(text) = fs::read_to_string(path) else {
+        return t;
+    };
+    for rec in text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<SpendRecord>(l).ok())
+    {
+        if rec.role.as_deref() == Some(role)
+            && rec.ts.with_timezone(&Local).date_naive() == now.date_naive()
+        {
+            t.add(rec.usd, rec.usage);
+        }
+    }
+    t
+}
+
 /// Which cap, if any, stops the next call. Caps of 0 are off.
 pub fn over_cap(spend: &SpendConfig, session: &Tally, totals: &Totals) -> Option<String> {
     let checks = [
@@ -138,6 +161,7 @@ mod tests {
             },
             usd,
             priced_by: Some("provider".into()),
+            role: None,
         }
     }
 

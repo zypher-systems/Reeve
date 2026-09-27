@@ -24,6 +24,9 @@ pub struct Settings {
     /// Connections added in the TUI.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub connections: BTreeMap<String, ConnectionConfig>,
+    /// The drafter, as set in `/observer`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drafter: Option<crate::config::DrafterConfig>,
 }
 
 impl Settings {
@@ -81,6 +84,9 @@ impl Settings {
             if let Some(c) = cfg.connections.get_mut(name) {
                 c.default_model = Some(model.clone());
             }
+        }
+        if let Some(d) = &self.drafter {
+            cfg.observer.drafter = d.clone();
         }
         // A model picked in the TUI for the active connection beats a
         // global `model =` from config.toml, or the pick would do nothing.

@@ -34,6 +34,8 @@ pub struct Config {
     pub snapshots: SnapshotConfig,
     /// Memory: survey and reflection.
     pub memory: MemoryConfig,
+    /// The background observer (`reeved`).
+    pub observer: ObserverConfig,
     /// TUI presentation.
     pub ui: UiConfig,
 }
@@ -50,6 +52,7 @@ impl Default for Config {
             approvals: ApprovalConfig::default(),
             snapshots: SnapshotConfig::default(),
             memory: MemoryConfig::default(),
+            observer: ObserverConfig::default(),
             ui: UiConfig::default(),
         }
     }
@@ -163,6 +166,65 @@ impl Default for MemoryConfig {
         Self {
             survey: true,
             auto_reflect: true,
+        }
+    }
+}
+
+/// `[observer]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ObserverConfig {
+    /// Desktop notifications for findings.
+    pub notify: bool,
+    /// Disk use (0–1) that raises a warning; +0.07 is critical.
+    pub disk_warn: f64,
+    /// CPU temperature (°C) that raises a warning when sustained.
+    pub temp_warn: f32,
+    /// Pre-drafts proposals for findings (off by default).
+    pub drafter: DrafterConfig,
+}
+
+impl Default for ObserverConfig {
+    fn default() -> Self {
+        Self {
+            notify: true,
+            disk_warn: 0.90,
+            temp_warn: 90.0,
+            drafter: DrafterConfig::default(),
+        }
+    }
+}
+
+/// `[observer.drafter]`: a separate role with its own model and budget.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DrafterConfig {
+    /// Draft proposals in the background.
+    pub enabled: bool,
+    /// Connection (default: the main one).
+    pub connection: Option<String>,
+    /// Model (default: the main one).
+    pub model: Option<String>,
+    /// Its own cap, USD per day.
+    pub daily_usd: f64,
+    /// Stop one draft past this, USD.
+    pub per_draft_usd: f64,
+    /// Most drafts per day.
+    pub max_drafts_per_day: u32,
+    /// `info`, `warning`, or `critical`: the least severe finding worth a draft.
+    pub min_severity: String,
+}
+
+impl Default for DrafterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            connection: None,
+            model: None,
+            daily_usd: 0.25,
+            per_draft_usd: 0.05,
+            max_drafts_per_day: 10,
+            min_severity: "warning".into(),
         }
     }
 }

@@ -9,6 +9,7 @@ pub mod config;
 pub mod diff;
 pub mod distro;
 pub mod error;
+pub mod findings;
 pub mod ledger;
 pub mod llm;
 pub mod memory;

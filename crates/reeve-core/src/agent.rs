@@ -156,6 +156,7 @@ pub struct Agent {
     receipts: ReceiptBook,
     approver: Arc<dyn Approver>,
     allowed: HashSet<String>,
+    role: Option<String>,
 }
 
 /// Environment variables that hold API keys, to keep out of commands.
@@ -212,12 +213,32 @@ impl Agent {
             tally: Tally::default(),
             approver: Arc::new(DenyAll),
             allowed: HashSet::new(),
+            role: None,
         })
     }
 
     /// Who approves actions. Until set, everything past T0 is denied.
     pub fn set_approver(&mut self, approver: Arc<dyn Approver>) {
         self.approver = approver;
+    }
+
+    /// Tag this agent's spend (and receipts' session) with a role, like `drafter`.
+    pub fn set_role(&mut self, role: &str) {
+        self.role = Some(role.to_string());
+    }
+
+    /// The last reply's text, for roles that read the answer (the drafter).
+    pub fn last_reply(&self) -> Option<&str> {
+        self.transcript
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && !m.content.trim().is_empty())
+            .map(|m| m.content.as_str())
+    }
+
+    /// This session's spend so far.
+    pub fn tally(&self) -> Tally {
+        self.tally
     }
 
     /// Tool settings (tests point these at a scratch home).
@@ -344,6 +365,7 @@ impl Agent {
                 usage: out.usage,
                 usd,
                 priced_by: priced_by.map(Into::into),
+                role: Some("reflect".into()),
             },
         )?;
         meta.reflected = Some(Utc::now());
@@ -655,6 +677,7 @@ impl Agent {
             usage,
             usd,
             priced_by: priced_by.map(Into::into),
+            role: self.role.clone(),
         };
         ledger::record(&self.home, &rec)?;
         self.session.record_spend(&rec)?;

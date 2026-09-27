@@ -8,6 +8,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod baselines;
+pub mod daemon;
+pub mod detect;
+pub mod drafter;
+pub mod journal;
+pub mod notify;
+pub mod service;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;

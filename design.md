@@ -292,8 +292,10 @@ Windows will need their own observer design later.
   - **Over budget:** the finding stays undrafted and says why ("drafter budget reached for today").
   - **Unknown price:** a model with no known price can't be used for the drafter while any cap is
     set; it fails closed.
-- **IPC:** `$XDG_RUNTIME_DIR/reeve/reeved.sock` (0600), JSON lines. The TUI subscribes to live
-  metrics and findings. Without `reeved`, the TUI samples by itself and shows "observer offline".
+- **Sharing state:** `reeved` and the TUI share files, not a socket. Findings are one JSON file each in
+  `~/.reeve/findings/`, and `~/.reeve/observer/status.json` holds a heartbeat every 10 s. The TUI polls
+  them each second and shows "observer ○ off" when the heartbeat is stale. The service runs
+  `reeve daemon run`, the same binary as the TUI.
 
 ---
 
@@ -428,6 +430,6 @@ $XDG_RUNTIME_DIR/reeve/  # reeved.sock, askpass-<pid>.sock
 | **M1** ✓ | Hands with a paper trail | File and shell tools, tier classifier, approval cards, YOLO, floor, hash-chained receipts, file undo, `reeve receipts verify`. |
 | **M2** ✓ | Sysadmin | Package, service, log, and process tools. Fedora distro layer. `sudo -A` askpass modal. Snapper pairs. Session reports. |
 | **M3** ✓ | Memory | Four layers, memory tools, machine profile in the prompt, the reflect step, the Memory view. |
-| **M4** | Observer | `reeved` with samplers, journal, detectors, baselines, notifications, and the Findings inbox with proposals. |
+| **M4** ✓ | Observer | `reeved` with samplers, journal, detectors, baselines, notifications, and the Findings inbox with proposals. |
 | **M5** | Standing orders | Scheduler, scoped autonomous runs, day and month budgets enforced across TUI and daemon. |
 | **M6** | Arch | pacman/AUR, snap-pac, Omarchy theme import. |
