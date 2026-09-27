@@ -3,6 +3,7 @@
 
 mod fs;
 mod mem;
+pub mod obs;
 mod shell;
 mod sys;
 
@@ -146,6 +147,7 @@ enum Call {
     MemSearch(mem::SearchArgs),
     MemRead(mem::ReadArgs),
     MemWrite(mem::WriteArgs),
+    Findings(obs::Args),
 }
 
 #[derive(Deserialize)]
@@ -183,6 +185,7 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
             }
             "memory_read" => Call::MemRead(serde_json::from_value(args.clone()).map_err(parse)?),
             "memory_write" => Call::MemWrite(serde_json::from_value(args.clone()).map_err(parse)?),
+            "findings" => Call::Findings(serde_json::from_value(args.clone()).map_err(parse)?),
             other => return Err(format!("there is no tool named {other}")),
         }
     };
@@ -212,6 +215,13 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
             None,
         ),
         Call::MemWrite(a) => (
+            Assessment::new(crate::policy::Tier::T0),
+            a.summary(),
+            None,
+            false,
+            None,
+        ),
+        Call::Findings(a) => (
             Assessment::new(crate::policy::Tier::T0),
             a.summary(),
             None,
@@ -250,6 +260,7 @@ pub async fn execute(ctx: &ToolCtx, plan: &Plan) -> Executed {
         Call::MemSearch(a) => mem::search(ctx, a),
         Call::MemRead(a) => mem::read(ctx, a),
         Call::MemWrite(a) => mem::write(ctx, a),
+        Call::Findings(a) => obs::run(ctx, a),
     }
 }
 
@@ -485,6 +496,12 @@ pub fn specs() -> Vec<ToolSpec> {
             "Send a signal to a process (TERM by default). Other users' processes need root.",
             json!({"pid": {"type": "integer"}, "signal": {"type": "string", "enum": ["TERM", "KILL", "HUP", "INT", "STOP", "CONT", "USR1", "USR2"]}}),
             &["pid"],
+        ),
+        spec(
+            "findings",
+            "What reeved, the background observer, has noticed: open findings (crashes, full disks, failed units, journal spikes, pending updates), or one finding's details and evidence by id.",
+            json!({"id": {"type": "string"}, "include_closed": {"type": "boolean", "description": "Include resolved and dismissed ones"}}),
+            &[],
         ),
         spec(
             "memory_search",

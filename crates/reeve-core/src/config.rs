@@ -176,6 +176,8 @@ impl Default for MemoryConfig {
 pub struct ObserverConfig {
     /// Desktop notifications for findings.
     pub notify: bool,
+    /// At most one notification this often (new findings in between share it).
+    pub notify_every_minutes: u32,
     /// Disk use (0–1) that raises a warning; +0.07 is critical.
     pub disk_warn: f64,
     /// CPU temperature (°C) that raises a warning when sustained.
@@ -188,6 +190,7 @@ impl Default for ObserverConfig {
     fn default() -> Self {
         Self {
             notify: true,
+            notify_every_minutes: 5,
             disk_warn: 0.90,
             temp_warn: 90.0,
             drafter: DrafterConfig::default(),

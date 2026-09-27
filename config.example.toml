@@ -50,6 +50,7 @@ auto_reflect = true                     # one model call per finished session to
 
 [observer]                              # reeved: `reeve daemon install`
 notify = true                           # desktop notifications for findings
+notify_every_minutes = 5                # at most one popup this often; new findings share it
 disk_warn = 0.90
 temp_warn = 90.0
 

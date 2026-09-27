@@ -441,9 +441,11 @@ impl Agent {
             }
             let req = CompletionRequest {
                 model: self.model.clone(),
-                system: Some(system_prompt(
-                    &self.machine_profile,
-                    &self.memory.profile(3500),
+                // What reeved is reporting, read fresh each round.
+                system: Some(format!(
+                    "{}\n\n{}",
+                    system_prompt(&self.machine_profile, &self.memory.profile(3500)),
+                    crate::tools::obs::brief(&self.home)
                 )),
                 messages: self.transcript.clone(),
                 tools: tools::specs(),

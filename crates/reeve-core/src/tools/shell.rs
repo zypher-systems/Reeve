@@ -384,6 +384,11 @@ mod tests {
 
     #[tokio::test]
     async fn no_terminal_means_sudo_fails_fast() {
+        // A real sudo attempt: it logs an auth failure (at alert level) and may
+        // count toward pam_faillock. Opt in on a developer machine.
+        if std::env::var_os("REEVE_TEST_SUDO").is_none() {
+            return;
+        }
         // CI runners have passwordless sudo: nothing to prove there.
         let passwordless = std::process::Command::new("sudo")
             .args(["-n", "true"])

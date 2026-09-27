@@ -233,13 +233,64 @@ pub fn journal_spike(
     })
 }
 
-/// A critical, alert, or emergency message.
+/// `Process 1338902 (main) of user 1000 dumped core.` → `main`, and the
+/// program's path from the stack trace when it's there
+/// (`…/mailspring/…/mailsync + 0x35780c` → `mailsync`).
+fn crashed_program(message: &str) -> Option<String> {
+    let first = message.lines().next().unwrap_or("");
+    let is_crash = first.contains("dumped core") || first.contains(") crashed in ");
+    if !is_crash {
+        return None;
+    }
+    // The stack trace names the real binary; `comm` is often just "main".
+    let from_stack = message.lines().skip(1).find_map(|l| {
+        let start = l.find('(')? + 1;
+        let path = l[start..].split_whitespace().next()?;
+        path.starts_with('/')
+            .then(|| path.rsplit('/').next().unwrap_or(path).to_string())
+    });
+    let comm = first
+        .split_once('(')
+        .and_then(|(_, r)| r.split_once(')'))
+        .map(|(c, _)| c.to_string());
+    from_stack.or(comm).filter(|p| !p.is_empty())
+}
+
+/// A critical, alert, or emergency message. Crashes are grouped by the
+/// program that crashed and sudo refusals into one finding, so a program
+/// that crashes every few minutes is one finding (with a count), not a new
+/// one per crash.
 pub fn journal_critical(unit: &str, template: &str, message: &str) -> Signal {
-    let hash = &reeve_core::undo::sha256_hex(template.as_bytes())[..8];
+    let first = message.lines().next().unwrap_or("").trim();
+    if let Some(program) = crashed_program(message) {
+        return sig(
+            format!("app-crash:{program}"),
+            Severity::Warning,
+            format!("{program} keeps crashing"),
+            "It dumped core; the count is how many times since this was first seen. `coredumpctl list` shows each crash, and `coredumpctl info` the details.".into(),
+            vec![message.chars().take(400).collect()],
+        );
+    }
+    let sudo_refused = first.contains("pam_unix(sudo:auth)")
+        || first.contains("a password is required")
+        || first.contains("incorrect password attempt")
+        || first.contains("authentication failure");
+    if sudo_refused {
+        return sig(
+            "auth-failure:sudo".into(),
+            Severity::Warning,
+            "sudo refused a password or had none to use".into(),
+            "Often a cancelled prompt, or a script running sudo without a terminal. Repeated failures from someone else would matter.".into(),
+            vec![first.chars().take(300).collect()],
+        );
+    }
+    let family = unit_family(unit);
+    let first_template = template.lines().next().unwrap_or(template);
+    let hash = &reeve_core::undo::sha256_hex(first_template.as_bytes())[..8];
     sig(
-        format!("journal-critical:{unit}:{hash}"),
+        format!("journal-critical:{family}:{hash}"),
         Severity::Critical,
-        format!("{unit}: {}", message.chars().take(90).collect::<String>()),
+        format!("{family}: {}", first.chars().take(90).collect::<String>()),
         "Logged at critical priority or above.".into(),
         vec![message.chars().take(400).collect()],
     )
@@ -347,6 +398,52 @@ mod tests {
             "60/hour is its normal"
         );
         assert!(journal_spike("chatty", 120, 60.0, &[]).is_some());
+    }
+
+    #[test]
+    fn crashes_group_by_program_not_by_instance() {
+        let a = journal_critical(
+            "systemd-coredump@495-32860-1686789_81223057-0.service",
+            "",
+            "Process 1338902 (main) of user 1000 dumped core.\n\nStack trace of thread 19492:\n#0  0x000055c0ccf6180c n/a (/app/share/mailspring/resources/app.asar.unpacked/mailsync + 0x35780c)",
+        );
+        let b = journal_critical(
+            "systemd-coredump@496-106507-1764271_81376054-0.service",
+            "",
+            "Process 1409241 (main) of user 1000 dumped core.\n\nStack trace of thread 19514:\n#0  0x000055b05e4bd80c n/a (/app/share/mailspring/resources/app.asar.unpacked/mailsync + 0x35780c)",
+        );
+        let abrt = journal_critical(
+            "abrtd.service",
+            "",
+            "Process 1136673 (mailsync) crashed in ??()",
+        );
+        assert_eq!(a.id, "app-crash:mailsync");
+        assert_eq!(a.id, b.id);
+        assert_eq!(abrt.id, a.id, "abrt's report of the same crash joins it");
+        assert_eq!(a.severity, Severity::Warning);
+        let s1 = journal_critical(
+            "user@1000.service",
+            "",
+            "pam_unix(sudo:auth): auth could not identify password for [zypher]",
+        );
+        let s2 = journal_critical(
+            "user@1000.service",
+            "",
+            "  zypher : a password is required ; PWD=/x ; USER=root ; COMMAND=/usr/sbin/true",
+        );
+        assert_eq!(
+            (s1.id.as_str(), s2.id.as_str()),
+            ("auth-failure:sudo", "auth-failure:sudo")
+        );
+        let other = journal_critical(
+            "kernel",
+            "EXT4-fs error #",
+            "EXT4-fs error (device nvme0n1p3): bad block",
+        );
+        assert!(
+            other.id.starts_with("journal-critical:kernel:")
+                && other.severity == Severity::Critical
+        );
     }
 
     #[test]

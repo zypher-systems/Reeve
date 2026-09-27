@@ -2,6 +2,19 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-27: A crashing program is one finding; popups are paced
+- **Decision:**
+  - Critical journal messages that report a crash (`dumped core`, abrt's `crashed in`) become `app-crash:<program>`, a warning. The program is taken from the stack trace when there is one, since `comm` is often just `main`.
+  - Sudo's auth failures become one `auth-failure:sudo` finding.
+  - Other critical messages are grouped by unit template and their first line.
+  - Popups: at most one every `notify_every_minutes` (default 5), and everything new in between shares it.
+  - The agent sees the open findings in every prompt, and has a T0 `findings` tool for details.
+  - The test that runs a real `sudo` is opt-in (`REEVE_TEST_SUDO=1`).
+- **Chosen vs rejected:** Rejected keeping coredumps as critical: an app crashing is worth knowing about, not an emergency.
+- **Why:** On the owner's machine, Mailspring's `mailsync` segfaults every few minutes. Every crash writes "dumped core" at critical priority under a new `systemd-coredump@<instance>` unit, so v0.1.0 raised a new finding, and a popup, per crash. Meanwhile the chat agent couldn't see any of it and said everything was fine. The sudo test had also put two auth-failure alerts in the owner's journal.
+- **Where:** `reeve-observer/src/detect.rs` (`journal_critical`, `crashed_program`), `daemon.rs` (`flush_notifications`), `reeve-core/src/tools/obs.rs`, `agent.rs` (prompt), `config.rs` (`notify_every_minutes`)
+- **Residual risk:** Findings made under v0.1.0's per-crash ids stay open until they go stale (24 h), unless dismissed.
+
 ### 2026-09-27: Standing orders: every part of a command must be allowed
 - **Decision:**
   - An order's run is an ordinary agent turn with an approver that allows T0, and T1/T2 only inside the order's scope. It never allows T3.

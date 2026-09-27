@@ -271,6 +271,12 @@ impl Observer {
         let _ = self
             .store
             .resolve_stale("journal-critical", chrono::Duration::hours(24), now);
+        let _ = self
+            .store
+            .resolve_stale("app-crash", chrono::Duration::hours(24), now);
+        let _ = self
+            .store
+            .resolve_stale("auth-failure", chrono::Duration::hours(24), now);
         self.flush_notifications(cfg, now);
     }
 
@@ -301,10 +307,10 @@ impl Observer {
             self.pending_notify.clear();
             return;
         }
-        if self
-            .last_notify
-            .is_some_and(|t| now - t < chrono::Duration::seconds(60))
-        {
+        // One popup per interval at most; everything new in between is summed
+        // up in it.
+        let every = chrono::Duration::minutes(i64::from(cfg.observer.notify_every_minutes.max(1)));
+        if self.last_notify.is_some_and(|t| now - t < every) {
             return;
         }
         let ids = std::mem::take(&mut self.pending_notify);
