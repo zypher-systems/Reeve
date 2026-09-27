@@ -174,9 +174,13 @@ impl Default for MemoryConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ObserverConfig {
-    /// Desktop notifications for findings.
+    /// Desktop notifications when a proposed fix is ready (the drafter
+    /// drafted one, or a standing order stopped and needs you). The
+    /// observer itself only watches and reports.
     pub notify: bool,
-    /// At most one notification this often (new findings in between share it).
+    /// Also pop up for findings as they're found (off: they wait in /findings).
+    pub notify_findings: bool,
+    /// At most one findings notification this often (new ones in between share it).
     pub notify_every_minutes: u32,
     /// Disk use (0–1) that raises a warning; +0.07 is critical.
     pub disk_warn: f64,
@@ -190,6 +194,7 @@ impl Default for ObserverConfig {
     fn default() -> Self {
         Self {
             notify: true,
+            notify_findings: false,
             notify_every_minutes: 5,
             disk_warn: 0.90,
             temp_warn: 90.0,

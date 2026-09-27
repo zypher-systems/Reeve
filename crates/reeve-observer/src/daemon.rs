@@ -303,7 +303,8 @@ impl Observer {
 
     /// At most one notification a minute; several findings share one.
     fn flush_notifications(&mut self, cfg: &config::Config, now: chrono::DateTime<Utc>) {
-        if self.pending_notify.is_empty() || !cfg.observer.notify {
+        // Findings are reported, not announced, unless the owner asked for it.
+        if self.pending_notify.is_empty() || !cfg.observer.notify || !cfg.observer.notify_findings {
             self.pending_notify.clear();
             return;
         }
@@ -392,7 +393,7 @@ impl Observer {
             self.order_running.clone(),
         );
         tokio::spawn(async move {
-            if order.notify == "before" {
+            if order.notify == "before" && cfg.observer.notify {
                 notify::plain(
                     &format!("Reeve: starting \"{}\"", order.name),
                     &cause.label(),
@@ -412,10 +413,13 @@ impl Observer {
             let receipts = run.receipts.len();
             states.entry(order.id.clone()).or_default().push(run);
             let _ = orders.save_states(&states);
-            if order.notify != "never" && cfg.observer.notify {
+            // A blocked run left a proposal: that's worth a popup. A finished
+            // or failed one only if the order asks for it.
+            let proposal = status == "blocked";
+            if cfg.observer.notify && (proposal || order.notify == "after") {
                 let title = match status.as_str() {
                     "done" => format!("Reeve did: {}", order.name),
-                    "blocked" => format!("Reeve needs you: {}", order.name),
+                    "blocked" => format!("Reeve has a proposal: {}", order.name),
                     _ => format!("Reeve couldn't: {}", order.name),
                 };
                 notify::plain(
@@ -562,7 +566,23 @@ pub async fn run_observer(home: PathBuf, once: bool) -> Result<(), String> {
                 if cfg.observer.drafter.enabled {
                     match drafter::pass(&home, &cfg, &obs.store, &profile).await {
                         drafter::Pass::Blocked(why) => obs.status.last_error = Some(why),
-                        drafter::Pass::Drafted(_) => obs.status.last_error = None,
+                        drafter::Pass::Drafted(id) => {
+                            obs.status.last_error = None;
+                            if cfg.observer.notify {
+                                if let Some(f) = obs.store.get(&id) {
+                                    let first = f
+                                        .proposal
+                                        .as_ref()
+                                        .and_then(|p| p.text.lines().find(|l| !l.trim().is_empty()).map(str::to_string))
+                                        .unwrap_or_default();
+                                    notify::plain(
+                                        &format!("Reeve has a fix ready: {}", f.title),
+                                        &format!("{first}\nOpen Reeve: /findings, then p to use it."),
+                                        false,
+                                    );
+                                }
+                            }
+                        }
                         drafter::Pass::Idle => {}
                     }
                 }

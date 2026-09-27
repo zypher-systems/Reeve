@@ -1796,7 +1796,8 @@ task = """
 Say plainly what to do, what to check first, and when to do nothing.
 """
 enabled = false
-notify = "after"            # after | before | never
+notify = "never"            # popups: a blocked run (a proposal) always gets one;
+                            # "after" adds one for every run, "before" also at the start
 
 [trigger]
 # Finding ids from /findings; * matches anything: "disk-full:*", "unit-failed:*".

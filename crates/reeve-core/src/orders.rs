@@ -70,13 +70,15 @@ pub struct Order {
     /// Model (default: the main one).
     #[serde(default)]
     pub model: Option<String>,
-    /// `after` (default), `before` (also when starting), or `never`.
-    #[serde(default = "after")]
+    /// Popups for this order beyond the one for a proposal (a blocked run
+    /// always gets one): `never` (default), `after` (every run), or
+    /// `before` (every run, and when it starts).
+    #[serde(default = "never")]
     pub notify: String,
 }
 
-fn after() -> String {
-    "after".into()
+fn never() -> String {
+    "never".into()
 }
 
 /// What starts a run.
@@ -669,7 +671,6 @@ crashed (from the unit names or `coredumpctl list`), then reset the failed units
 the apps, so the owner can decide whether a crash needs attention.
 """
 enabled = false
-notify = "after"
 
 [trigger]
 findings = ["unit-failed:drkonqi-coredump-processor@*"]

@@ -265,8 +265,10 @@ Windows will need their own observer design later.
 - **Detectors** are rules, not LLM calls: a threshold (disk > 90%), a trend ("`/var` fills in ~4 days"),
   a baseline deviation ("journal errors from `bluetooth.service` 20× normal"), or a state change
   (a unit newly failed, a reboot pending after a kernel update).
-- **Findings** go to `~/.reeve/findings/` and trigger a **desktop notification**
-  (`org.freedesktop.Notifications` via `notify-rust`), rate-limited and deduplicated.
+- **Findings** go to `~/.reeve/findings/`. They are reported, not announced: `/findings`, the header badge, and
+  the agent's prompt, with no popup. A desktop notification means a proposed fix is waiting: the drafter
+  wrote one, or a standing order stopped at its scope. `notify_findings = true` opts back into popups for
+  findings, paced.
 - **Proposals:** when you open Reeve, the Findings inbox shows each finding, and "draft a fix"
   runs a read-only (T0-only) diagnosis to produce a proposed plan you approve. Nothing runs
   without you, except under §9.

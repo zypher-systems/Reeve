@@ -49,8 +49,9 @@ survey = true                           # read-only survey on first run, weekly 
 auto_reflect = true                     # one model call per finished session to propose memories
 
 [observer]                              # reeved: `reeve daemon install`
-notify = true                           # desktop notifications for findings
-notify_every_minutes = 5                # at most one popup this often; new findings share it
+notify = true                           # popups when a proposed fix is ready (drafter, blocked orders)
+notify_findings = false                 # also pop up for findings themselves (they're in /findings either way)
+notify_every_minutes = 5                # with notify_findings: at most one popup this often
 disk_warn = 0.90
 temp_warn = 90.0
 

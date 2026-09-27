@@ -2,6 +2,19 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-27: The observer reports; a popup means a fix is ready
+- **Decision:**
+  - Findings no longer pop up. They wait in `/findings`, the header badge, and the agent's prompt.
+  - A desktop notification is sent when there's something to decide: the drafter wrote a proposal ("Reeve has a fix ready: …"), or a standing order stopped at its scope and left one.
+  - A standing order that simply finished is quiet unless it sets `notify = "after"`, and `never` is now the default.
+  - `[observer] notify_findings = true` opts back into finding popups, paced by `notify_every_minutes`.
+- **Chosen vs rejected:**
+  - Rejected finding popups by default, even paced: a watcher that interrupts for everything teaches you to ignore it.
+  - Rejected no popups at all: a drafted fix, or an order waiting on the owner, is the moment a person is needed.
+- **Why:** The owner's call: "the watcher should watch and report; the popup should come when the observer writes a proposed solution".
+- **Where:** `reeve-observer/src/daemon.rs` (`flush_notifications`, the drafter and order branches), `reeve-core/src/config.rs` (`notify_findings`), `orders.rs` (`notify` default)
+- **Residual risk:** With the drafter off, a critical finding (a disk about to fill) has no popup. It shows the next time Reeve is opened.
+
 ### 2026-09-27: A crashing program is one finding; popups are paced
 - **Decision:**
   - Critical journal messages that report a crash (`dumped core`, abrt's `crashed in`) become `app-crash:<program>`, a warning. The program is taken from the stack trace when there is one, since `comm` is often just `main`.

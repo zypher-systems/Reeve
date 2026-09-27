@@ -109,9 +109,10 @@ reeve daemon uninstall
 - journal spikes against each unit's normal rate, and critical messages
 - a newer kernel waiting for a reboot, and security updates
 
-Findings notify the desktop (rate-limited) and wait in `/findings`. There, `d` asks Reeve to look into one,
-`p` carries out a drafted fix, `a` marks it seen, and `x` dismisses it for good. Baselines of what's normal
-appear in `/memory`'s Baselines tab.
+Findings are reported, not announced: they wait in `/findings`, the header badge, and the agent's view,
+with no popups. In `/findings`, `d` asks Reeve to look into one, `p` carries out a drafted fix, `a` marks it seen,
+and `x` dismisses it for good. A popup means a proposed fix is ready: the drafter wrote one, or a standing order
+stopped and needs you. (`[observer] notify_findings = true` brings back popups for findings themselves.)
 
 The observer never changes the machine. The optional **drafter** pre-drafts a fix for each finding while
 you're away. It's off by default, and when on it uses read-only tools and its own model and budget

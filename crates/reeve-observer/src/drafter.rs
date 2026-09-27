@@ -22,7 +22,7 @@ use reeve_core::llm::{HttpProvider, Provider};
 pub enum Pass {
     /// Off, or nothing to draft.
     Idle,
-    /// Drafted a proposal for this finding.
+    /// Drafted a proposal for this finding (its id).
     Drafted(String),
     /// Couldn't: the reason (budget, no key, no price…).
     Blocked(String),
@@ -169,7 +169,6 @@ pub async fn pass(home: &Path, cfg: &Config, store: &FindingStore, profile: &str
             }
         })
         .await;
-    let usd = agent.tally().label();
     let spent_now = agent.tally().usd;
     let reply = agent.last_reply().map(str::to_string);
     let _ = agent.write_report();
@@ -191,7 +190,7 @@ pub async fn pass(home: &Path, cfg: &Config, store: &FindingStore, profile: &str
     });
     fresh.draft_note = None;
     let _ = store.put(&fresh);
-    Pass::Drafted(format!("{} ({usd})", fresh.id))
+    Pass::Drafted(fresh.id)
 }
 
 #[cfg(test)]
