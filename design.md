@@ -268,9 +268,30 @@ Windows will need their own observer design later.
 - **Findings** go to `~/.reeve/findings/` and trigger a **desktop notification**
   (`org.freedesktop.Notifications` via `notify-rust`), rate-limited and deduplicated.
 - **Proposals:** when you open Reeve, the Findings inbox shows each finding, and "draft a fix"
-  runs a read-only (T0-only) diagnosis to produce a proposed plan you approve. With
-  `observer.draft_proposals = true`, `reeved` drafts the plan ahead of time, within the daily
-  budget, still T0-only. Nothing runs without you, except under §9.
+  runs a read-only (T0-only) diagnosis to produce a proposed plan you approve. Nothing runs
+  without you, except under §9.
+- **The drafter** (off by default): a separate role that drafts those proposals in the background,
+  so a plan is waiting when you open Reeve. It works like an auditor seat:
+  ```toml
+  [observer.drafter]
+  enabled = false
+  connection = "openrouter"            # default: the main connection
+  model = "…"                          # default: the main model; a cheap one is plenty
+  daily_usd = 0.25                     # its own cap, per day
+  per_draft_usd = 0.05                 # stop a single draft past this
+  max_drafts_per_day = 10
+  min_severity = "warning"             # don't draft for notices
+  ```
+  - **Turning it on:** `/observer` in the TUI toggles it and sets the model and budgets, saved to
+    `settings.toml`, or edit `config.toml` directly.
+  - **Tools:** T0 only, so it can read and diagnose but never change anything. The draft is a
+    proposal that waits in the inbox.
+  - **Spend:** recorded in the global ledger under the `drafter` role. It counts toward the global
+    day and month caps as well as its own; whichever is hit first stops it. The Spend panel shows
+    drafter spend on its own line.
+  - **Over budget:** the finding stays undrafted and says why ("drafter budget reached for today").
+  - **Unknown price:** a model with no known price can't be used for the drafter while any cap is
+    set; it fails closed.
 - **IPC:** `$XDG_RUNTIME_DIR/reeve/reeved.sock` (0600), JSON lines. The TUI subscribes to live
   metrics and findings. Without `reeved`, the TUI samples by itself and shows "observer offline".
 

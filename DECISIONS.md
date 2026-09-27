@@ -2,6 +2,19 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-27: Background drafting is a separate, budgeted role, off by default
+- **Decision:**
+  - `reeved` watches with rules and no model.
+  - Pre-drafting fixes for findings is done by an opt-in "drafter" role with its own connection, model, daily cap, per-draft cap, and draft count (`[observer.drafter]`, or `/observer` in the TUI).
+  - It uses T0 tools only.
+  - Its spend is ledgered under its own role and also counts toward the global caps.
+- **Chosen vs rejected:**
+  - Rejected drafting on by default: a noisy journal could spend money while nobody is at the machine.
+  - Rejected sharing the main session's budget: the owner can't tell or cap what the background costs.
+- **Why:** The user wants a way to turn it on, "with its own budget like an auditor" (Ryter's auditor seat).
+- **Where:** `design.md` §8 (to be built in M4)
+- **Residual risk:** Findings are built from journal text any process can write, and the drafter reads that text. With T0-only tools, the worst outcome is a misleading proposal that the owner still has to approve.
+
 ### 2026-09-27: Memory is Markdown notes; the owner has the last word
 - **Decision:**
   - Four layers under `~/.reeve/memory/`, one Markdown file per note with a short header (source, observed, confidence, status, OS, runbook counts, rule).
