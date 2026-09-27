@@ -20,6 +20,11 @@ async-trait.workspace = true
 bytes.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+sha2.workspace = true
+regex.workspace = true
+walkdir.workspace = true
+similar.workspace = true
+rustix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

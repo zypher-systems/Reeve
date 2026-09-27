@@ -84,6 +84,10 @@ pub struct Theme {
     pub code: Color,
     /// Code block ground.
     pub code_bg: Color,
+    /// Ground of an added diff row.
+    pub add_bg: Color,
+    /// Ground of a removed diff row.
+    pub del_bg: Color,
 }
 
 impl Theme {
@@ -109,6 +113,8 @@ impl Theme {
             bad: rgb(0xec5f6b),
             code: rgb(0xe8c78a),
             code_bg: rgb(0x1a2336),
+            add_bg: rgb(0x14302b),
+            del_bg: rgb(0x3a1c25),
         }
     }
 
@@ -134,6 +140,8 @@ impl Theme {
             bad: Color::Red,
             code: Color::Yellow,
             code_bg: Color::Reset,
+            add_bg: Color::Reset,
+            del_bg: Color::Reset,
         }
     }
 
@@ -180,6 +188,8 @@ impl Theme {
             bad: f(self.bad),
             code: f(self.code),
             code_bg: f(self.code_bg),
+            add_bg: f(self.add_bg),
+            del_bg: f(self.del_bg),
         }
     }
 
@@ -218,6 +228,17 @@ impl Theme {
             self.warn
         } else {
             self.teal
+        }
+    }
+
+    /// A risk tier's color: slate, teal, amber, red.
+    pub fn tier(&self, tier: reeve_core::policy::Tier) -> Color {
+        use reeve_core::policy::Tier;
+        match tier {
+            Tier::T0 => self.dim,
+            Tier::T1 => self.teal,
+            Tier::T2 => self.amber,
+            Tier::T3 => self.bad,
         }
     }
 

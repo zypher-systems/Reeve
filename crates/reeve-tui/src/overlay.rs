@@ -27,6 +27,10 @@ pub const COMMANDS: &[Command] = &[
         about: "choose the model (live prices)",
     },
     Command {
+        name: "/receipts",
+        about: "everything Reeve did; undo and verify",
+    },
+    Command {
         name: "/new",
         about: "start a fresh session",
     },
@@ -86,6 +90,10 @@ pub enum Action {
         /// Model id.
         model: String,
     },
+    /// Undo the action on this receipt.
+    Undo(u64),
+    /// Check the whole receipt chain.
+    VerifyReceipts,
     /// Save a new connection.
     AddConnection {
         /// Name (also the key's file name).
@@ -106,6 +114,8 @@ pub enum Overlay {
     Models(ModelPicker),
     /// New connection form.
     Add(AddForm),
+    /// `/receipts`.
+    Receipts(ReceiptsPanel),
     /// `/help`.
     Help,
 }
@@ -121,6 +131,7 @@ impl Overlay {
             Self::Key(e) => e.on_key(k),
             Self::Models(m) => m.on_key(k),
             Self::Add(a) => a.on_key(k),
+            Self::Receipts(r) => r.on_key(k),
             Self::Help => Action::Close,
         }
     }
@@ -232,6 +243,55 @@ impl Providers {
         if let Some(r) = self.rows.iter_mut().find(|r| r.name == connection) {
             r.status = Some(status);
         }
+    }
+}
+
+// ── /receipts ───────────────────────────────────────────────────────────────
+
+/// The receipt browser: newest first.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ReceiptsPanel {
+    /// Receipts, newest first.
+    pub items: Vec<reeve_core::receipts::Receipt>,
+    /// Receipts that have been undone (by seq).
+    pub undone: std::collections::HashSet<u64>,
+    /// Selected row.
+    pub sel: usize,
+    /// The last verify or undo result.
+    pub note: Option<Result<String, String>>,
+}
+
+impl ReceiptsPanel {
+    /// The selected receipt.
+    pub fn selected(&self) -> Option<&reeve_core::receipts::Receipt> {
+        self.items.get(self.sel)
+    }
+
+    fn on_key(&mut self, k: KeyEvent) -> Action {
+        let n = self.items.len();
+        match k.code {
+            KeyCode::Up => self.sel = self.sel.saturating_sub(1),
+            KeyCode::Down => self.sel = (self.sel + 1).min(n.saturating_sub(1)),
+            KeyCode::PageUp => self.sel = self.sel.saturating_sub(10),
+            KeyCode::PageDown => self.sel = (self.sel + 10).min(n.saturating_sub(1)),
+            KeyCode::Home => self.sel = 0,
+            KeyCode::End => self.sel = n.saturating_sub(1),
+            KeyCode::Char('u') => {
+                if let Some(r) = self.selected() {
+                    if r.undo.is_some() && !self.undone.contains(&r.seq) {
+                        return Action::Undo(r.seq);
+                    }
+                    self.note = Some(Err(if self.undone.contains(&r.seq) {
+                        format!("#{} was already undone", r.seq)
+                    } else {
+                        format!("#{} has nothing to undo", r.seq)
+                    }));
+                }
+            }
+            KeyCode::Char('v') => return Action::VerifyReceipts,
+            _ => {}
+        }
+        Action::None
     }
 }
 

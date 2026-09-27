@@ -8,7 +8,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use reeve_core::config::{self, Config};
 use reeve_core::llm::{HttpProvider, Provider};
+use reeve_core::receipts::ReceiptBook;
 use reeve_core::spend::{PriceBook, format_rates, format_tokens};
+use reeve_core::undo::UndoStore;
 
 #[derive(Parser)]
 #[command(name = "reeve", version, about = "An operator agent for your computer")]
@@ -34,6 +36,36 @@ enum Cmd {
     },
     /// Show what Reeve has spent today and this month.
     Spend,
+    /// List, inspect, or verify receipts.
+    Receipts {
+        #[command(subcommand)]
+        cmd: Option<ReceiptsCmd>,
+    },
+    /// Undo the action on a receipt.
+    Undo {
+        /// Receipt number.
+        seq: u64,
+        /// Don't ask for confirmation.
+        #[arg(short, long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReceiptsCmd {
+    /// The newest receipts (default).
+    List {
+        /// How many.
+        #[arg(short, default_value_t = 30)]
+        n: usize,
+    },
+    /// One receipt in full.
+    Show {
+        /// Receipt number.
+        seq: u64,
+    },
+    /// Check the whole chain: nothing missing, nothing changed.
+    Verify,
 }
 
 #[derive(Subcommand)]
@@ -81,6 +113,22 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Some(Cmd::Models { connection, filter }) => models(&cfg, &home, connection, filter),
+        Some(Cmd::Receipts { cmd }) => receipts(&home, cmd.unwrap_or(ReceiptsCmd::List { n: 30 })),
+        Some(Cmd::Undo { seq, yes }) => {
+            let book = ReceiptBook::new(&home);
+            let r = book
+                .find(seq)
+                .ok_or_else(|| format!("there's no receipt #{seq}"))?;
+            println!("#{} {} {} — {}", r.seq, r.tier.label(), r.tool, r.target());
+            if !yes && !confirm("Undo it? [y/N] ")? {
+                return Ok(());
+            }
+            let done = book
+                .undo(&UndoStore::new(&home), seq, "cli")
+                .map_err(|e| e.to_string())?;
+            println!("{} (receipt #{})", done.outcome.summary, done.seq);
+            Ok(())
+        }
         Some(Cmd::Spend) => {
             let t = reeve_core::ledger::totals(&home, chrono_now());
             println!(
@@ -108,6 +156,67 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn receipts(home: &std::path::Path, cmd: ReceiptsCmd) -> Result<(), String> {
+    let book = ReceiptBook::new(home);
+    match cmd {
+        ReceiptsCmd::List { n } => {
+            let list = book.recent(n);
+            if list.is_empty() {
+                println!("No receipts yet.");
+            }
+            let undone: std::collections::HashSet<u64> =
+                book.all().iter().filter_map(|r| r.undoes).collect();
+            for r in list.iter().rev() {
+                let mark = if undone.contains(&r.seq) {
+                    " (undone)"
+                } else if r.undo.is_some() {
+                    " ↶"
+                } else {
+                    ""
+                };
+                println!(
+                    "#{:<5} {}  {}  {:<9} {:<10} {}{mark}",
+                    r.seq,
+                    r.ts.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
+                    r.tier.label(),
+                    format!("{:?}", r.outcome.status).to_lowercase(),
+                    r.tool,
+                    r.target()
+                );
+            }
+            Ok(())
+        }
+        ReceiptsCmd::Show { seq } => {
+            let r = book
+                .find(seq)
+                .ok_or_else(|| format!("there's no receipt #{seq}"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
+        ReceiptsCmd::Verify => {
+            let v = book.verify();
+            match v.problem {
+                None => {
+                    println!("✓ {} receipts: none missing, none changed.", v.count);
+                    Ok(())
+                }
+                Some(p) => Err(format!("✗ after {} good receipts: {p}", v.count)),
+            }
+        }
+    }
+}
+
+fn confirm(prompt: &str) -> Result<bool, String> {
+    eprint!("{prompt}");
+    io::stderr().flush().ok();
+    let mut s = String::new();
+    io::stdin().read_line(&mut s).map_err(|e| e.to_string())?;
+    Ok(matches!(s.trim(), "y" | "Y" | "yes"))
 }
 
 fn chrono_now() -> chrono::DateTime<chrono::Local> {

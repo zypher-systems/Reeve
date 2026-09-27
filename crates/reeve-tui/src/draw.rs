@@ -128,7 +128,15 @@ fn draw_footer(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
     let key = |k: &str| Span::styled(k.to_string(), Style::default().fg(t.brass));
     let label = |l: &str| Span::styled(format!(" {l}   "), t.ghost());
     let mut spans = vec![Span::raw(" ")];
-    let hints: &[(&str, &str)] = if v.busy {
+    let floor = v
+        .approval
+        .as_ref()
+        .is_some_and(|p| p.req.tier == reeve_core::policy::Tier::T3);
+    let hints: &[(&str, &str)] = if floor {
+        &[("yes ⏎", "allow"), ("esc", "deny"), ("^c", "stop the turn")]
+    } else if v.approval.is_some() {
+        &[("⏎", "approve"), ("n", "deny"), ("^c", "stop the turn")]
+    } else if v.busy {
         &[("esc", "stop"), ("pgup/pgdn", "scroll")]
     } else {
         &[
@@ -192,8 +200,15 @@ fn draw_chat(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
 
     let text_w = inner.width.saturating_sub(4).max(10) as usize;
     let composer_lines = char_wrap(&v.input, text_w).len().clamp(1, 6) as u16;
+    // An approval takes the composer's place until it's answered.
+    let bottom_h = match &v.approval {
+        Some(p) => {
+            crate::cards::approval_height(p, inner.width).min(inner.height.saturating_sub(3).max(6))
+        }
+        None => composer_lines + 2,
+    };
     let [log, composer] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(composer_lines + 2)]).areas(inner);
+        Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_h)]).areas(inner);
 
     // Until the conversation starts, the wordmark sits above any notices.
     let talking = v
@@ -235,8 +250,13 @@ fn draw_chat(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
             r,
         );
     }
-    draw_composer(f, composer, v, t, text_w);
-    crate::panels::draw_palette(f, composer, v, t);
+    match &v.approval {
+        Some(p) => crate::cards::draw_approval(f, composer, v, p, t),
+        None => {
+            draw_composer(f, composer, v, t, text_w);
+            crate::panels::draw_palette(f, composer, v, t);
+        }
+    }
 }
 
 fn draw_composer(f: &mut Frame, area: Rect, v: &View, t: &Theme, text_w: usize) {
@@ -356,9 +376,21 @@ fn welcome(area: Rect, v: &View, t: &Theme) -> Vec<Line<'static>> {
 fn transcript(v: &View, t: &Theme, width: usize) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let body_w = width.saturating_sub(2).max(8);
-    for e in &v.entries {
+    for (i, e) in v.entries.iter().enumerate() {
         let time = Span::styled(format!("  {}", e.at.format("%H:%M")), t.ghost());
         match e.who {
+            Speaker::Tool => {
+                if let Some(tv) = &e.tool {
+                    for mut l in crate::cards::tool_lines(tv, body_w, v.frame, t) {
+                        l.spans.insert(0, Span::raw("  "));
+                        out.push(l);
+                    }
+                }
+                // Consecutive tool calls sit together.
+                if v.entries.get(i + 1).is_some_and(|n| n.who == Speaker::Tool) {
+                    continue;
+                }
+            }
             Speaker::User => {
                 out.push(Line::from(vec![
                     Span::styled("▍", Style::default().fg(t.user)),
@@ -404,7 +436,12 @@ fn transcript(v: &View, t: &Theme, width: usize) -> Vec<Line<'static>> {
         }
         out.push(Line::raw(""));
     }
-    if v.busy {
+    let running_tool = v
+        .entries
+        .last()
+        .and_then(|e| e.tool.as_ref())
+        .is_some_and(|t| t.status.is_none());
+    if v.busy && !running_tool {
         let spin = SPINNER[(v.frame / 2) as usize % SPINNER.len()];
         let label = if v.thinking.is_empty() {
             "working"
@@ -447,7 +484,13 @@ fn draw_rail(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
     .areas(area);
     put_panel(f, a, "system", sys, t);
     put_panel(f, b, "spend", spend, t);
-    put_panel(f, c, "receipts", receipt_lines(t), t);
+    put_panel(
+        f,
+        c,
+        "receipts",
+        crate::cards::receipt_lines(v, inner_w, t),
+        t,
+    );
 }
 
 fn put_panel(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>, t: &Theme) {
@@ -684,34 +727,6 @@ fn capped(name: &str, used: f64, cap: f64, w: usize, t: &Theme) -> Line<'static>
     spans.extend(bar(used / cap, bar_w, t));
     spans.push(Span::styled(format!(" / ${cap:.2}"), t.ghost()));
     Line::from(spans)
-}
-
-fn receipt_lines(t: &Theme) -> Vec<Line<'static>> {
-    vec![
-        Line::from(vec![
-            Span::styled("◌ ", Style::default().fg(t.faint)),
-            Span::styled("No actions yet.", t.muted()),
-        ]),
-        Line::from(Span::styled(
-            "  Every change Reeve makes lands here",
-            t.ghost(),
-        )),
-        Line::from(Span::styled(
-            "  with its tier, approval, and undo.",
-            t.ghost(),
-        )),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("  T0 ", Style::default().fg(t.dim)),
-            Span::styled("observe  ", t.ghost()),
-            Span::styled("T1 ", Style::default().fg(t.teal)),
-            Span::styled("user  ", t.ghost()),
-            Span::styled("T2 ", Style::default().fg(t.amber)),
-            Span::styled("system  ", t.ghost()),
-            Span::styled("T3 ", Style::default().fg(t.bad)),
-            Span::styled("floor", t.ghost()),
-        ]),
-    ]
 }
 
 // ── little instruments ──────────────────────────────────────────────────────

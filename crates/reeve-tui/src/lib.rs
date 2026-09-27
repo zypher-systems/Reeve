@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cards;
 pub mod draw;
 pub mod overlay;
 pub mod panels;

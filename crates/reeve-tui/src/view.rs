@@ -4,8 +4,11 @@
 use std::collections::VecDeque;
 
 use chrono::{DateTime, Local};
-use reeve_core::agent::AgentEvent;
+use reeve_core::agent::{AgentEvent, ApprovalRequest};
+use reeve_core::diff::FileDiff;
 use reeve_core::ledger::Totals;
+use reeve_core::policy::Tier;
+use reeve_core::receipts::{Receipt, Status};
 use reeve_core::spend::{Tally, Usage};
 use reeve_observer::{HostInfo, Snapshot};
 
@@ -23,7 +26,46 @@ pub enum Speaker {
     System,
     /// Something failed.
     Error,
+    /// A tool call (see [`Entry::tool`]).
+    Tool,
 }
+
+/// A tool call as the chat shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolView {
+    /// Provider call id.
+    pub id: String,
+    /// Tool name.
+    pub tool: String,
+    /// Tier.
+    pub tier: Tier,
+    /// The command or path.
+    pub summary: String,
+    /// `None` while running.
+    pub status: Option<Status>,
+    /// What happened.
+    pub result: String,
+    /// What changed.
+    pub diff: Option<FileDiff>,
+    /// Receipt number.
+    pub seq: Option<u64>,
+    /// The receipt carries an undo.
+    pub undoable: bool,
+    /// Who approved it.
+    pub approved_by: Option<String>,
+}
+
+/// An approval waiting on the person.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pending {
+    /// What's asked.
+    pub req: ApprovalRequest,
+    /// For T3: the confirmation typed so far.
+    pub typed: String,
+}
+
+/// Receipts kept for the rail.
+pub const RAIL_RECEIPTS: usize = 40;
 
 /// One chat entry.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,6 +78,8 @@ pub struct Entry {
     pub at: DateTime<Local>,
     /// Setup chatter that goes away once Reeve is connected.
     pub transient: bool,
+    /// For [`Speaker::Tool`].
+    pub tool: Option<ToolView>,
 }
 
 /// The last call's cost details, for the Spend panel.
@@ -104,6 +148,10 @@ pub struct View {
     pub overlays: Vec<crate::overlay::Overlay>,
     /// Selected row of the slash-command palette.
     pub palette_sel: usize,
+    /// An approval card waiting for an answer.
+    pub approval: Option<Pending>,
+    /// Newest receipts first.
+    pub receipts: Vec<Receipt>,
 }
 
 /// Spending caps, USD; 0 is off.
@@ -148,7 +196,30 @@ impl View {
             quit: false,
             overlays: Vec::new(),
             palette_sel: 0,
+            approval: None,
+            receipts: Vec::new(),
         }
+    }
+
+    /// Remember a receipt for the rail (and mark an undone one).
+    pub fn add_receipt(&mut self, r: Receipt) {
+        if let Some(seq) = r.undoes {
+            for e in &mut self.entries {
+                if let Some(t) = e.tool.as_mut().filter(|t| t.seq == Some(seq)) {
+                    t.undoable = false;
+                    t.result.push_str(&format!("  · undone by #{}", r.seq));
+                }
+            }
+        }
+        self.receipts.insert(0, r);
+        self.receipts.truncate(RAIL_RECEIPTS);
+    }
+
+    /// Whether receipt `seq` has been undone (as far as the rail knows).
+    pub fn is_undone(&self, seq: u64) -> bool {
+        self.receipts
+            .iter()
+            .any(|r| r.undoes == Some(seq) && r.outcome.status == Status::Ok)
     }
 
     /// Add a chat entry.
@@ -159,6 +230,7 @@ impl View {
             text: text.into(),
             at: Local::now(),
             transient: false,
+            tool: None,
         });
         self.scroll = 0;
     }
@@ -222,6 +294,7 @@ impl View {
             AgentEvent::TurnDone { truncated } => {
                 self.busy = false;
                 self.thinking.clear();
+                self.approval = None;
                 if truncated {
                     self.push(
                         Speaker::System,
@@ -233,10 +306,73 @@ impl View {
             AgentEvent::Error(e) => {
                 self.busy = false;
                 self.thinking.clear();
+                self.approval = None;
+                self.settle_running("stopped");
                 self.close_reply();
                 self.push(Speaker::Error, e);
             }
             AgentEvent::Models(_) => {}
+            AgentEvent::ToolStarted {
+                id,
+                tool,
+                tier,
+                summary,
+            } => {
+                self.push(Speaker::Tool, String::new());
+                if let Some(e) = self.entries.last_mut() {
+                    e.tool = Some(ToolView {
+                        id,
+                        tool,
+                        tier,
+                        summary,
+                        status: None,
+                        result: String::new(),
+                        diff: None,
+                        seq: None,
+                        undoable: false,
+                        approved_by: None,
+                    });
+                }
+                self.thinking.clear();
+            }
+            AgentEvent::ToolFinished {
+                id,
+                status,
+                summary,
+                diff,
+                receipt,
+            } => {
+                self.approval = None;
+                if let Some(t) = self
+                    .entries
+                    .iter_mut()
+                    .rev()
+                    .filter_map(|e| e.tool.as_mut())
+                    .find(|t| t.id == id && t.status.is_none())
+                {
+                    t.status = Some(status);
+                    t.result = summary;
+                    t.diff = diff;
+                    if let Some(r) = &receipt {
+                        t.seq = Some(r.seq);
+                        t.undoable = r.undo.is_some() && status == Status::Ok;
+                        t.approved_by = Some(r.approved_by.clone());
+                    }
+                }
+                if let Some(r) = receipt {
+                    self.add_receipt(*r);
+                }
+            }
+        }
+    }
+
+    /// Mark tool calls still shown as running (the turn ended under them).
+    fn settle_running(&mut self, why: &str) {
+        for t in self.entries.iter_mut().filter_map(|e| e.tool.as_mut()) {
+            if t.status.is_none() {
+                t.status = Some(Status::Error);
+                t.result = why.into();
+            }
         }
     }
 

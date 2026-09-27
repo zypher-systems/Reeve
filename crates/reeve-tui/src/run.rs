@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,18 +27,23 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use reeve_core::agent::{Agent, AgentEvent};
+use reeve_core::agent::{Agent, AgentEvent, ApprovalRequest, Approver, Decision};
 use reeve_core::config::{self, Config};
 use reeve_core::ledger::{self, Totals};
 use reeve_core::llm::{HttpProvider, ModelInfo, Provider};
+use reeve_core::policy::Tier;
+use reeve_core::receipts::ReceiptBook;
 use reeve_core::settings::Settings;
 use reeve_core::spend::format_rates;
+use reeve_core::undo::UndoStore;
 use reeve_observer::{HostInfo, Sampler, failed_units};
 
 use crate::draw::draw;
-use crate::overlay::{Action, KeyEntry, ModelPicker, Overlay, ProviderRow, Providers, palette};
+use crate::overlay::{
+    Action, KeyEntry, ModelPicker, Overlay, ProviderRow, Providers, ReceiptsPanel, palette,
+};
 use crate::theme::{ColorMode, Theme};
-use crate::view::{Caps, Speaker, View};
+use crate::view::{Caps, Pending, RAIL_RECEIPTS, Speaker, View};
 
 /// What the UI asks of the worker.
 enum Work {
@@ -72,6 +78,29 @@ enum UiMsg {
         result: Result<String, String>,
     },
     SessionReset,
+    /// The agent needs a yes or no.
+    Approval(Box<ApprovalRequest>, tokio::sync::oneshot::Sender<Decision>),
+}
+
+/// Asks the person through the TUI. With the TUI gone, the answer is no.
+struct TuiApprover {
+    tx: Sender<UiMsg>,
+    yolo: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl Approver for TuiApprover {
+    async fn decide(&self, req: ApprovalRequest) -> Decision {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        if self.tx.send(UiMsg::Approval(Box::new(req), reply)).is_err() {
+            return Decision::Deny(Some("the TUI closed".into()));
+        }
+        answer.await.unwrap_or(Decision::Deny(None))
+    }
+
+    fn yolo(&self) -> bool {
+        self.yolo.load(Ordering::Relaxed)
+    }
 }
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -83,6 +112,11 @@ struct App {
     work: UnboundedSender<Work>,
     cancel: Arc<Notify>,
     catalog: HashMap<String, Vec<ModelInfo>>,
+    yolo: Arc<AtomicBool>,
+    /// Where to send the answer to the approval on screen.
+    reply: Option<tokio::sync::oneshot::Sender<Decision>>,
+    /// Session id for receipts the TUI writes itself (undo).
+    session: String,
 }
 
 /// Run the TUI until the user quits.
@@ -104,12 +138,19 @@ pub fn run(cfg: Config, home: PathBuf) -> io::Result<()> {
     let (ui_tx, ui_rx) = mpsc::channel::<UiMsg>();
     let (work_tx, work_rx) = unbounded_channel::<Work>();
     let cancel = Arc::new(Notify::new());
+    let yolo = Arc::new(AtomicBool::new(view.yolo));
+    let approver: Arc<dyn Approver> = Arc::new(TuiApprover {
+        tx: ui_tx.clone(),
+        yolo: yolo.clone(),
+    });
+    view.receipts = ReceiptBook::new(&home).recent(RAIL_RECEIPTS);
     spawn_worker(
         home.clone(),
         host.profile(),
         ui_tx.clone(),
         work_rx,
         cancel.clone(),
+        approver,
     );
     spawn_unit_watch(ui_tx);
 
@@ -119,6 +160,9 @@ pub fn run(cfg: Config, home: PathBuf) -> io::Result<()> {
         work: work_tx,
         cancel,
         catalog: HashMap::new(),
+        yolo,
+        reply: None,
+        session: format!("tui-{}", std::process::id()),
     };
     app.connect_quietly(&mut view);
 
@@ -214,7 +258,30 @@ fn event_loop(
 impl App {
     fn receive(&mut self, view: &mut View, msg: UiMsg) {
         match msg {
-            UiMsg::Agent(ev) => view.apply(ev),
+            UiMsg::Agent(ev) => {
+                if let AgentEvent::ToolFinished {
+                    receipt: Some(r), ..
+                } = &ev
+                {
+                    self.session.clone_from(&r.session);
+                }
+                let ended = matches!(ev, AgentEvent::TurnDone { .. } | AgentEvent::Error(_));
+                view.apply(ev);
+                if ended {
+                    // A turn that ended under an open card answers it no.
+                    self.reply = None;
+                }
+            }
+            UiMsg::Approval(req, reply) => {
+                // Menus give way to a question that needs an answer.
+                view.overlays.clear();
+                view.approval = Some(Pending {
+                    req: *req,
+                    typed: String::new(),
+                });
+                view.scroll = 0;
+                self.reply = Some(reply);
+            }
             UiMsg::Ready { connection, model } => {
                 view.drop_transient();
                 if !view.ready && (view.connection != connection || view.model != model) {
@@ -288,6 +355,10 @@ impl App {
             self.perform(view, action);
             return;
         }
+        if view.approval.is_some() {
+            self.approval_key(view, k);
+            return;
+        }
         // The slash palette steals arrows, tab, and enter while it's open.
         let hits = palette(&view.input);
         if !hits.is_empty() {
@@ -337,7 +408,8 @@ impl App {
                 }
             }
             KeyCode::Char('q' | 'd') if ctrl => view.quit = true,
-            KeyCode::Char('y') if ctrl => toggle_yolo(view),
+            KeyCode::Char('y') if ctrl => self.toggle_yolo(view),
+            KeyCode::Char('r') if ctrl => self.command(view, "/receipts"),
             KeyCode::Char('b') if ctrl => view.rail_only = !view.rail_only,
             KeyCode::Char('p') if ctrl => self.command(view, "/providers"),
             KeyCode::Char('w') if ctrl => view.delete_word(),
@@ -412,7 +484,18 @@ impl App {
                     let _ = self.work.send(Work::NewSession);
                 }
             }
-            "/yolo" => toggle_yolo(view),
+            "/yolo" => self.toggle_yolo(view),
+            "/receipts" => {
+                let book = ReceiptBook::new(&self.home);
+                let items = book.recent(500);
+                let undone = items.iter().filter_map(|r| r.undoes).collect();
+                view.overlays.push(Overlay::Receipts(ReceiptsPanel {
+                    items,
+                    undone,
+                    sel: 0,
+                    note: None,
+                }));
+            }
             "/help" => view.overlays.push(Overlay::Help),
             "/quit" => view.quit = true,
             _ => {}
@@ -476,6 +559,44 @@ impl App {
                     .send(Work::Verify(connection, Box::new(self.cfg.clone())));
             }
             Action::Use(connection) => self.use_connection(view, &connection),
+            Action::Undo(seq) => {
+                let book = ReceiptBook::new(&self.home);
+                let result = book.undo(&UndoStore::new(&self.home), seq, &self.session);
+                let note = match result {
+                    Ok(r) => {
+                        let msg =
+                            format!("undid #{seq}: {} (receipt #{})", r.outcome.summary, r.seq);
+                        view.add_receipt(r);
+                        view.push(Speaker::System, format!("Undid #{seq} from /receipts."));
+                        Ok(msg)
+                    }
+                    Err(e) => {
+                        view.receipts = book.recent(RAIL_RECEIPTS);
+                        Err(e.to_string())
+                    }
+                };
+                if let Some(Overlay::Receipts(p)) = view.overlays.last_mut() {
+                    p.items = book.recent(500);
+                    p.undone = p.items.iter().filter_map(|r| r.undoes).collect();
+                    // Stay on the receipt acted on, not the new one at the top:
+                    // a second `u` must not quietly undo the undo.
+                    p.sel = p.items.iter().position(|r| r.seq == seq).unwrap_or(0);
+                    p.note = Some(note);
+                }
+            }
+            Action::VerifyReceipts => {
+                let v = ReceiptBook::new(&self.home).verify();
+                let note = match v.problem {
+                    None => Ok(format!(
+                        "all {} receipts check out: none missing, none changed",
+                        v.count
+                    )),
+                    Some(p) => Err(format!("after {} good receipts: {p}", v.count)),
+                };
+                if let Some(Overlay::Receipts(p)) = view.overlays.last_mut() {
+                    p.note = Some(note);
+                }
+            }
             Action::OpenModels(connection) => self.open_models(view, connection),
             Action::ChooseModel { connection, model } => {
                 // Picking a model is the end of setup: back to the chat.
@@ -635,6 +756,60 @@ impl App {
     }
 }
 
+impl App {
+    fn toggle_yolo(&mut self, view: &mut View) {
+        toggle_yolo(view);
+        self.yolo.store(view.yolo, Ordering::Relaxed);
+    }
+
+    /// Keys while an approval card is up.
+    fn approval_key(&mut self, view: &mut View, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(p) = view.approval.as_mut() else {
+            return;
+        };
+        let floor = p.req.tier == Tier::T3;
+        let decision = match k.code {
+            KeyCode::Char('c') if ctrl => {
+                // Stop the whole turn; the dropped reply reads as a no.
+                self.cancel.notify_one();
+                self.reply = None;
+                view.approval = None;
+                return;
+            }
+            KeyCode::Esc => Some(Decision::Deny(None)),
+            KeyCode::Enter if floor => {
+                if p.typed.trim().eq_ignore_ascii_case("yes") {
+                    Some(Decision::Approve)
+                } else {
+                    p.typed.clear();
+                    None
+                }
+            }
+            KeyCode::Backspace if floor => {
+                p.typed.pop();
+                None
+            }
+            KeyCode::Char(c) if floor && !ctrl => {
+                if p.typed.len() < 8 {
+                    p.typed.push(c);
+                }
+                None
+            }
+            KeyCode::Enter | KeyCode::Char('y') => Some(Decision::Approve),
+            KeyCode::Char('a') if p.req.can_allow_session => Some(Decision::AllowSession),
+            KeyCode::Char('n') => Some(Decision::Deny(None)),
+            _ => None,
+        };
+        if let Some(d) = decision {
+            if let Some(reply) = self.reply.take() {
+                let _ = reply.send(d);
+            }
+            view.approval = None;
+        }
+    }
+}
+
 fn toggle_yolo(view: &mut View) {
     view.yolo = !view.yolo;
     view.push(
@@ -672,6 +847,7 @@ fn spawn_worker(
     tx: Sender<UiMsg>,
     mut work: UnboundedReceiver<Work>,
     cancel: Arc<Notify>,
+    approver: Arc<dyn Approver>,
 ) {
     thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -692,6 +868,7 @@ fn spawn_worker(
                 tx.clone(),
                 agent_rx,
                 cancel,
+                approver,
             ));
             while let Some(w) = work.recv().await {
                 match w {
@@ -753,6 +930,7 @@ async fn agent_loop(
     tx: Sender<UiMsg>,
     mut work: UnboundedReceiver<AgentWork>,
     cancel: Arc<Notify>,
+    approver: Arc<dyn Approver>,
 ) {
     let mut agent: Option<Agent> = None;
     let emit_tx = tx.clone();
@@ -783,7 +961,12 @@ async fn agent_loop(
                     }
                 }
             }
-            AgentWork::Connect(cfg) => connect(&mut agent, *cfg, &home, &profile, &tx).await,
+            AgentWork::Connect(cfg) => {
+                connect(&mut agent, *cfg, &home, &profile, &tx).await;
+                if let Some(a) = agent.as_mut() {
+                    a.set_approver(approver.clone());
+                }
+            }
         }
     }
 }

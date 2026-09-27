@@ -2,6 +2,50 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-27: Commands run in their own session, with no terminal
+- **Decision:**
+  - `shell` runs `setsid bash --noprofile --norc -c …` with stdin closed.
+  - Reeve's API-key variables are removed from the environment, pagers are set to `cat`, and editors to `false`.
+  - The command leads its own process group. A guard kills the whole group on timeout, and when the turn is stopped mid-command.
+  - Until M2's askpass, `sudo` fails at once ("a terminal is required"), and Reeve tells the model to hand the owner the exact command instead.
+- **Chosen vs rejected:**
+  - Rejected running commands on Reeve's own terminal: `sudo`, `ssh`, and pagers would draw over the TUI or wait forever for a key.
+  - Rejected `pre_exec(setsid)`: it needs `unsafe`, which the workspace forbids. The `setsid` binary execs in place (Reeve's child isn't a group leader), so the child's pid is the group to kill.
+  - Rejected killing only the direct child: `(sleep 3; touch x) & sleep 30` left the background job running after a timeout (a test proves it's gone now).
+- **Why:** An operator's commands are exactly the ones that prompt, page, or linger.
+- **Where:** `reeve-core/src/tools/shell.rs` (`run`, `GroupGuard`)
+- **Residual risk:**
+  - A command that double-forks into a new session of its own (a daemon) escapes the group kill.
+  - `setsid` must be installed (util-linux, standard on Fedora and Arch).
+
+### 2026-09-27: What "allow for this session" covers
+- **Decision:**
+  - Only T1 actions can be allowed for a session.
+  - For `shell`, the rule is the exact command line. For file tools, it's the tool plus the directory.
+  - T2 and T3 ask every time, and YOLO never answers T3; that is checked in core, not in the TUI.
+- **Chosen vs rejected:**
+  - Rejected allowing a program name (`rm`): one yes would cover every later `rm`.
+  - Rejected letting the approver enforce the floor: a second front end (the daemon, a future web UI) could forget. `Agent::approve` never asks YOLO about T3.
+- **Why:** Repeating a small edit in the same folder shouldn't mean ten prompts, and a broad yes shouldn't leak into unrelated work.
+- **Where:** `reeve-core/src/agent.rs` (`approve`), `tools/fs.rs` (`rule_for`), `tools/shell.rs` (`plan`)
+- **Residual risk:** A directory rule covers any file in that directory, including ones the owner didn't picture when saying yes.
+
+### 2026-09-27: Undo keeps both sides, and never clobbers
+- **Decision:**
+  - Every file change stores the file's before and after in the content-addressed undo store.
+  - Reverting first checks every path still matches the after. If anything changed since, nothing is reverted.
+  - An undo is itself an action with a receipt (`undoes: N`) whose own undo is the redo.
+  - File tools refuse a change they can't snapshot: over 64 MB, or a folder of more than 5000 files.
+- **Chosen vs rejected:**
+  - Rejected keeping only the before: without the after, Reeve can't tell whether someone edited the file since, and an undo would silently throw that edit away.
+  - Rejected changing a file without a copy "just this once": the promise is that file changes can be undone.
+  - Rejected marking the original receipt as undone: receipts are append-only, so the undo is a new receipt that points back.
+- **Why:** "Receipts for everything" is only worth something if the receipt can put things back.
+- **Where:** `reeve-core/src/undo.rs`, `receipts.rs` (`undo`), `reeve-tui/src/run.rs` (`Action::Undo`)
+- **Residual risk:**
+  - `shell` changes have no undo: the receipt records the command and a hash of its output, not what it touched.
+  - The undo store grows without bound until M3 adds pruning.
+
 ### 2026-09-27: Keys and models are set up inside the TUI
 - **Decision:**
   - `/providers` lists every connection with where its key comes from (`keys/<name>`, `$VAR`, `config.toml`), and lets you set, check, or forget a key, add a connection, and pick a model.

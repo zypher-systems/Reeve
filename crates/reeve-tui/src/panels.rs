@@ -10,7 +10,9 @@ use unicode_width::UnicodeWidthStr;
 use reeve_core::spend::{format_tokens, trim_rate};
 
 use crate::draw::{pad, panel, truncate};
-use crate::overlay::{AddForm, FIELDS, KINDS, KeyEntry, ModelPicker, Overlay, Providers, palette};
+use crate::overlay::{
+    AddForm, FIELDS, KINDS, KeyEntry, ModelPicker, Overlay, Providers, ReceiptsPanel, palette,
+};
 use crate::theme::Theme;
 use crate::view::View;
 
@@ -25,6 +27,10 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::Key(_) => (84, 11),
         Overlay::Models(_) => (104, area.height.saturating_sub(6).min(32)),
         Overlay::Add(_) => (92, 15),
+        Overlay::Receipts(_) => (
+            area.width.saturating_sub(6).min(130),
+            area.height.saturating_sub(4),
+        ),
         Overlay::Help => (72, 24),
     };
     let r = centered(area, w, h);
@@ -34,6 +40,7 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::Key(_) => "api key",
         Overlay::Models(_) => "model",
         Overlay::Add(_) => "add a connection",
+        Overlay::Receipts(_) => "receipts",
         Overlay::Help => "help",
     };
     let block = panel(title, t, true);
@@ -50,6 +57,7 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::Key(k) => key_entry(f, inner, k, t),
         Overlay::Models(m) => models(f, inner, m, t),
         Overlay::Add(a) => add_form(f, inner, a, t),
+        Overlay::Receipts(r) => receipts(f, inner, r, t),
         Overlay::Help => help(f, inner, t),
     }
 }
@@ -456,6 +464,174 @@ fn add_form(f: &mut Frame, r: Rect, a: &AddForm, t: &Theme) {
     if let Some((x, y)) = cursor {
         f.set_cursor_position(Position::new(x, y));
     }
+}
+
+fn receipts(f: &mut Frame, r: Rect, p: &ReceiptsPanel, t: &Theme) {
+    use reeve_core::receipts::Status;
+    let w = r.width as usize;
+    let list_h = (r.height as usize).saturating_sub(4) / 2;
+    let mut lines = Vec::new();
+    if p.items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No receipts yet: Reeve hasn't done anything.",
+            t.muted(),
+        )));
+    }
+    let start = p.sel.saturating_sub(list_h.saturating_sub(1));
+    for (i, rc) in p.items.iter().enumerate().skip(start).take(list_h) {
+        let on = i == p.sel;
+        let bg = if on { t.input } else { t.panel };
+        let undone = p.undone.contains(&rc.seq);
+        let (icon, ic) = match rc.outcome.status {
+            Status::Ok => ("✓", t.good),
+            Status::Error => ("✗", t.bad),
+            Status::Denied => ("⊘", t.warn),
+            Status::Refused => ("⊗", t.bad),
+        };
+        let when = rc
+            .ts
+            .with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M")
+            .to_string();
+        let target_w = w.saturating_sub(3 + 7 + 3 + 4 + 11 + 12 + 3);
+        let mark = if rc.undoes.is_some() {
+            "↺"
+        } else if undone {
+            "undone"
+        } else if rc.undo.is_some() && rc.outcome.status == Status::Ok {
+            "↶"
+        } else {
+            ""
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if on { " ▸ " } else { "   " },
+                Style::default().fg(t.brass).bg(bg),
+            ),
+            Span::styled(pad(&format!("#{}", rc.seq), 7), t.ghost().bg(bg)),
+            Span::styled(format!("{icon}  "), Style::default().fg(ic).bg(bg)),
+            Span::styled(
+                format!("{} ", rc.tier.label()),
+                Style::default().fg(t.tier(rc.tier)).bg(bg),
+            ),
+            Span::styled(
+                pad(&rc.tool, 11),
+                Style::default().fg(if on { t.amber } else { t.fg }).bg(bg),
+            ),
+            Span::styled(
+                pad(&truncate(&rc.target(), target_w), target_w),
+                (if undone {
+                    t.ghost().add_modifier(Modifier::CROSSED_OUT)
+                } else {
+                    t.muted()
+                })
+                .bg(bg),
+            ),
+            Span::styled(pad(&when, 12), t.ghost().bg(bg)),
+            Span::styled(pad(mark, 7), Style::default().fg(t.teal).bg(bg)),
+        ]));
+    }
+    while lines.len() < list_h {
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::from(Span::styled("─".repeat(w), t.ghost())));
+    if let Some(rc) = p.selected() {
+        let field = |k: &str, v: String, st: Style| {
+            Line::from(vec![
+                Span::styled(pad(k, 11), t.ghost()),
+                Span::styled(truncate(&v, w.saturating_sub(11)), st),
+            ])
+        };
+        lines.push(field(
+            "action",
+            format!(
+                "#{} {} · {} · {}",
+                rc.seq,
+                rc.tool,
+                rc.tier.label(),
+                rc.tier.name()
+            ),
+            t.accent(),
+        ));
+        lines.push(field(
+            "when",
+            rc.ts
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+            t.muted(),
+        ));
+        lines.push(field(
+            "approved",
+            rc.approved_by.clone(),
+            Style::default().fg(if rc.approved_by == "yolo" {
+                t.bad
+            } else {
+                t.teal
+            }),
+        ));
+        if let Some(why) = &rc.why {
+            lines.push(field(
+                "why",
+                why.clone(),
+                t.muted().add_modifier(Modifier::ITALIC),
+            ));
+        }
+        if !rc.reasons.is_empty() {
+            lines.push(field(
+                "risk",
+                rc.reasons.join(" · "),
+                Style::default().fg(t.tier(rc.tier)),
+            ));
+        }
+        let exit = rc
+            .outcome
+            .exit
+            .map(|c| format!(" (exit {c})"))
+            .unwrap_or_default();
+        lines.push(field(
+            "result",
+            format!("{}{exit}", rc.outcome.summary),
+            t.text(),
+        ));
+        let args = rc.args.to_string();
+        lines.push(field("args", args, Style::default().fg(t.code)));
+        let undo = match (&rc.undo, p.undone.contains(&rc.seq)) {
+            (Some(_), true) => "already undone".to_string(),
+            (Some(_), false) => "available: press u".to_string(),
+            (None, _) => "none (nothing to reverse, or Reeve can't)".to_string(),
+        };
+        lines.push(field("undo", undo, t.muted()));
+        lines.push(field(
+            "hash",
+            format!(
+                "{}…  prev {}…",
+                &rc.hash.get(..16).unwrap_or(""),
+                &rc.prev.get(..16).unwrap_or("")
+            ),
+            t.ghost(),
+        ));
+    }
+    let footer_at = r.height.saturating_sub(2) as usize;
+    lines.truncate(footer_at);
+    while lines.len() < footer_at {
+        lines.push(Line::raw(""));
+    }
+    lines.push(match &p.note {
+        Some(Ok(m)) => Line::from(Span::styled(format!("✓ {m}"), Style::default().fg(t.good))),
+        Some(Err(m)) => Line::from(Span::styled(format!("✗ {m}"), Style::default().fg(t.bad))),
+        None => Line::raw(""),
+    });
+    lines.push(hints(
+        &[
+            ("↑↓", "move"),
+            ("u", "undo"),
+            ("v", "verify the chain"),
+            ("esc", "close"),
+        ],
+        t,
+    ));
+    f.render_widget(Paragraph::new(lines), r);
 }
 
 fn help(f: &mut Frame, r: Rect, t: &Theme) {
