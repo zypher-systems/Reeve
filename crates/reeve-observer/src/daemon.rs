@@ -124,6 +124,8 @@ struct Observer {
     status: ObserverStatus,
     pending_notify: Vec<String>,
     last_notify: Option<chrono::DateTime<Utc>>,
+    /// A standing order is running (one at a time).
+    order_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn push<T>(q: &mut VecDeque<T>, v: T) {
@@ -156,6 +158,7 @@ impl Observer {
             },
             pending_notify: Vec::new(),
             last_notify: None,
+            order_running: Default::default(),
             home,
         }
     }
@@ -311,6 +314,114 @@ impl Observer {
         self.last_notify = Some(now);
     }
 
+    /// Start at most one standing order that's due: asked for, triggered by
+    /// a finding, or scheduled. It runs in the background; readings go on.
+    fn orders_tick(&mut self, cfg: &config::Config, profile: &str) {
+        use reeve_core::orders::{Orders, Run};
+        use std::sync::atomic::Ordering;
+        if self.order_running.load(Ordering::SeqCst) {
+            return;
+        }
+        let orders = Orders::new(&self.home);
+        let (list, _) = orders.load();
+        let requests = orders.take_requests();
+        if list.is_empty() {
+            return;
+        }
+        let mut states = orders.states();
+        let now = Utc::now();
+        let findings = self.store.list();
+        let mut due = None;
+        for o in &list {
+            let st = states.entry(o.id.clone()).or_default();
+            if requests.contains(&o.id) {
+                due = Some((o.clone(), crate::orders::Cause::Manual));
+                break;
+            }
+            if !o.enabled {
+                continue;
+            }
+            if let Some(f) = findings
+                .iter()
+                .find(|f| o.wants(f) && st.handled.get(&f.id) != Some(&f.first_seen))
+            {
+                // Each episode of a finding is handled once, run or not.
+                st.handled.insert(f.id.clone(), f.first_seen);
+                match o.can_run(st, now) {
+                    Ok(()) => {
+                        due = Some((
+                            o.clone(),
+                            crate::orders::Cause::Finding(Box::new(f.clone())),
+                        ));
+                        break;
+                    }
+                    Err(why) => st.push(Run {
+                        ts: now,
+                        trigger: format!("finding:{}", f.id),
+                        status: "skipped".into(),
+                        summary: why,
+                        receipts: vec![],
+                        usd: None,
+                        session: None,
+                    }),
+                }
+                continue;
+            }
+            if o.schedule_due(st, now) && o.can_run(st, now).is_ok() {
+                due = Some((o.clone(), crate::orders::Cause::Schedule));
+                break;
+            }
+        }
+        if let Some((order, _)) = &due {
+            // Claimed before it starts, so a slow run can't be started twice.
+            states.entry(order.id.clone()).or_default().last_run = Some(now);
+        }
+        let _ = orders.save_states(&states);
+        let Some((order, cause)) = due else { return };
+        self.order_running.store(true, Ordering::SeqCst);
+        let (home, cfg, profile, running) = (
+            self.home.clone(),
+            cfg.clone(),
+            profile.to_string(),
+            self.order_running.clone(),
+        );
+        tokio::spawn(async move {
+            if order.notify == "before" {
+                notify::plain(
+                    &format!("Reeve: starting \"{}\"", order.name),
+                    &cause.label(),
+                    false,
+                );
+            }
+            let run = crate::orders::run(&home, &cfg, &order, cause, &profile).await;
+            let orders = Orders::new(&home);
+            let mut states = orders.states();
+            let summary_line = run
+                .summary
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .to_string();
+            let status = run.status.clone();
+            let receipts = run.receipts.len();
+            states.entry(order.id.clone()).or_default().push(run);
+            let _ = orders.save_states(&states);
+            if order.notify != "never" && cfg.observer.notify {
+                let title = match status.as_str() {
+                    "done" => format!("Reeve did: {}", order.name),
+                    "blocked" => format!("Reeve needs you: {}", order.name),
+                    _ => format!("Reeve couldn't: {}", order.name),
+                };
+                notify::plain(
+                    &title,
+                    &format!("{summary_line}\n{receipts} receipts · /orders to review"),
+                    status != "done",
+                );
+            }
+            running.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
     fn hour_tick(&mut self) {
         let now = Utc::now();
         let disks: Vec<(String, u64)> = self
@@ -436,7 +547,11 @@ pub async fn run_observer(home: PathBuf, once: bool) -> Result<(), String> {
             }
             _ = hour.tick() => obs.hour_tick(),
             _ = slow.tick() => obs.slow_checks().await,
-            _ = beat.tick() => obs.beat(&cfg),
+            _ = beat.tick() => {
+                obs.beat(&cfg);
+                // Every 10 s, so "run now" in /orders doesn't wait a minute.
+                obs.orders_tick(&cfg, &profile);
+            }
             _ = draft.tick() => {
                 if cfg.observer.drafter.enabled {
                     match drafter::pass(&home, &cfg, &obs.store, &profile).await {

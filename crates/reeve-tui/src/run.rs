@@ -311,6 +311,24 @@ fn event_loop(
                 }
             }
         }
+        if let Some(path) = view.edit_file.take() {
+            restore(app.cfg.ui.mouse);
+            let editor = std::env::var("VISUAL")
+                .or_else(|_| std::env::var("EDITOR"))
+                .unwrap_or_else(|_| "nano".into());
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{editor} \"$1\""))
+                .arg("sh")
+                .arg(&path)
+                .status();
+            enter(app.cfg.ui.mouse)?;
+            term.clear()?;
+            match status {
+                Ok(_) => app.order_edited(view, &path),
+                Err(e) => view.push(Speaker::Error, format!("couldn't run {editor}: {e}")),
+            }
+        }
         if let Some((layer, id)) = view.edit_request.take() {
             let path = app.memory.path(layer, &id);
             let before = std::fs::read_to_string(&path).ok();
@@ -598,6 +616,17 @@ impl App {
                 view.overlays.push(Overlay::Findings(p));
             }
             "/observer" => self.open_observer(view),
+            "/orders" => {
+                let orders = reeve_core::orders::Orders::new(&self.home);
+                let seeded = orders.seed_examples().unwrap_or(0);
+                let mut p = crate::overlay::OrdersPanel::load(&orders);
+                if seeded > 0 {
+                    p.note = Some(Ok(format!(
+                        "wrote {seeded} example orders to start from; all are off until you turn them on"
+                    )));
+                }
+                view.overlays.push(Overlay::Orders(p));
+            }
             "/memory" => view
                 .overlays
                 .push(Overlay::Memory(crate::overlay::MemoryPanel::load(
@@ -783,6 +812,94 @@ impl App {
                     p.refresh(store.list());
                 }
                 self.poll_observer(view);
+            }
+            Action::OrderToggle(id, on) => {
+                let orders = reeve_core::orders::Orders::new(&self.home);
+                let note = orders
+                    .set_enabled(&id, on)
+                    .map(|()| {
+                        if on {
+                            let daemon = if view.observer_alive {
+                                "reeved will run it when it's due"
+                            } else {
+                                "start reeved (/observer) for it to run"
+                            };
+                            format!("{id} is on: {daemon}")
+                        } else {
+                            format!("{id} is off")
+                        }
+                    })
+                    .map_err(|e| e.to_string());
+                self.orders_note(view, note);
+            }
+            Action::OrderRun(id) => {
+                let orders = reeve_core::orders::Orders::new(&self.home);
+                let note = if !view.observer_alive {
+                    Err("reeved isn't running; start it in /observer (or `reeve orders run` from a terminal)".to_string())
+                } else {
+                    orders
+                        .request_run(&id)
+                        .map(|()| format!("asked reeved to run {id}; it starts within 10 s"))
+                        .map_err(|e| e.to_string())
+                };
+                self.orders_note(view, note);
+            }
+            Action::OrderEdit(id) => {
+                let orders = reeve_core::orders::Orders::new(&self.home);
+                let path = match id {
+                    Some(id) => orders.path(&id),
+                    None => {
+                        let mut n = 1;
+                        let mut p = orders.path("new-order");
+                        while p.exists() {
+                            n += 1;
+                            p = orders.path(&format!("new-order-{n}"));
+                        }
+                        let _ = std::fs::create_dir_all(orders.dir());
+                        let _ = std::fs::write(&p, NEW_ORDER);
+                        p
+                    }
+                };
+                view.edit_file = Some(path);
+            }
+            Action::OrderDelete(id) => {
+                let orders = reeve_core::orders::Orders::new(&self.home);
+                let note = std::fs::remove_file(orders.path(&id))
+                    .map(|()| format!("deleted {id}"))
+                    .map_err(|e| e.to_string());
+                self.orders_note(view, note);
+            }
+            Action::OrderSudoers(id) => {
+                let orders = reeve_core::orders::Orders::new(&self.home);
+                if let Ok(o) = orders.get(&id) {
+                    let user = std::env::var("USER").unwrap_or_else(|_| "you".into());
+                    let which = |p: &str| {
+                        std::process::Command::new("sh")
+                            .args(["-c", &format!("command -v {p}")])
+                            .output()
+                            .ok()
+                            .filter(|o| o.status.success())
+                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    };
+                    let (lines, skipped) = o.sudoers(&user, which);
+                    let mut extra = Vec::new();
+                    if lines.is_empty() {
+                        extra.push(
+                            "No exact root commands: nothing to allow in sudoers.".to_string(),
+                        );
+                    } else {
+                        extra.push(format!(
+                            "sudo visudo -f /etc/sudoers.d/reeve-{id}   and add:"
+                        ));
+                        extra.extend(lines);
+                    }
+                    for s in skipped {
+                        extra.push(format!("(skipped, has a wildcard: {s})"));
+                    }
+                    if let Some(Overlay::Orders(p)) = view.overlays.last_mut() {
+                        p.extra = extra;
+                    }
+                }
             }
             Action::InstallDaemon => {
                 let exe = std::env::current_exe().map_err(|e| e.to_string());
@@ -1106,6 +1223,38 @@ impl App {
             _ => Ok("no changes".into()),
         };
         self.memory_note(view, msg);
+    }
+
+    fn orders_note(&self, view: &mut View, note: Result<String, String>) {
+        let orders = reeve_core::orders::Orders::new(&self.home);
+        if let Some(Overlay::Orders(p)) = view
+            .overlays
+            .iter_mut()
+            .rev()
+            .find(|o| matches!(o, Overlay::Orders(_)))
+        {
+            p.reload(&orders);
+            p.note = Some(note);
+        }
+    }
+
+    /// After `$EDITOR` on an order: say whether it still parses.
+    fn order_edited(&self, view: &mut View, path: &std::path::Path) {
+        let id = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let note = match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|t| reeve_core::orders::parse(&id, &t))
+        {
+            Ok(o) => Ok(format!(
+                "{id} saved ({})",
+                if o.enabled { "on" } else { "off" }
+            )),
+            Err(e) => Err(format!("{id} doesn't parse, so it won't run: {e}")),
+        };
+        self.orders_note(view, note);
     }
 
     /// Read reeved's heartbeat and the findings.
@@ -1638,3 +1787,34 @@ async fn survey(tools: ToolCtx, home: PathBuf, tx: Sender<UiMsg>, first: bool) {
     }
     let _ = tx.send(UiMsg::MemoryChanged);
 }
+
+/// A new order, commented, for `n` in `/orders`.
+const NEW_ORDER: &str = r#"# A standing order: work Reeve does unattended, within the scope below.
+# It stays off until you set enabled = true (or press space in /orders).
+name = "My order"
+task = """
+Say plainly what to do, what to check first, and when to do nothing.
+"""
+enabled = false
+notify = "after"            # after | before | never
+
+[trigger]
+# Finding ids from /findings; * matches anything: "disk-full:*", "unit-failed:*".
+findings = []
+# hourly | every 30m | every 6h | daily 03:00 | weekly sun 03:00
+# schedule = "daily 03:00"
+min_severity = "warning"
+
+[scope]
+max_tier = "T1"             # T1 (your files) or T2 (system); never T3
+tools = ["shell"]           # tools that may change things; reads are always fine
+# Every command must match one of these. * matches within one word.
+# Root commands need a sudoers rule: press s in /orders to see it.
+commands = []
+paths = []                  # for file tools: "~/.cache/**"
+
+[budget]
+per_run_usd = 0.05
+runs_per_day = 2
+cooldown_hours = 12
+"#;

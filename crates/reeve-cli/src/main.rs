@@ -42,6 +42,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<ReceiptsCmd>,
     },
+    /// Standing orders: work Reeve does unattended, within a scope you set.
+    Orders {
+        #[command(subcommand)]
+        cmd: Option<OrdersCmd>,
+    },
     /// The background observer (reeved).
     Daemon {
         #[command(subcommand)]
@@ -55,6 +60,22 @@ enum Cmd {
         #[arg(short, long)]
         yes: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum OrdersCmd {
+    /// Every order, with its trigger and last run (default).
+    List,
+    /// One order in full, with its recent runs.
+    Show { id: String },
+    /// Run an order now, exactly as reeved would (unattended, scoped).
+    Run { id: String },
+    /// Print the sudoers lines that let an order's root commands run unattended.
+    Sudoers { id: String },
+    /// Check every order file.
+    Check,
+    /// Write the example orders (disabled) if there are none.
+    Examples,
 }
 
 #[derive(Subcommand)]
@@ -148,6 +169,7 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Some(Cmd::Models { connection, filter }) => models(&cfg, &home, connection, filter),
         Some(Cmd::Daemon { cmd }) => daemon(&home, cmd),
+        Some(Cmd::Orders { cmd }) => orders_cmd(&cfg, &home, cmd.unwrap_or(OrdersCmd::List)),
         Some(Cmd::Doctor) => {
             doctor(&cfg, &home);
             Ok(())
@@ -318,6 +340,179 @@ fn daemon(home: &std::path::Path, cmd: DaemonCmd) -> Result<(), String> {
                 home.to_path_buf(),
                 once,
             ))
+        }
+    }
+}
+
+fn orders_cmd(cfg: &Config, home: &std::path::Path, cmd: OrdersCmd) -> Result<(), String> {
+    use reeve_core::orders::Orders;
+    let orders = Orders::new(home);
+    match cmd {
+        OrdersCmd::List | OrdersCmd::Check => {
+            let (list, bad) = orders.load();
+            let states = orders.states();
+            if list.is_empty() && bad.is_empty() {
+                println!(
+                    "No standing orders. `reeve orders examples` writes three (disabled) to start from, in {}.",
+                    orders.dir().display()
+                );
+            }
+            for o in &list {
+                let st = states.get(&o.id).cloned().unwrap_or_default();
+                let trig = [
+                    o.trigger.schedule.clone().unwrap_or_default(),
+                    o.trigger.findings.join(","),
+                ]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · ");
+                let last = st
+                    .runs
+                    .last()
+                    .map(|r| {
+                        format!(
+                            "{} {}",
+                            r.status,
+                            r.ts.with_timezone(&chrono::Local).format("%m-%d %H:%M")
+                        )
+                    })
+                    .unwrap_or_else(|| "never ran".into());
+                println!(
+                    "{} {:<22} {:<40} {} · ≤{} · {}",
+                    if o.enabled { "●" } else { "○" },
+                    o.id,
+                    trig,
+                    last,
+                    o.scope.max_tier.label(),
+                    o.name
+                );
+            }
+            for (id, e) in &bad {
+                println!("✗ {id}: {e}");
+            }
+            if matches!(cmd, OrdersCmd::Check) && !bad.is_empty() {
+                return Err(format!("{} order file(s) don't parse", bad.len()));
+            }
+            Ok(())
+        }
+        OrdersCmd::Show { id } => {
+            let o = orders.get(&id).map_err(|e| e.to_string())?;
+            println!(
+                "{} ({})  {}",
+                o.name,
+                o.id,
+                if o.enabled { "enabled" } else { "disabled" }
+            );
+            println!("task: {}", o.task.trim());
+            println!(
+                "trigger: schedule {:?}, findings {:?}, min severity {:?}",
+                o.trigger.schedule, o.trigger.findings, o.trigger.min_severity
+            );
+            println!(
+                "scope: up to {}, tools {:?}, commands {:?}, paths {:?}",
+                o.scope.max_tier.label(),
+                o.scope.tools,
+                o.scope.commands,
+                o.scope.paths
+            );
+            println!(
+                "budget: ${:.2} a run, {} runs a day, {}h apart",
+                o.budget.per_run_usd, o.budget.runs_per_day, o.budget.cooldown_hours
+            );
+            for r in orders
+                .states()
+                .get(&id)
+                .map(|s| s.runs.clone())
+                .unwrap_or_default()
+                .iter()
+                .rev()
+                .take(10)
+            {
+                println!(
+                    "  {} {:<8} {:<28} {}",
+                    r.ts.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
+                    r.status,
+                    r.trigger,
+                    r.summary.lines().next().unwrap_or("")
+                );
+            }
+            Ok(())
+        }
+        OrdersCmd::Run { id } => {
+            let o = orders.get(&id).map_err(|e| e.to_string())?;
+            println!(
+                "running \"{}\" as reeved would: unattended, inside its scope…",
+                o.name
+            );
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .build()
+                .map_err(|e| e.to_string())?;
+            let profile = reeve_observer::HostInfo::read().profile();
+            let run = rt.block_on(reeve_observer::orders::run(
+                home,
+                cfg,
+                &o,
+                reeve_observer::orders::Cause::Manual,
+                &profile,
+            ));
+            println!("{}: {}", run.status, run.summary);
+            println!(
+                "receipts: {:?}  cost: {}",
+                run.receipts,
+                reeve_core::spend::format_usd(run.usd)
+            );
+            let mut states = orders.states();
+            states.entry(id).or_default().push(run);
+            orders.save_states(&states).map_err(|e| e.to_string())
+        }
+        OrdersCmd::Sudoers { id } => {
+            let o = orders.get(&id).map_err(|e| e.to_string())?;
+            let user = std::env::var("USER").unwrap_or_else(|_| "you".into());
+            let which = |p: &str| {
+                std::process::Command::new("sh")
+                    .args(["-c", &format!("command -v {p}")])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            };
+            let (lines, skipped) = o.sudoers(&user, which);
+            if lines.is_empty() {
+                println!("\"{}\" has no exact root commands to allow.", o.name);
+            } else {
+                println!(
+                    "# /etc/sudoers.d/reeve-{}: lets reeved run exactly these as root, unattended.",
+                    o.id
+                );
+                println!(
+                    "# Install with: sudo visudo -f /etc/sudoers.d/reeve-{}",
+                    o.id
+                );
+                for l in &lines {
+                    println!("{l}");
+                }
+            }
+            for s in skipped {
+                println!(
+                    "# not included (has a wildcard, which in sudoers allows more than it looks like): {s}"
+                );
+            }
+            Ok(())
+        }
+        OrdersCmd::Examples => {
+            let n = orders.seed_examples().map_err(|e| e.to_string())?;
+            if n == 0 {
+                println!("You already have orders; nothing written.");
+            } else {
+                println!(
+                    "Wrote {n} example orders (all disabled) to {}.",
+                    orders.dir().display()
+                );
+            }
+            Ok(())
         }
     }
 }

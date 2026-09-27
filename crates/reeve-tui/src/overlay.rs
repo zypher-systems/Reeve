@@ -27,6 +27,10 @@ pub const COMMANDS: &[Command] = &[
         about: "choose the model (live prices)",
     },
     Command {
+        name: "/orders",
+        about: "standing orders: what Reeve may do unattended",
+    },
+    Command {
         name: "/findings",
         about: "what the observer noticed; drafted fixes",
     },
@@ -128,6 +132,16 @@ pub enum Action {
     UseProposal(String),
     /// Set a finding's status.
     FindingStatus(String, reeve_core::findings::FindingStatus),
+    /// Turn a standing order on or off.
+    OrderToggle(String, bool),
+    /// Ask reeved to run an order now.
+    OrderRun(String),
+    /// Open an order (or a new one) in `$EDITOR`.
+    OrderEdit(Option<String>),
+    /// Delete an order's file.
+    OrderDelete(String),
+    /// Show an order's sudoers lines.
+    OrderSudoers(String),
     /// Install and start reeved.
     InstallDaemon,
     /// Stop and remove reeved.
@@ -175,6 +189,8 @@ pub enum Overlay {
     Findings(FindingsPanel),
     /// `/observer`.
     Observer(ObserverPanel),
+    /// `/orders`.
+    Orders(OrdersPanel),
     /// `/help`.
     Help,
 }
@@ -195,6 +211,7 @@ impl Overlay {
             Self::Memory(m) => m.on_key(k),
             Self::Findings(f) => f.on_key(k),
             Self::Observer(o) => o.on_key(k),
+            Self::Orders(o) => o.on_key(k),
             Self::Help => Action::Close,
         }
     }
@@ -416,6 +433,95 @@ impl FindingsPanel {
             KeyCode::Char('a') => Action::FindingStatus(id, S::Acknowledged),
             KeyCode::Char('x') => Action::FindingStatus(id, S::Dismissed),
             KeyCode::Char('o') => Action::FindingStatus(id, S::Open),
+            _ => Action::None,
+        }
+    }
+}
+
+// ── /orders ─────────────────────────────────────────────────────────────────
+
+/// The standing orders panel.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OrdersPanel {
+    /// Orders that parse.
+    pub items: Vec<reeve_core::orders::Order>,
+    /// Files that don't: (id, why).
+    pub bad: Vec<(String, String)>,
+    /// Run history.
+    pub states: std::collections::BTreeMap<String, reeve_core::orders::OrderState>,
+    /// Selected row.
+    pub sel: usize,
+    /// Last action's result.
+    pub note: Option<Result<String, String>>,
+    /// Extra lines to show (sudoers rules).
+    pub extra: Vec<String>,
+    /// Delete asked once.
+    pub confirm_delete: Option<String>,
+}
+
+impl OrdersPanel {
+    /// Load from disk.
+    pub fn load(orders: &reeve_core::orders::Orders) -> Self {
+        let mut p = Self::default();
+        p.reload(orders);
+        p
+    }
+
+    /// Re-read, keeping the selection.
+    pub fn reload(&mut self, orders: &reeve_core::orders::Orders) {
+        let keep = self.selected().map(|o| o.id.clone());
+        let (items, bad) = orders.load();
+        self.items = items;
+        self.bad = bad;
+        self.states = orders.states();
+        if let Some(id) = keep {
+            if let Some(i) = self.items.iter().position(|o| o.id == id) {
+                self.sel = i;
+            }
+        }
+        self.sel = self.sel.min(self.items.len().saturating_sub(1));
+    }
+
+    /// The selected order.
+    pub fn selected(&self) -> Option<&reeve_core::orders::Order> {
+        self.items.get(self.sel)
+    }
+
+    fn on_key(&mut self, k: KeyEvent) -> Action {
+        let n = self.items.len();
+        if !matches!(k.code, KeyCode::Char('D')) {
+            self.confirm_delete = None;
+        }
+        match k.code {
+            KeyCode::Up => self.sel = self.sel.saturating_sub(1),
+            KeyCode::Down => self.sel = (self.sel + 1).min(n.saturating_sub(1)),
+            KeyCode::Char('n') => return Action::OrderEdit(None),
+            _ => {}
+        }
+        if !matches!(k.code, KeyCode::Char('s')) {
+            self.extra.clear();
+        }
+        let Some(o) = self.selected() else {
+            return Action::None;
+        };
+        let id = o.id.clone();
+        match k.code {
+            KeyCode::Char(' ') => Action::OrderToggle(id, !o.enabled),
+            KeyCode::Char('r') => Action::OrderRun(id),
+            KeyCode::Char('e') | KeyCode::Enter => Action::OrderEdit(Some(id)),
+            KeyCode::Char('s') => Action::OrderSudoers(id),
+            KeyCode::Char('D') => {
+                if self.confirm_delete.as_deref() == Some(id.as_str()) {
+                    self.confirm_delete = None;
+                    Action::OrderDelete(id)
+                } else {
+                    self.note = Some(Err(format!(
+                        "press D again to delete {id} (space turns it off instead)"
+                    )));
+                    self.confirm_delete = Some(id);
+                    Action::None
+                }
+            }
             _ => Action::None,
         }
     }

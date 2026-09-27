@@ -13,6 +13,7 @@ pub mod findings;
 pub mod ledger;
 pub mod llm;
 pub mod memory;
+pub mod orders;
 pub mod policy;
 pub mod receipts;
 pub mod report;

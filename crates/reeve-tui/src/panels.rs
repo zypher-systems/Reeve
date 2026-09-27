@@ -37,6 +37,10 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
             area.height.saturating_sub(4),
         ),
         Overlay::Observer(_) => (92, 26),
+        Overlay::Orders(_) => (
+            area.width.saturating_sub(6).min(130),
+            area.height.saturating_sub(4),
+        ),
         Overlay::Help => (72, 24),
     };
     let r = centered(area, w, h);
@@ -51,6 +55,7 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::Memory(_) => "memory",
         Overlay::Findings(_) => "findings",
         Overlay::Observer(_) => "observer",
+        Overlay::Orders(_) => "standing orders",
         Overlay::Help => "help",
     };
     let block = panel(title, t, true);
@@ -72,6 +77,7 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::Memory(m) => memory(f, inner, m, t),
         Overlay::Findings(p) => findings(f, inner, p, t),
         Overlay::Observer(o) => observer(f, inner, o, t),
+        Overlay::Orders(o) => orders(f, inner, o, t),
         Overlay::Help => help(f, inner, t),
     }
 }
@@ -832,6 +838,229 @@ fn findings(f: &mut Frame, r: Rect, p: &crate::overlay::FindingsPanel, t: &Theme
             ("x", "dismiss"),
             ("o", "reopen"),
             ("pgup/dn", "scroll"),
+            ("esc", "close"),
+        ],
+        t,
+    ));
+    f.render_widget(Paragraph::new(lines), r);
+}
+
+fn orders(f: &mut Frame, r: Rect, p: &crate::overlay::OrdersPanel, t: &Theme) {
+    let w = r.width as usize;
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "  The one way Reeve acts unattended: only when one of these calls for it, only inside its scope.",
+        t.ghost(),
+    )));
+    lines.push(Line::raw(""));
+    if p.items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   No orders. `n` writes a new one from a template.",
+            t.muted(),
+        )));
+    }
+    let list_h = ((r.height as usize).saturating_sub(6) / 3).max(3);
+    let start = p.sel.saturating_sub(list_h.saturating_sub(1));
+    for (i, o) in p.items.iter().enumerate().skip(start).take(list_h) {
+        let on = i == p.sel;
+        let bg = if on { t.input } else { t.panel };
+        let st = p.states.get(&o.id).cloned().unwrap_or_default();
+        let last = st.runs.last().map_or("never ran".to_string(), |r| {
+            format!("{} {} ago", r.status, ago(r.ts))
+        });
+        let trig = o
+            .trigger
+            .schedule
+            .clone()
+            .into_iter()
+            .chain((!o.trigger.findings.is_empty()).then(|| {
+                format!(
+                    "{} finding kind{}",
+                    o.trigger.findings.len(),
+                    if o.trigger.findings.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                )
+            }))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let name_w = w.saturating_sub(3 + 3 + 26 + 22 + 5);
+        lines.push(Line::from(vec![
+            Span::styled(
+                if on { " ▸ " } else { "   " },
+                Style::default().fg(t.brass).bg(bg),
+            ),
+            Span::styled(
+                if o.enabled { "●  " } else { "○  " },
+                Style::default()
+                    .fg(if o.enabled { t.good } else { t.faint })
+                    .bg(bg),
+            ),
+            Span::styled(
+                pad(&truncate(&o.name, name_w), name_w),
+                (if on {
+                    Style::default().fg(t.amber).add_modifier(Modifier::BOLD)
+                } else if o.enabled {
+                    t.text()
+                } else {
+                    t.muted()
+                })
+                .bg(bg),
+            ),
+            Span::styled(pad(&truncate(&trig, 25), 26), t.ghost().bg(bg)),
+            Span::styled(pad(&last, 22), t.ghost().bg(bg)),
+            Span::styled(
+                pad(&format!("≤{}", o.scope.max_tier.label()), 5),
+                Style::default().fg(t.tier(o.scope.max_tier)).bg(bg),
+            ),
+        ]));
+    }
+    for (id, e) in &p.bad {
+        lines.push(Line::from(Span::styled(
+            format!("   ✗ {id}: {}", truncate(e, w.saturating_sub(8))),
+            Style::default().fg(t.bad),
+        )));
+    }
+    while lines.len() < list_h + 2 {
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::from(Span::styled("─".repeat(w), t.ghost())));
+    if let Some(o) = p.selected() {
+        let field = |k: &str, v: String, st: Style| {
+            Line::from(vec![
+                Span::styled(pad(k, 10), t.ghost()),
+                Span::styled(truncate(&v, w.saturating_sub(10)), st),
+            ])
+        };
+        lines.push(Line::from(vec![
+            Span::styled(o.name.clone(), t.accent()),
+            Span::styled(
+                format!("  {} · {}", o.id, if o.enabled { "on" } else { "off" }),
+                t.ghost(),
+            ),
+        ]));
+        for l in o.task.trim().lines().take(3) {
+            lines.push(Line::from(Span::styled(truncate(l, w), t.muted())));
+        }
+        let when = [
+            o.trigger.schedule.clone().unwrap_or_default(),
+            o.trigger.findings.join(", "),
+        ]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("  ·  ");
+        lines.push(field("when", when, t.text()));
+        let list = |v: &[String]| {
+            if v.is_empty() {
+                "none".to_string()
+            } else {
+                v.join(" | ")
+            }
+        };
+        lines.push(field(
+            "may",
+            format!(
+                "up to {} · tools {} ",
+                o.scope.max_tier.label(),
+                list(&o.scope.tools)
+            ),
+            Style::default().fg(t.tier(o.scope.max_tier)),
+        ));
+        lines.push(field(
+            "commands",
+            list(&o.scope.commands),
+            Style::default().fg(t.code),
+        ));
+        if !o.scope.paths.is_empty() {
+            lines.push(field(
+                "paths",
+                list(&o.scope.paths),
+                Style::default().fg(t.code),
+            ));
+        }
+        let st = p.states.get(&o.id).cloned().unwrap_or_default();
+        lines.push(field(
+            "budget",
+            format!(
+                "${:.2} a run · {} a day ({} today) · {}h apart",
+                o.budget.per_run_usd,
+                o.budget.runs_per_day,
+                st.runs_today(),
+                o.budget.cooldown_hours
+            ),
+            Style::default().fg(t.amber),
+        ));
+        if !p.extra.is_empty() {
+            lines.push(Line::raw(""));
+            for l in &p.extra {
+                lines.push(Line::from(Span::styled(
+                    truncate(l, w),
+                    Style::default().fg(t.code),
+                )));
+            }
+        } else if !st.runs.is_empty() {
+            lines.push(Line::raw(""));
+            for run in st.runs.iter().rev().take(6) {
+                let c = match run.status.as_str() {
+                    "done" => t.good,
+                    "blocked" => t.warn,
+                    "skipped" => t.dim,
+                    _ => t.bad,
+                };
+                let receipts = if run.receipts.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " #{}",
+                        run.receipts
+                            .iter()
+                            .map(u64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(" #")
+                    )
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(pad(&format!("{} ago", ago(run.ts)), 9), t.ghost()),
+                    Span::styled(pad(&run.status, 8), Style::default().fg(c)),
+                    Span::styled(
+                        truncate(
+                            &format!(
+                                "{} {}{receipts}",
+                                run.trigger,
+                                run.summary
+                                    .lines()
+                                    .find(|l| !l.trim().is_empty())
+                                    .unwrap_or("")
+                            ),
+                            w.saturating_sub(17),
+                        ),
+                        t.muted(),
+                    ),
+                ]));
+            }
+        }
+    }
+    let footer_at = r.height.saturating_sub(2) as usize;
+    lines.truncate(footer_at);
+    while lines.len() < footer_at {
+        lines.push(Line::raw(""));
+    }
+    lines.push(match &p.note {
+        Some(Ok(m)) => Line::from(Span::styled(format!("✓ {m}"), Style::default().fg(t.good))),
+        Some(Err(m)) => Line::from(Span::styled(format!("! {m}"), Style::default().fg(t.warn))),
+        None => Line::raw(""),
+    });
+    lines.push(hints(
+        &[
+            ("space", "on/off"),
+            ("r", "run now"),
+            ("e", "edit"),
+            ("n", "new"),
+            ("s", "sudoers"),
+            ("D", "delete"),
             ("esc", "close"),
         ],
         t,

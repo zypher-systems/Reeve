@@ -14,6 +14,7 @@ pub mod detect;
 pub mod drafter;
 pub mod journal;
 pub mod notify;
+pub mod orders;
 pub mod service;
 
 use std::fs;

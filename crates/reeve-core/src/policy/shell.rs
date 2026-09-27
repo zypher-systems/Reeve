@@ -56,6 +56,31 @@ fn assess_at(ctx: &PathCtx, command: &str, depth: usize) -> Assessment {
     a
 }
 
+/// One simple command: its words joined by single spaces, and its
+/// redirects as (target, writes?).
+pub type SimpleCommand = (String, Vec<(String, bool)>);
+
+/// Each simple command of a line, as its words joined by single spaces,
+/// with its redirects. For standing orders, which check every part of a
+/// line against their scope. Command substitutions can't be checked, so a
+/// line with any is refused.
+pub fn simple_commands(command: &str) -> Result<Vec<SimpleCommand>, String> {
+    let parsed = tokenize(command).map_err(|e| format!("couldn't be parsed ({e})"))?;
+    if !parsed.substitutions.is_empty() {
+        return Err("it contains $(…) or backticks, which can't be checked".into());
+    }
+    Ok(parsed
+        .segments
+        .into_iter()
+        .map(|s| (s.words.join(" "), s.redirects))
+        .collect())
+}
+
+/// Whether a redirect target is harmless (`/dev/null` and friends).
+pub fn harmless_sink(t: &str) -> bool {
+    is_harmless_sink(t)
+}
+
 // ── tokenizing ──────────────────────────────────────────────────────────────
 
 /// One simple command.

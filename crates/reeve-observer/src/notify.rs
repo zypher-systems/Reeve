@@ -54,3 +54,23 @@ pub fn send(findings: &[&Finding]) {
 fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("")
 }
+
+/// A plain notification (standing orders reporting back).
+pub fn plain(summary: &str, body: &str, urgent: bool) {
+    let _ = std::process::Command::new("notify-send")
+        .args([
+            "--app-name=Reeve",
+            if urgent {
+                "--urgency=critical"
+            } else {
+                "--urgency=normal"
+            },
+            "--icon=dialog-information",
+            summary,
+            body,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}

@@ -47,6 +47,10 @@ pub struct ApprovalRequest {
     pub undoable: bool,
     /// "Allow for this session" may be offered (T1 only).
     pub can_allow_session: bool,
+    /// The exact command, for shell and system tools.
+    pub command: Option<String>,
+    /// Resolved paths it changes, for file tools.
+    pub paths: Vec<String>,
 }
 
 /// The owner's answer.
@@ -70,6 +74,11 @@ pub trait Approver: Send + Sync {
     /// Auto-approve T0–T2.
     fn yolo(&self) -> bool {
         false
+    }
+
+    /// What a yes from this approver is recorded as (`user`, `order:<id>`).
+    fn label(&self) -> String {
+        "user".into()
     }
 }
 
@@ -633,14 +642,16 @@ impl Agent {
             preview: plan.preview.clone(),
             undoable: plan.undoable,
             can_allow_session: tier == Tier::T1 && plan.rule.is_some(),
+            command: plan.command(),
+            paths: plan.paths(&self.tools),
         };
         match self.approver.decide(req).await {
-            Decision::Approve => Ok("user".into()),
+            Decision::Approve => Ok(self.approver.label()),
             Decision::AllowSession => {
                 if let (Tier::T1, Some(r)) = (tier, &plan.rule) {
                     self.allowed.insert(r.clone());
                 }
-                Ok("user".into())
+                Ok(self.approver.label())
             }
             Decision::Deny(note) => Err(note),
         }

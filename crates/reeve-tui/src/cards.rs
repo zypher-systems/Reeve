@@ -435,6 +435,8 @@ mod tests {
             preview: Some(diff("a\nb\n", "a\nc\n", 20)),
             undoable: true,
             can_allow_session: tier == Tier::T1,
+            command: None,
+            paths: vec!["/home/u/.bashrc".into()],
         }
     }
 

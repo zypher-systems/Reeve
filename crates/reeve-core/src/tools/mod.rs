@@ -89,6 +89,35 @@ pub struct Plan {
     call: Call,
 }
 
+impl Plan {
+    /// The command it runs, for shell and system tools.
+    pub fn command(&self) -> Option<String> {
+        match &self.call {
+            Call::Shell(_) => self
+                .args
+                .get("command")
+                .and_then(Value::as_str)
+                .map(|c| c.trim().to_string()),
+            Call::Sys(c) => Some(c.command.clone()),
+            _ => None,
+        }
+    }
+
+    /// The paths it changes, resolved, for file tools.
+    pub fn paths(&self, ctx: &ToolCtx) -> Vec<String> {
+        match &self.call {
+            Call::Write(_) | Call::Edit(_) | Call::Move(_) | Call::Delete(_) => {
+                ["path", "from", "to"]
+                    .iter()
+                    .filter_map(|k| self.args.get(*k).and_then(Value::as_str))
+                    .map(|p| ctx.paths.resolve(p).to_string_lossy().into_owned())
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
 /// What running a plan produced.
 #[derive(Debug, Clone)]
 pub struct Executed {

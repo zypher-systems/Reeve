@@ -128,6 +128,14 @@ impl PathCtx {
         {
             return PathClass::ReeveAudit;
         }
+        // Standing orders grant unattended powers, and Reeve's config sets
+        // YOLO and budgets: changing either needs the owner's typed yes.
+        if p.starts_with(self.reeve_home.join("orders")) {
+            return PathClass::FloorFile("a standing order (powers Reeve uses unattended)");
+        }
+        if p == self.reeve_home.join("config.toml") || p == self.reeve_home.join("settings.toml") {
+            return PathClass::FloorFile("Reeve's own configuration (budgets, approvals)");
+        }
         if let Some(what) = self.floor_file(p) {
             return PathClass::FloorFile(what);
         }
@@ -356,7 +364,15 @@ mod tests {
         let c = |s: &str| ctx.classify(&ctx.resolve(s));
         assert_eq!(c("~/.reeve/keys/openrouter"), PathClass::ReeveKeys);
         assert_eq!(c("~/.reeve/undo/objects/ab"), PathClass::ReeveAudit);
-        assert_eq!(c("~/.reeve/settings.toml"), PathClass::Home);
+        assert!(matches!(
+            c("~/.reeve/settings.toml"),
+            PathClass::FloorFile(_)
+        ));
+        assert!(matches!(
+            c("~/.reeve/orders/x.toml"),
+            PathClass::FloorFile(_)
+        ));
+        assert_eq!(c("~/.reeve/memory/facts/gpu.md"), PathClass::Home);
         assert_eq!(
             c("/boot/grub2/grub.cfg"),
             PathClass::FloorFile("the boot partition")
