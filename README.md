@@ -4,11 +4,12 @@ An **operator harness**: an agent that runs on your computer and manages it for 
 coding agent. It keeps the machine healthy, tidy, and configured. It gives receipts for everything
 it does, and it learns how your system behaves.
 
-> **Status: M1 (hands with a paper trail).** Reeve reads, searches, writes, edits, moves, and deletes
-> files anywhere on the machine, and runs shell commands. Every action is classified by risk, waits for
-> your yes where it should, and leaves a hash-chained receipt. Every file change can be undone. Root
-> (`sudo`) arrives in M2. See [`design.md`](design.md) for the plan and [`DECISIONS.md`](DECISIONS.md)
-> for the reasoning.
+> **Status: M2 (sysadmin).** Reeve reads, searches, and changes files anywhere on the machine,
+> including root-owned ones. It manages packages (dnf5 on Fedora, pacman on Arch), systemd units, the
+> journal, and processes, and it runs shell commands, `sudo` included: you approve the action, then type
+> your password into Reeve. Every action is classified by risk and gets a hash-chained receipt. File,
+> package, and service changes can be undone. Root changes get a snapper snapshot pair when snapper is
+> set up for `/`. Each session writes a report. See [`design.md`](design.md) and [`DECISIONS.md`](DECISIONS.md).
 
 ## Quick start
 
@@ -41,6 +42,24 @@ Other commands:
 | **T3** floor | formatting disks, partition tables, bootloader, `rm -rf` of top-level dirs, protected packages, secrets | you type `yes`, even in YOLO |
 
 Reeve's own keys can't be read, and its receipts and undo store can't be written, by any tool, in any mode.
+
+## Root
+
+When an approved action needs root, Reeve asks for your password in a masked panel. The password goes to
+sudo and nowhere else: not to the model, a log, or a receipt. You can let Reeve remember it in memory for
+5 minutes (`tab` in the panel). The prompt only works while an approved root action is running.
+
+- Root-owned files are changed in place by `sudo reeve root`, so owner, mode, and SELinux label are kept.
+  Undo copies go to `/var/lib/reeve/undo` (root-only). Edits to `/etc/sudoers*` and `/etc/fstab` must pass
+  `visudo -c` / `findmnt --verify` first.
+- Package changes record their dnf transaction, so undo runs `dnf history undo`. Service changes record
+  the unit's previous state.
+- With snapper configured for `/`, each root action is wrapped in a pre/post snapshot pair. The receipt holds
+  the numbers for `snapper undochange`. Reeve won't create a snapper config unless you ask.
+- `reeve undo N` from a terminal asks for sudo there.
+
+Each session keeps `~/.reeve/sessions/<id>/report.md`: what you asked, what was done, what can be undone,
+and what it cost.
 
 Configuration lives in `~/.reeve/config.toml` (see [`config.example.toml`](config.example.toml)). Reeve never
 rewrites that file. Choices made in the TUI go to `~/.reeve/settings.toml`, which is layered on top.

@@ -41,6 +41,9 @@ warn_usd = 1.00
 [approvals]
 yolo = false                            # ^y toggles per session; the safeguard floor always asks
 
+[snapshots]
+enabled = true                          # snapper pre/post around root actions, when snapper covers /
+
 [ui]
 theme = "brass"
 colors = "auto"                         # auto | truecolor | 256 | 16 ; NO_COLOR wins

@@ -32,10 +32,12 @@ use reeve_core::config::{self, Config};
 use reeve_core::ledger::{self, Totals};
 use reeve_core::llm::{HttpProvider, ModelInfo, Provider};
 use reeve_core::policy::Tier;
+use reeve_core::receipts::Receipt;
 use reeve_core::receipts::ReceiptBook;
 use reeve_core::settings::Settings;
 use reeve_core::spend::format_rates;
-use reeve_core::undo::UndoStore;
+use reeve_core::sudo::{Askpass, PasswordSource};
+use reeve_core::tools::{ToolCtx, undo_receipt};
 use reeve_observer::{HostInfo, Sampler, failed_units};
 
 use crate::draw::draw;
@@ -51,8 +53,13 @@ enum Work {
     /// Rebuild the agent from this config (new key, connection, or model).
     Connect(Box<Config>),
     NewSession,
-    /// Side requests carry the config they were asked under: a connection
-    /// added a moment ago must be known to them.
+    /// Undo a receipt (may need sudo, so it runs on the worker).
+    Undo {
+        seq: u64,
+        session: String,
+    },
+    /// Side requests (this and `Verify`) carry the config they were asked
+    /// under: a connection added a moment ago must be known to them.
     ListModels(String, Box<Config>),
     Verify(String, Box<Config>),
 }
@@ -80,6 +87,13 @@ enum UiMsg {
     SessionReset,
     /// The agent needs a yes or no.
     Approval(Box<ApprovalRequest>, tokio::sync::oneshot::Sender<Decision>),
+    /// sudo needs the password.
+    Password(String, tokio::sync::oneshot::Sender<Option<String>>),
+    /// An undo finished.
+    Undone {
+        seq: u64,
+        result: Result<Box<Receipt>, String>,
+    },
 }
 
 /// Asks the person through the TUI. With the TUI gone, the answer is no.
@@ -103,6 +117,18 @@ impl Approver for TuiApprover {
     }
 }
 
+#[async_trait::async_trait]
+impl PasswordSource for TuiApprover {
+    async fn password(&self, prompt: String) -> Option<String> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.tx.send(UiMsg::Password(prompt, reply)).ok()?;
+        answer.await.ok().flatten()
+    }
+}
+
+/// How long a remembered sudo password lives (sudo's own default).
+const PASSWORD_TTL: Duration = Duration::from_secs(300);
+
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// UI-side state that isn't drawn.
@@ -117,6 +143,14 @@ struct App {
     reply: Option<tokio::sync::oneshot::Sender<Decision>>,
     /// Session id for receipts the TUI writes itself (undo).
     session: String,
+    /// Where to send the password on screen.
+    pw_reply: Option<tokio::sync::oneshot::Sender<Option<String>>>,
+    /// A remembered sudo password, and when it was typed. Memory only.
+    pw_cache: Option<(String, Instant)>,
+    /// When the cache last answered (a quick second ask means it was wrong).
+    pw_used: Option<Instant>,
+    /// The approved action a password request belongs to.
+    last_action: String,
 }
 
 /// Run the TUI until the user quits.
@@ -139,10 +173,12 @@ pub fn run(cfg: Config, home: PathBuf) -> io::Result<()> {
     let (work_tx, work_rx) = unbounded_channel::<Work>();
     let cancel = Arc::new(Notify::new());
     let yolo = Arc::new(AtomicBool::new(view.yolo));
-    let approver: Arc<dyn Approver> = Arc::new(TuiApprover {
+    let tui = Arc::new(TuiApprover {
         tx: ui_tx.clone(),
         yolo: yolo.clone(),
     });
+    let approver: Arc<dyn Approver> = tui.clone();
+    let passwords: Arc<dyn PasswordSource> = tui;
     view.receipts = ReceiptBook::new(&home).recent(RAIL_RECEIPTS);
     spawn_worker(
         home.clone(),
@@ -151,6 +187,7 @@ pub fn run(cfg: Config, home: PathBuf) -> io::Result<()> {
         work_rx,
         cancel.clone(),
         approver,
+        passwords,
     );
     spawn_unit_watch(ui_tx);
 
@@ -163,6 +200,10 @@ pub fn run(cfg: Config, home: PathBuf) -> io::Result<()> {
         yolo,
         reply: None,
         session: format!("tui-{}", std::process::id()),
+        pw_reply: None,
+        pw_cache: None,
+        pw_used: None,
+        last_action: String::new(),
     };
     app.connect_quietly(&mut view);
 
@@ -272,7 +313,10 @@ impl App {
                     self.reply = None;
                 }
             }
+            UiMsg::Password(prompt, reply) => self.password_asked(view, prompt, reply),
+            UiMsg::Undone { seq, result } => self.undone(view, seq, result),
             UiMsg::Approval(req, reply) => {
+                self.last_action.clone_from(&req.summary);
                 // Menus give way to a question that needs an answer.
                 view.overlays.clear();
                 view.approval = Some(Pending {
@@ -348,6 +392,9 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && k.code == KeyCode::Char('c') && !view.overlays.is_empty() {
             view.overlays.clear();
+            if let Some(r) = self.pw_reply.take() {
+                let _ = r.send(None);
+            }
             return;
         }
         if let Some(top) = view.overlays.last_mut() {
@@ -506,7 +553,27 @@ impl App {
         match action {
             Action::None => {}
             Action::Close => {
-                view.overlays.pop();
+                if let Some(Overlay::Password(_)) = view.overlays.pop() {
+                    if let Some(r) = self.pw_reply.take() {
+                        let _ = r.send(None);
+                    }
+                }
+            }
+            Action::Password(answer) => {
+                view.overlays.retain(|o| !matches!(o, Overlay::Password(_)));
+                let pw = answer.map(|(pw, remember)| {
+                    self.pw_cache = remember.then(|| (pw.clone(), Instant::now()));
+                    pw
+                });
+                if pw.is_none() {
+                    view.push(
+                        Speaker::System,
+                        "No password given; the root step will fail.",
+                    );
+                }
+                if let Some(r) = self.pw_reply.take() {
+                    let _ = r.send(pw);
+                }
             }
             Action::Push(o) => view.overlays.push(o),
             Action::SaveKey {
@@ -560,29 +627,13 @@ impl App {
             }
             Action::Use(connection) => self.use_connection(view, &connection),
             Action::Undo(seq) => {
-                let book = ReceiptBook::new(&self.home);
-                let result = book.undo(&UndoStore::new(&self.home), seq, &self.session);
-                let note = match result {
-                    Ok(r) => {
-                        let msg =
-                            format!("undid #{seq}: {} (receipt #{})", r.outcome.summary, r.seq);
-                        view.add_receipt(r);
-                        view.push(Speaker::System, format!("Undid #{seq} from /receipts."));
-                        Ok(msg)
-                    }
-                    Err(e) => {
-                        view.receipts = book.recent(RAIL_RECEIPTS);
-                        Err(e.to_string())
-                    }
-                };
                 if let Some(Overlay::Receipts(p)) = view.overlays.last_mut() {
-                    p.items = book.recent(500);
-                    p.undone = p.items.iter().filter_map(|r| r.undoes).collect();
-                    // Stay on the receipt acted on, not the new one at the top:
-                    // a second `u` must not quietly undo the undo.
-                    p.sel = p.items.iter().position(|r| r.seq == seq).unwrap_or(0);
-                    p.note = Some(note);
+                    p.note = Some(Ok(format!("undoing #{seq}…")));
                 }
+                let _ = self.work.send(Work::Undo {
+                    seq,
+                    session: self.session.clone(),
+                });
             }
             Action::VerifyReceipts => {
                 let v = ReceiptBook::new(&self.home).verify();
@@ -757,6 +808,73 @@ impl App {
 }
 
 impl App {
+    /// sudo wants a password: answer from memory, or ask.
+    fn password_asked(
+        &mut self,
+        view: &mut View,
+        prompt: String,
+        reply: tokio::sync::oneshot::Sender<Option<String>>,
+    ) {
+        let fresh = self
+            .pw_cache
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() < PASSWORD_TTL);
+        // Asked again right after the cache answered: it was wrong.
+        let just_used = self
+            .pw_used
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(15));
+        if fresh && !just_used {
+            if let Some((pw, _)) = &self.pw_cache {
+                self.pw_used = Some(Instant::now());
+                let _ = reply.send(Some(pw.clone()));
+                return;
+            }
+        }
+        if just_used {
+            self.pw_cache = None;
+        }
+        self.pw_used = None;
+        self.pw_reply = Some(reply);
+        view.overlays
+            .push(Overlay::Password(crate::overlay::PasswordEntry {
+                prompt,
+                action: self.last_action.clone(),
+                secret: String::new(),
+                remember: true,
+            }));
+    }
+
+    /// An undo came back from the worker.
+    fn undone(&mut self, view: &mut View, seq: u64, result: Result<Box<Receipt>, String>) {
+        let book = ReceiptBook::new(&self.home);
+        let note = match result {
+            Ok(r) => {
+                let msg = format!("undid #{seq}: {} (receipt #{})", r.outcome.summary, r.seq);
+                view.add_receipt(*r);
+                view.push(Speaker::System, format!("Undid #{seq}."));
+                Ok(msg)
+            }
+            Err(e) => {
+                view.receipts = book.recent(RAIL_RECEIPTS);
+                Err(e)
+            }
+        };
+        if let Some(Overlay::Receipts(p)) = view
+            .overlays
+            .iter_mut()
+            .rev()
+            .find(|o| matches!(o, Overlay::Receipts(_)))
+        {
+            p.items = book.recent(500);
+            p.undone = p.items.iter().filter_map(|r| r.undoes).collect();
+            // Stay on the receipt acted on: a second `u` must not undo the undo.
+            p.sel = p.items.iter().position(|r| r.seq == seq).unwrap_or(0);
+            p.note = Some(note);
+        } else if let Err(e) = note {
+            view.push(Speaker::Error, format!("couldn't undo #{seq}: {e}"));
+        }
+    }
+
     fn toggle_yolo(&mut self, view: &mut View) {
         toggle_yolo(view);
         self.yolo.store(view.yolo, Ordering::Relaxed);
@@ -848,6 +966,7 @@ fn spawn_worker(
     mut work: UnboundedReceiver<Work>,
     cancel: Arc<Notify>,
     approver: Arc<dyn Approver>,
+    passwords: Arc<dyn PasswordSource>,
 ) {
     thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -861,6 +980,19 @@ fn spawn_worker(
             return;
         };
         rt.block_on(async move {
+            let askpass = match Askpass::start(&home, passwords) {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    let _ = tx.send(UiMsg::Notice(
+                        Speaker::Error,
+                        format!("root actions won't work this session: {e}"),
+                    ));
+                    None
+                }
+            };
+            let cfg = config::load_at(&home).unwrap_or_default();
+            let mut tools = ToolCtx::new(home.clone(), reeve_core::agent::secret_env(&cfg));
+            tools.askpass = askpass.clone();
             let (agent_tx, agent_rx) = unbounded_channel::<AgentWork>();
             let agent_task = tokio::spawn(agent_loop(
                 home.clone(),
@@ -869,6 +1001,7 @@ fn spawn_worker(
                 agent_rx,
                 cancel,
                 approver,
+                askpass,
             ));
             while let Some(w) = work.recv().await {
                 match w {
@@ -877,6 +1010,17 @@ fn spawn_worker(
                     }
                     Work::NewSession => {
                         let _ = agent_tx.send(AgentWork::NewSession);
+                    }
+                    Work::Undo { seq, session } => {
+                        let (tx, tools, home) = (tx.clone(), tools.clone(), home.clone());
+                        tokio::spawn(async move {
+                            let book = ReceiptBook::new(&home);
+                            let result = undo_receipt(&tools, &book, seq, &session)
+                                .await
+                                .map(Box::new)
+                                .map_err(|e| e.to_string());
+                            let _ = tx.send(UiMsg::Undone { seq, result });
+                        });
                     }
                     Work::Connect(c) => {
                         let _ = agent_tx.send(AgentWork::Connect(c));
@@ -931,6 +1075,7 @@ async fn agent_loop(
     mut work: UnboundedReceiver<AgentWork>,
     cancel: Arc<Notify>,
     approver: Arc<dyn Approver>,
+    askpass: Option<Askpass>,
 ) {
     let mut agent: Option<Agent> = None;
     let emit_tx = tx.clone();
@@ -965,6 +1110,7 @@ async fn agent_loop(
                 connect(&mut agent, *cfg, &home, &profile, &tx).await;
                 if let Some(a) = agent.as_mut() {
                     a.set_approver(approver.clone());
+                    a.tools_mut().askpass = askpass.clone();
                 }
             }
         }

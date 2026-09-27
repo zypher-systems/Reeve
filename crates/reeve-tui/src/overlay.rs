@@ -92,6 +92,8 @@ pub enum Action {
     },
     /// Undo the action on this receipt.
     Undo(u64),
+    /// Answer sudo's password request (`None` refuses).
+    Password(Option<(String, bool)>),
     /// Check the whole receipt chain.
     VerifyReceipts,
     /// Save a new connection.
@@ -116,6 +118,8 @@ pub enum Overlay {
     Add(AddForm),
     /// `/receipts`.
     Receipts(ReceiptsPanel),
+    /// sudo's password.
+    Password(PasswordEntry),
     /// `/help`.
     Help,
 }
@@ -132,6 +136,7 @@ impl Overlay {
             Self::Models(m) => m.on_key(k),
             Self::Add(a) => a.on_key(k),
             Self::Receipts(r) => r.on_key(k),
+            Self::Password(p) => p.on_key(k),
             Self::Help => Action::Close,
         }
     }
@@ -141,6 +146,7 @@ impl Overlay {
         let line = s.trim();
         match self {
             Self::Key(e) => e.secret.push_str(line),
+            Self::Password(p) => p.secret.push_str(line),
             Self::Models(m) => {
                 m.query.push_str(line);
                 m.sel = 0;
@@ -292,6 +298,61 @@ impl ReceiptsPanel {
             _ => {}
         }
         Action::None
+    }
+}
+
+// ── sudo password ───────────────────────────────────────────────────────────
+
+/// sudo's password, masked. Never drawn, logged, or sent to the model.
+#[derive(Clone, PartialEq)]
+pub struct PasswordEntry {
+    /// What sudo said (`[sudo] password for …:`).
+    pub prompt: String,
+    /// The root action it's for.
+    pub action: String,
+    /// Typed so far.
+    pub secret: String,
+    /// Keep it in memory for a few minutes.
+    pub remember: bool,
+}
+
+impl std::fmt::Debug for PasswordEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordEntry")
+            .field("prompt", &self.prompt)
+            .field(
+                "secret",
+                &format_args!("<{} chars>", self.secret.chars().count()),
+            )
+            .finish()
+    }
+}
+
+impl PasswordEntry {
+    fn on_key(&mut self, k: KeyEvent) -> Action {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Enter => {
+                Action::Password(Some((std::mem::take(&mut self.secret), self.remember)))
+            }
+            KeyCode::Tab => {
+                self.remember = !self.remember;
+                Action::None
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.secret.clear();
+                Action::None
+            }
+            KeyCode::Backspace => {
+                self.secret.pop();
+                Action::None
+            }
+            KeyCode::Char(c) if !ctrl => {
+                self.secret.push(c);
+                Action::None
+            }
+            _ => Action::None,
+        }
     }
 }
 

@@ -31,6 +31,7 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
             area.width.saturating_sub(6).min(130),
             area.height.saturating_sub(4),
         ),
+        Overlay::Password(_) => (80, 13),
         Overlay::Help => (72, 24),
     };
     let r = centered(area, w, h);
@@ -41,6 +42,7 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::Models(_) => "model",
         Overlay::Add(_) => "add a connection",
         Overlay::Receipts(_) => "receipts",
+        Overlay::Password(_) => "sudo",
         Overlay::Help => "help",
     };
     let block = panel(title, t, true);
@@ -58,6 +60,7 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::Models(m) => models(f, inner, m, t),
         Overlay::Add(a) => add_form(f, inner, a, t),
         Overlay::Receipts(r) => receipts(f, inner, r, t),
+        Overlay::Password(p) => password(f, inner, p, t),
         Overlay::Help => help(f, inner, t),
     }
 }
@@ -602,6 +605,17 @@ fn receipts(f: &mut Frame, r: Rect, p: &ReceiptsPanel, t: &Theme) {
             (None, _) => "none (nothing to reverse, or Reeve can't)".to_string(),
         };
         lines.push(field("undo", undo, t.muted()));
+        if let Some(sp) = &rc.snapshot {
+            let post = sp.post.map_or("?".to_string(), |n| n.to_string());
+            lines.push(field(
+                "snapshot",
+                format!(
+                    "snapper {} #{}..#{post}  (sudo snapper -c {} undochange {}..{post})",
+                    sp.config, sp.pre, sp.config, sp.pre
+                ),
+                Style::default().fg(t.teal),
+            ));
+        }
         lines.push(field(
             "hash",
             format!(
@@ -632,6 +646,57 @@ fn receipts(f: &mut Frame, r: Rect, p: &ReceiptsPanel, t: &Theme) {
         t,
     ));
     f.render_widget(Paragraph::new(lines), r);
+}
+
+fn password(f: &mut Frame, r: Rect, p: &crate::overlay::PasswordEntry, t: &Theme) {
+    let n = p.secret.chars().count();
+    let dots: String = "•".repeat(n.min(r.width.saturating_sub(12) as usize));
+    let check = if p.remember { "☑" } else { "☐" };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("◆ ", Style::default().fg(t.bad)),
+            Span::styled("Root access for an approved action", t.accent()),
+        ]),
+        Line::from(Span::styled(
+            format!(
+                "  {}",
+                truncate(&p.action, r.width.saturating_sub(4) as usize)
+            ),
+            Style::default().fg(t.code),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            truncate(p.prompt.trim(), r.width as usize),
+            t.muted(),
+        )),
+        Line::from(vec![
+            Span::styled(" ❯ ", Style::default().fg(t.brass).bg(t.input)),
+            Span::styled(
+                pad(&dots, r.width.saturating_sub(3) as usize),
+                Style::default().fg(t.amber).bg(t.input),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(format!("{check} "), Style::default().fg(t.teal)),
+            Span::styled(
+                "remember for 5 minutes (in memory only, gone when Reeve quits)",
+                t.muted(),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "It goes to sudo only: never to the model, a log, or a receipt.",
+            t.ghost(),
+        )),
+        Line::raw(""),
+        hints(&[("⏎", "send"), ("tab", "remember"), ("esc", "refuse")], t),
+    ];
+    f.render_widget(Paragraph::new(lines), r);
+    let col = 3 + dots.width() as u16;
+    f.set_cursor_position(Position::new(
+        r.x + col.min(r.width.saturating_sub(1)),
+        r.y + 4,
+    ));
 }
 
 fn help(f: &mut Frame, r: Rect, t: &Theme) {

@@ -2,6 +2,64 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-27: The sudo password is typed into Reeve, and only answers while armed
+- **Decision:**
+  - Root commands run with `~/.reeve/bin` first on `PATH`. A `sudo` wrapper there adds `-A`, and `SUDO_ASKPASS` points at `reeve-askpass` (a link to this binary).
+  - The helper asks the running TUI over `$XDG_RUNTIME_DIR/reeve/askpass-*.sock` (0600, in a 0700 dir). It must present a per-session token.
+  - The socket answers only while an approved root action is running (`Askpass::arm`). Otherwise it says no at once.
+  - The password panel remembers the password for 5 minutes in memory by default (`tab` turns that off). A second request within 15 s of a remembered answer means it was wrong: the cache is dropped and the panel shown.
+- **Chosen vs rejected:**
+  - Rejected running Reeve as root, and a root daemon (see the earlier entry).
+  - Rejected sudo's own timestamp cache: with no terminal, the record is keyed on the parent process, so every command would ask again.
+  - Rejected a remembered password that never expires, or one written to disk.
+  - Rejected answering any request on the socket: a stray same-user process could then trigger password prompts whenever it liked.
+- **Why:** The user wants root, one approved action at a time, with the password never reaching the model.
+- **Where:** `reeve-core/src/sudo.rs`, `tools/shell.rs` (`run_command`), `reeve-tui/src/run.rs` (`password_asked`), `reeve-cli/src/main.rs` (argv[0] check)
+- **Residual risk:**
+  - Anything running as the user can read the token from a root command's environment while it runs, and ask for a password during that window. It still gets a prompt the person sees.
+  - A remembered password lives in process memory for up to 5 minutes.
+  - A cancelled prompt may count as a failed login for `pam_faillock`, where that's enabled.
+
+### 2026-09-27: Root files through `sudo reeve root`, changed in place
+- **Decision:**
+  - Files you can't write go through `sudo <reeve> root`: one JSON operation on stdin (write, edit, delete, revert), one reply on stdout.
+  - Running as root, it snapshots into `/var/lib/reeve/undo` and writes in place, so the inode keeps its owner, mode, and SELinux label. New files get `restorecon`.
+  - `/etc/sudoers*` and `/etc/fstab` must pass `visudo -cf` / `findmnt --verify` first.
+- **Chosen vs rejected:**
+  - Rejected `sudo tee` plus separate `sudo cat` for undo copies: several password prompts per edit, and the copies would sit in the user's home.
+  - Rejected temp file plus rename: it changes owner and label unless every attribute is copied back by hand.
+- **Why:** Most sysadmin fixes are edits to root-owned config, and they need the same undo promise as anything else.
+- **Where:** `reeve-core/src/root.rs`, `tools/fs.rs` (`needs_root`, `root_exec`, `root_revert`)
+- **Residual risk:**
+  - sudo runs this binary as root. If the binary sits in a user-writable directory (a cargo `target/`), whoever can replace it gets root at the next approved edit. That is no more than the user's own sudo rights, but install Reeve somewhere root-owned for daily use.
+  - An in-place write isn't atomic: a crash mid-write can leave a partial file. The undo copy is taken first.
+
+### 2026-09-27: System tools are commands the shell policy already understands
+- **Decision:**
+  - `pkg_*`, `svc_*`, `logs_query`, `proc_*`, and `sys_info` build commands with validated names and quoted values. Changes are classified by `policy::shell` as if typed, so `pkg_remove systemd` meets the same floor as `dnf remove systemd`.
+  - The read-only ones are T0 by construction.
+  - Package changes record the dnf transaction id (undo is `dnf history undo`). `svc_control` records the unit's enable and active state first.
+- **Chosen vs rejected:**
+  - Rejected a separate tier table for structured tools: two policies drift apart.
+  - Rejected parsing dnf's output to find the transaction: comparing `history list` before and after is simpler and survives format changes.
+- **Why:** Structured tools give better approval cards and real undo, and the classifier stays the one source of truth.
+- **Where:** `reeve-core/src/tools/sys.rs`, `distro.rs`
+- **Residual risk:**
+  - A package transaction that runs at the same time (a GNOME Software update) can be recorded as Reeve's.
+  - Arch has no transaction undo; pacman changes carry no undo.
+
+### 2026-09-27: Snapshots only where snapper is already set up
+- **Decision:**
+  - When snapper has a config for `/`, every approved root action is wrapped in `snapper create --type pre/post`, described "reeve: <action>", with the number cleanup algorithm.
+  - The pair goes in the receipt and the session report, with the `undochange` command.
+  - Without a config, nothing is taken, and Reeve never creates one unasked.
+- **Chosen vs rejected:**
+  - Rejected setting snapper up automatically: it decides what gets snapshotted and kept on the user's disk.
+  - Rejected one pair per turn: a pair per action points at exactly what changed.
+- **Why:** Some root changes can't be undone by Reeve itself (a shell command, a post-install script). A snapshot can undo them.
+- **Where:** `reeve-core/src/snapshots.rs`, `agent.rs` (`run_call`)
+- **Residual risk:** On this machine snapper is installed but has no config, so today nothing is snapshotted until the owner sets one up.
+
 ### 2026-09-27: Commands run in their own session, with no terminal
 - **Decision:**
   - `shell` runs `setsid bash --noprofile --norc -c …` with stdin closed.

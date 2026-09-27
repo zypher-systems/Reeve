@@ -158,7 +158,7 @@ pub struct Agent {
 }
 
 /// Environment variables that hold API keys, to keep out of commands.
-fn secret_env(cfg: &Config) -> Vec<String> {
+pub fn secret_env(cfg: &Config) -> Vec<String> {
     let mut v: Vec<String> = cfg
         .connections
         .values()
@@ -278,10 +278,30 @@ impl Agent {
     /// Run one user turn, reporting through `emit`.
     pub async fn turn(&mut self, user: String, emit: &(dyn Fn(AgentEvent) + Send + Sync)) {
         emit(AgentEvent::TurnStarted);
-        match self.turn_inner(user, emit).await {
+        let result = self.turn_inner(user, emit).await;
+        // Kept current after every turn, so it survives a crash.
+        let _ = self.write_report();
+        match result {
             Ok(truncated) => emit(AgentEvent::TurnDone { truncated }),
             Err(e) => emit(AgentEvent::Error(e.to_string())),
         }
+    }
+
+    /// Rewrite this session's `report.md`.
+    pub fn write_report(&self) -> Result<PathBuf> {
+        let mine: Vec<Receipt> = self
+            .receipts
+            .all()
+            .into_iter()
+            .filter(|r| r.session == self.session.meta.id)
+            .collect();
+        crate::report::write(
+            &self.session.dir,
+            &self.session.meta,
+            &self.transcript,
+            &mine,
+            &self.tally,
+        )
     }
 
     async fn turn_inner(
@@ -438,7 +458,25 @@ impl Agent {
                 }
                 Ok(by) => {
                     draft.approved_by = by;
+                    // Root changes get a snapper pair when snapper covers `/`.
+                    let snap =
+                        if plan.assessment.sudo && a.tier >= Tier::T2 && self.cfg.snapshots.enabled
+                        {
+                            match crate::snapshots::root_config(&self.tools).await {
+                                Some(c) => crate::snapshots::pre(&self.tools, &c, &plan.summary)
+                                    .await
+                                    .map(|n| (c, n)),
+                                None => None,
+                            }
+                        } else {
+                            None
+                        };
                     let ex = tools::execute(&self.tools, &plan).await;
+                    if let Some((config, pre)) = snap {
+                        let post =
+                            crate::snapshots::post(&self.tools, &config, pre, &plan.summary).await;
+                        draft.snapshot = Some(crate::snapshots::SnapPair { config, pre, post });
+                    }
                     draft.outcome = ex.outcome;
                     draft.undo = ex.undo;
                     (ex.output, ex.diff)
@@ -607,9 +645,14 @@ investigate with T0 actions first and batch what you ask for. Give every call a 
 `reason`: the owner reads it on the approval card and in the receipt.\n\
 If the owner declines, don't retry the same thing; ask or propose another way. If \
 Reeve's policy refuses something, don't work around it.\n\
+Prefer the structured tools: sys_info for an overview; pkg_* for packages (their \
+transactions can be rolled back); svc_* for systemd units (their previous state is \
+recorded); logs_query for the journal; proc_* for processes. Use shell for the rest.\n\
 Commands run without a terminal: nothing can prompt (pass -y and similar), pagers are \
-off. sudo is not available yet: when a fix needs root, give the owner the exact command \
-to run themselves.\n\
+off. Root works: sudo in a command, root-owned files in fs_write/fs_edit, and the pkg_/ \
+svc_ tools all ask the owner for approval and then their password inside Reeve. Root \
+actions also get a snapper snapshot pair when snapper is set up for /. If a password \
+isn't given, don't retry; say what you needed.\n\
 Each result ends with its receipt number; mention it when you change something, so the \
 owner can undo it.\n\n\
 Machine:\n{machine_profile}"

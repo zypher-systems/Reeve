@@ -3,6 +3,7 @@
 
 mod fs;
 mod shell;
+mod sys;
 
 use std::path::PathBuf;
 
@@ -24,6 +25,16 @@ pub struct ToolCtx {
     pub undo: UndoStore,
     /// Environment variables to strip from commands (API keys).
     pub secret_env: Vec<String>,
+    /// Root through the TUI's password prompt. `None`: sudo fails fast.
+    pub askpass: Option<crate::sudo::Askpass>,
+    /// Run sudo on the terminal instead (the CLI).
+    pub interactive_sudo: bool,
+    /// This binary, for `sudo reeve root …`.
+    pub exe: PathBuf,
+    /// Which distribution.
+    pub distro: crate::distro::Distro,
+    /// Snapper config for `/`, once looked up.
+    pub snapper: std::sync::Arc<tokio::sync::OnceCell<Option<String>>>,
 }
 
 impl ToolCtx {
@@ -33,6 +44,11 @@ impl ToolCtx {
             undo: UndoStore::new(&reeve_home),
             paths: PathCtx::current(reeve_home),
             secret_env,
+            askpass: None,
+            interactive_sudo: false,
+            exe: std::env::current_exe().unwrap_or_else(|_| "reeve".into()),
+            distro: crate::distro::Distro::detect(),
+            snapper: Default::default(),
         }
     }
 }
@@ -83,6 +99,7 @@ enum Call {
     Move(fs::MoveArgs),
     Delete(fs::DeleteArgs),
     Shell(shell::ShellArgs),
+    Sys(sys::SysCall),
 }
 
 #[derive(Deserialize)]
@@ -102,17 +119,21 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
         .ok()
         .and_then(|w| w.reason);
     let parse = |e: serde_json::Error| format!("bad arguments for {tool}: {e}");
-    let call = match tool {
-        "fs_read" => Call::Read(serde_json::from_value(args.clone()).map_err(parse)?),
-        "fs_list" => Call::List(serde_json::from_value(args.clone()).map_err(parse)?),
-        "fs_search" => Call::Search(serde_json::from_value(args.clone()).map_err(parse)?),
-        "fs_stat" => Call::Stat(serde_json::from_value(args.clone()).map_err(parse)?),
-        "fs_write" => Call::Write(serde_json::from_value(args.clone()).map_err(parse)?),
-        "fs_edit" => Call::Edit(serde_json::from_value(args.clone()).map_err(parse)?),
-        "fs_move" => Call::Move(serde_json::from_value(args.clone()).map_err(parse)?),
-        "fs_delete" => Call::Delete(serde_json::from_value(args.clone()).map_err(parse)?),
-        "shell" => Call::Shell(serde_json::from_value(args.clone()).map_err(parse)?),
-        other => return Err(format!("there is no tool named {other}")),
+    let call = if let Some(c) = sys::parse(ctx, tool, &args)? {
+        Call::Sys(c)
+    } else {
+        match tool {
+            "fs_read" => Call::Read(serde_json::from_value(args.clone()).map_err(parse)?),
+            "fs_list" => Call::List(serde_json::from_value(args.clone()).map_err(parse)?),
+            "fs_search" => Call::Search(serde_json::from_value(args.clone()).map_err(parse)?),
+            "fs_stat" => Call::Stat(serde_json::from_value(args.clone()).map_err(parse)?),
+            "fs_write" => Call::Write(serde_json::from_value(args.clone()).map_err(parse)?),
+            "fs_edit" => Call::Edit(serde_json::from_value(args.clone()).map_err(parse)?),
+            "fs_move" => Call::Move(serde_json::from_value(args.clone()).map_err(parse)?),
+            "fs_delete" => Call::Delete(serde_json::from_value(args.clone()).map_err(parse)?),
+            "shell" => Call::Shell(serde_json::from_value(args.clone()).map_err(parse)?),
+            other => return Err(format!("there is no tool named {other}")),
+        }
     };
     let (assessment, summary, preview, undoable, rule) = match &call {
         Call::Read(a) => fs::plan_read(ctx, a),
@@ -124,6 +145,7 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
         Call::Move(a) => fs::plan_move(ctx, a),
         Call::Delete(a) => fs::plan_delete(ctx, a),
         Call::Shell(a) => shell::plan(ctx, a),
+        Call::Sys(c) => sys::plan(ctx, c),
     };
     Ok(Plan {
         tool: tool.to_string(),
@@ -145,12 +167,48 @@ pub async fn execute(ctx: &ToolCtx, plan: &Plan) -> Executed {
         Call::List(a) => fs::list(ctx, a),
         Call::Search(a) => fs::search(ctx, a).await,
         Call::Stat(a) => fs::stat(ctx, a),
-        Call::Write(a) => fs::write(ctx, a),
-        Call::Edit(a) => fs::edit(ctx, a),
+        Call::Write(a) => fs::write(ctx, a).await,
+        Call::Edit(a) => fs::edit(ctx, a).await,
         Call::Move(a) => fs::mv(ctx, a),
-        Call::Delete(a) => fs::delete(ctx, a),
-        Call::Shell(a) => shell::run(ctx, a).await,
+        Call::Delete(a) => fs::delete(ctx, a).await,
+        Call::Shell(a) => shell::run(ctx, a, plan.assessment.sudo).await,
+        Call::Sys(c) => sys::run(ctx, c, plan.assessment.sudo).await,
     }
+}
+
+/// Run a short command and return its stdout, or `None` if it failed.
+pub(crate) async fn shell_exec(ctx: &ToolCtx, command: &str, sudo: bool) -> Option<String> {
+    let out = shell::run_command(
+        ctx,
+        shell::RunSpec {
+            command,
+            cwd: &ctx.paths.home,
+            timeout: std::time::Duration::from_secs(60),
+            sudo,
+            stdin: None,
+        },
+    )
+    .await;
+    (out.code == Some(0)).then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Undo receipt `seq` (files, root files, packages, or a unit) and write a
+/// receipt for the undo. May need sudo; with the TUI, the password prompt
+/// appears there.
+pub async fn undo_receipt(
+    ctx: &ToolCtx,
+    book: &crate::receipts::ReceiptBook,
+    seq: u64,
+    session: &str,
+) -> crate::Result<crate::receipts::Receipt> {
+    let (target, undo) = book.undo_target(seq)?;
+    let root_files = matches!(&undo, Undo::Files { changes } if changes.iter().any(|c| c.root));
+    let result = match &undo {
+        Undo::Packages { .. } | Undo::Unit { .. } => sys::revert(ctx, &undo).await,
+        _ if root_files => fs::root_revert(ctx, &undo).await,
+        _ => ctx.undo.revert(&undo).map_err(|e| e.to_string()),
+    };
+    book.record_undo(&target, session, result)
 }
 
 /// Arguments as they go into a receipt: file contents become size and hash.
@@ -242,8 +300,92 @@ pub fn specs() -> Vec<ToolSpec> {
             &["path"],
         ),
         spec(
+            "sys_info",
+            "A summary of the machine: OS, kernel (and newer installed kernels), memory and swap, disks, failed units, SELinux, snapper.",
+            json!({}),
+            &[],
+        ),
+        spec(
+            "pkg_search",
+            "Search available packages by name and summary.",
+            json!({"query": {"type": "string"}}),
+            &["query"],
+        ),
+        spec(
+            "pkg_info",
+            "Details of one package, installed or available.",
+            json!({"name": {"type": "string"}}),
+            &["name"],
+        ),
+        spec(
+            "pkg_list",
+            "List packages: installed (name, version, size), user (explicitly installed), leaves (nothing depends on them), or updates (pending).",
+            json!({"which": {"type": "string", "enum": ["installed", "user", "leaves", "updates"]}, "filter": {"type": "string", "description": "Case-insensitive substring"}}),
+            &[],
+        ),
+        spec(
+            "pkg_install",
+            "Install packages (needs root). The transaction is recorded so it can be rolled back.",
+            json!({"packages": {"type": "array", "items": {"type": "string"}}}),
+            &["packages"],
+        ),
+        spec(
+            "pkg_remove",
+            "Remove packages (needs root). The transaction is recorded so it can be rolled back.",
+            json!({"packages": {"type": "array", "items": {"type": "string"}}}),
+            &["packages"],
+        ),
+        spec(
+            "pkg_upgrade",
+            "Upgrade the named packages, or everything when the list is empty (needs root). Recorded for rollback.",
+            json!({"packages": {"type": "array", "items": {"type": "string"}}}),
+            &[],
+        ),
+        spec(
+            "pkg_history",
+            "Recent package transactions.",
+            json!({"limit": {"type": "integer"}}),
+            &[],
+        ),
+        spec(
+            "svc_status",
+            "Status of a systemd unit, with its recent log lines.",
+            json!({"unit": {"type": "string"}, "user": {"type": "boolean", "description": "A user unit (systemctl --user)"}}),
+            &["unit"],
+        ),
+        spec(
+            "svc_list",
+            "List units: failed (default), running, enabled, timers, or all.",
+            json!({"state": {"type": "string", "enum": ["failed", "running", "enabled", "timers", "all"]}, "user": {"type": "boolean"}}),
+            &[],
+        ),
+        spec(
+            "svc_control",
+            "Start, stop, restart, reload, enable, disable, mask, or unmask a unit. System units need root. The unit's previous state is recorded so it can be put back.",
+            json!({"unit": {"type": "string"}, "action": {"type": "string", "enum": ["start", "stop", "restart", "reload", "enable", "disable", "mask", "unmask", "enable --now", "disable --now"]}, "user": {"type": "boolean"}}),
+            &["unit", "action"],
+        ),
+        spec(
+            "logs_query",
+            "Read the systemd journal. Filter by unit, priority (emerg…debug, or a range like err..warning), time (since/until: 'today', '-1h', '2026-09-26 10:00'), boot (0 current, -1 previous), kernel messages, or a grep pattern.",
+            json!({"unit": {"type": "string"}, "user": {"type": "boolean"}, "priority": {"type": "string"}, "since": {"type": "string"}, "until": {"type": "string"}, "boot": {"type": "integer"}, "kernel": {"type": "boolean"}, "grep": {"type": "string"}, "limit": {"type": "integer", "description": "Newest lines (default 200, max 2000)"}}),
+            &[],
+        ),
+        spec(
+            "proc_list",
+            "Top processes by CPU or memory.",
+            json!({"sort": {"type": "string", "enum": ["cpu", "mem"]}, "filter": {"type": "string"}, "limit": {"type": "integer"}}),
+            &[],
+        ),
+        spec(
+            "proc_signal",
+            "Send a signal to a process (TERM by default). Other users' processes need root.",
+            json!({"pid": {"type": "integer"}, "signal": {"type": "string", "enum": ["TERM", "KILL", "HUP", "INT", "STOP", "CONT", "USR1", "USR2"]}}),
+            &["pid"],
+        ),
+        spec(
             "shell",
-            "Run a bash command. Non-interactive: no terminal, no prompts (use -y flags), pagers off. Output is capped. Root commands (sudo) are not available yet and will fail.",
+            "Run a bash command. There is no terminal: nothing can prompt (pass -y and similar), pagers are off, output is capped. sudo works: the owner approves the action and types their password into Reeve. Prefer the pkg_, svc_, logs_, and proc_ tools when they fit.",
             json!({"command": {"type": "string"}, "cwd": {"type": "string", "description": "Working directory (default: home)"}, "timeout_secs": {"type": "integer", "description": "Default 120, max 600"}}),
             &["command"],
         ),

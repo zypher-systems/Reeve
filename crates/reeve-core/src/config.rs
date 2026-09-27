@@ -30,6 +30,8 @@ pub struct Config {
     pub spend: SpendConfig,
     /// Approval behavior.
     pub approvals: ApprovalConfig,
+    /// Filesystem snapshots around root changes.
+    pub snapshots: SnapshotConfig,
     /// TUI presentation.
     pub ui: UiConfig,
 }
@@ -44,6 +46,7 @@ impl Default for Config {
             pricing: BTreeMap::new(),
             spend: SpendConfig::default(),
             approvals: ApprovalConfig::default(),
+            snapshots: SnapshotConfig::default(),
             ui: UiConfig::default(),
         }
     }
@@ -124,6 +127,21 @@ pub struct ApprovalConfig {
     /// Start every session in YOLO mode (auto-approve T0–T2). The safeguard
     /// floor still asks.
     pub yolo: bool,
+}
+
+/// `[snapshots]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SnapshotConfig {
+    /// Take a snapper pre/post pair around each root action, when snapper
+    /// has a config for `/`.
+    pub enabled: bool,
+}
+
+impl Default for SnapshotConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// `[ui]`.

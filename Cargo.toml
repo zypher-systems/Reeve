@@ -21,7 +21,7 @@ clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 dirs = "6"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "time", "sync", "process"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "time", "sync", "process", "net"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures-util = "0.3"
 async-trait = "0.1"

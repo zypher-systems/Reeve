@@ -79,6 +79,9 @@ pub struct Receipt {
     /// This receipt reverses that one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undoes: Option<u64>,
+    /// Snapper snapshots taken around it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<crate::snapshots::SnapPair>,
 }
 
 impl Receipt {
@@ -104,6 +107,7 @@ impl Receipt {
             },
             undo: None,
             undoes: None,
+            snapshot: None,
         }
     }
 
@@ -114,12 +118,24 @@ impl Receipt {
         Ok(sha256_hex(format!("{}\n{json}", self.prev).as_bytes()))
     }
 
-    /// The path or command it acted on, for one-line lists.
+    /// What it acted on, for one-line lists: the command, path, unit,
+    /// packages, query, or process.
     pub fn target(&self) -> String {
-        for k in ["command", "path", "from"] {
+        for k in ["command", "path", "from", "unit", "name", "query"] {
             if let Some(v) = self.args.get(k).and_then(|v| v.as_str()) {
                 return v.to_string();
             }
+        }
+        if let Some(list) = self.args.get("packages").and_then(|v| v.as_array()) {
+            let names: Vec<&str> = list.iter().filter_map(|v| v.as_str()).collect();
+            return if names.is_empty() {
+                "all packages".into()
+            } else {
+                names.join(" ")
+            };
+        }
+        if let Some(pid) = self.args.get("pid").and_then(serde_json::Value::as_u64) {
+            return format!("pid {pid}");
         }
         if let Some(n) = self.undoes {
             return format!("#{n}");
@@ -250,35 +266,43 @@ impl ReceiptBook {
             .map(|r| r.seq)
     }
 
-    /// Reverse receipt `seq` and write a receipt for the undo. Refuses when
-    /// there's nothing to undo, it was already undone, or the files have
-    /// changed since.
-    pub fn undo(&self, store: &crate::undo::UndoStore, seq: u64, session: &str) -> Result<Receipt> {
+    /// The receipt to undo and its undo record, or why it can't be undone.
+    pub fn undo_target(&self, seq: u64) -> Result<(Receipt, Undo)> {
         let target = self
             .find(seq)
             .ok_or_else(|| Error::Io(format!("there's no receipt #{seq}")))?;
-        let Some(undo) = &target.undo else {
+        let Some(undo) = target.undo.clone() else {
             return Err(Error::Io(format!(
                 "#{seq} ({}) has nothing to undo",
                 target.tool
             )));
         };
-        if target.outcome.status != Status::Ok && target.outcome.status != Status::Error {
+        if matches!(target.outcome.status, Status::Denied | Status::Refused) {
             return Err(Error::Io(format!("#{seq} never ran")));
         }
         if let Some(by) = self.undone_by(seq) {
             return Err(Error::Io(format!("#{seq} was already undone by #{by}")));
         }
+        Ok((target, undo))
+    }
+
+    /// Write the receipt for an undo attempt (successful or not).
+    pub fn record_undo(
+        &self,
+        target: &Receipt,
+        session: &str,
+        result: std::result::Result<(Undo, String), String>,
+    ) -> Result<Receipt> {
         let mut r = Receipt::draft(
             session,
             "undo",
-            serde_json::json!({ "seq": seq }),
+            serde_json::json!({ "seq": target.seq }),
             target.tier,
         );
         r.approved_by = "user".into();
-        r.undoes = Some(seq);
-        r.why = Some(format!("undo #{seq}: {}", target.outcome.summary));
-        match store.revert(undo) {
+        r.undoes = Some(target.seq);
+        r.why = Some(format!("undo #{}: {}", target.seq, target.outcome.summary));
+        match result {
             Ok((inverse, summary)) => {
                 r.outcome = Outcome {
                     status: Status::Ok,
@@ -293,13 +317,21 @@ impl ReceiptBook {
                 r.outcome = Outcome {
                     status: Status::Error,
                     exit: None,
-                    summary: e.to_string(),
+                    summary: e.clone(),
                     output_sha256: None,
                 };
                 self.append(r)?;
-                Err(e)
+                Err(Error::Io(e))
             }
         }
+    }
+
+    /// Undo a user-level file change (no sudo). See `tools::undo_receipt`
+    /// for everything else.
+    pub fn undo(&self, store: &crate::undo::UndoStore, seq: u64, session: &str) -> Result<Receipt> {
+        let (target, undo) = self.undo_target(seq)?;
+        let result = store.revert(&undo).map_err(|e| e.to_string());
+        self.record_undo(&target, session, result)
     }
 
     /// Walk the whole chain: sequence, links, and hashes.

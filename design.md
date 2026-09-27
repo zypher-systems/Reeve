@@ -405,7 +405,7 @@ $XDG_RUNTIME_DIR/reeve/  # reeved.sock, askpass-<pid>.sock
 | --- | --- | --- |
 | **M0** ✓ | Scaffold | Workspace builds. Config and keys work. Provider and spend are copied in. The TUI draws the mission-control layout with a live System rail and Spend panel. Chat streams with no tools. |
 | **M1** ✓ | Hands with a paper trail | File and shell tools, tier classifier, approval cards, YOLO, floor, hash-chained receipts, file undo, `reeve receipts verify`. |
-| **M2** | Sysadmin | Package, service, log, and process tools. Fedora distro layer. `sudo -A` askpass modal. Snapper pairs. Session reports. |
+| **M2** ✓ | Sysadmin | Package, service, log, and process tools. Fedora distro layer. `sudo -A` askpass modal. Snapper pairs. Session reports. |
 | **M3** | Memory | Four layers, memory tools, machine profile in the prompt, the reflect step, the Memory view. |
 | **M4** | Observer | `reeved` with samplers, journal, detectors, baselines, notifications, and the Findings inbox with proposals. |
 | **M5** | Standing orders | Scheduler, scoped autonomous runs, day and month budgets enforced across TUI and daemon. |

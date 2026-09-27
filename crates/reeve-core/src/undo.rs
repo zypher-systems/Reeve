@@ -41,6 +41,10 @@ pub struct FileChange {
     pub pre: Option<Blob>,
     /// What Reeve left (`None`: deleted).
     pub post: Option<Blob>,
+    /// A root-owned file: its copies are in `/var/lib/reeve`, and putting
+    /// it back goes through `sudo reeve root`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub root: bool,
 }
 
 /// How to reverse an action.
@@ -51,6 +55,24 @@ pub enum Undo {
     Files {
         /// Changes, in the order they were made.
         changes: Vec<FileChange>,
+    },
+    /// Roll a package transaction back (`dnf history undo`).
+    Packages {
+        /// `dnf5` or `dnf`.
+        manager: String,
+        /// Transaction id.
+        transaction: u64,
+    },
+    /// Put a unit back the way it was.
+    Unit {
+        /// Unit name.
+        unit: String,
+        /// A user unit (`systemctl --user`).
+        user: bool,
+        /// `is-enabled` before: enabled, disabled, masked, static…
+        enabled: String,
+        /// Was it running.
+        active: bool,
     },
     /// Move `to` back to `from`; `replaced` is what `to` overwrote.
     Move {
@@ -184,6 +206,7 @@ impl UndoStore {
                 path: entry.path().to_string_lossy().into_owned(),
                 pre: self.snapshot(entry.path())?,
                 post: None,
+                root: false,
             });
         }
         Ok(out)
@@ -226,6 +249,7 @@ impl UndoStore {
                         path: c.path.clone(),
                         pre: c.post.clone(),
                         post: c.pre.clone(),
+                        root: c.root,
                     });
                 }
                 let summary = match changes.len() {
@@ -234,6 +258,9 @@ impl UndoStore {
                 };
                 Ok((Undo::Files { changes: inverse }, summary))
             }
+            Undo::Packages { .. } | Undo::Unit { .. } => Err(Error::Io(
+                "package and service changes are undone through their own tools, not the file store".into(),
+            )),
             Undo::Move { from, to, replaced } => {
                 if Path::new(from).exists() {
                     return Err(Error::Io(format!(
@@ -333,6 +360,7 @@ mod tests {
                 path: f.to_string_lossy().into(),
                 pre,
                 post,
+                root: false,
             }],
         };
         let (redo, _) = store.revert(&undo).unwrap();
@@ -354,6 +382,7 @@ mod tests {
                     fs::write(&f, "reeve wrote this").unwrap();
                     store.snapshot(&f).unwrap()
                 },
+                root: false,
             }],
         };
         fs::write(&f, "then the user edited it").unwrap();

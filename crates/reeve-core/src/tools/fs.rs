@@ -8,10 +8,13 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use super::shell::{RunSpec, run_command};
 use super::{Executed, ToolCtx, cap};
 use crate::diff::{FileDiff, diff};
+use crate::distro::quote;
 use crate::policy::{self, Assessment, PathClass, Tier};
 use crate::receipts::{Outcome, Status};
+use crate::root::{RootOp, RootReply};
 use crate::undo::{FileChange, Undo, write_atomic};
 
 const MAX_READ: usize = 64 * 1024;
@@ -192,9 +195,34 @@ pub(super) fn plan_stat(ctx: &ToolCtx, a: &PathArg) -> Planned {
     (asm, format!("stat {}", show(ctx, &p)), None, false, None)
 }
 
+/// You can't write it yourself: it goes through `sudo reeve root`.
+pub(crate) fn needs_root(p: &Path) -> bool {
+    use rustix::fs::{Access, access};
+    let mut probe = p;
+    loop {
+        if fs::symlink_metadata(probe).is_ok() {
+            return access(probe, Access::WRITE_OK).is_err();
+        }
+        match probe.parent() {
+            Some(parent) => probe = parent,
+            None => return true,
+        }
+    }
+}
+
+fn as_root(asm: &mut Assessment, p: &Path) -> bool {
+    let root = asm.deny.is_none() && needs_root(p);
+    if root {
+        asm.sudo = true;
+        asm.raise(Tier::T2, "needs root (you'll be asked for your password)");
+    }
+    root
+}
+
 pub(super) fn plan_write(ctx: &ToolCtx, a: &WriteArgs) -> Planned {
     let p = ctx.paths.resolve(&a.path);
-    let asm = policy::write(&ctx.paths, &a.path);
+    let mut asm = policy::write(&ctx.paths, &a.path);
+    as_root(&mut asm, &p);
     let old = fs::read_to_string(&p).ok();
     let preview = diff(old.as_deref().unwrap_or(""), &a.content, DIFF_ROWS);
     let verb = if old.is_some() || p.exists() {
@@ -214,11 +242,19 @@ pub(super) fn plan_write(ctx: &ToolCtx, a: &WriteArgs) -> Planned {
 
 pub(super) fn plan_edit(ctx: &ToolCtx, a: &EditArgs) -> Result<Planned, String> {
     let p = ctx.paths.resolve(&a.path);
-    let asm = policy::write(&ctx.paths, &a.path);
+    let mut asm = policy::write(&ctx.paths, &a.path);
     if asm.deny.is_some() {
         return Ok((asm, format!("edit {}", show(ctx, &p)), None, false, None));
     }
-    let old = fs::read_to_string(&p).map_err(|e| io_msg(&p, &e))?;
+    let root = as_root(&mut asm, &p);
+    let old = match fs::read_to_string(&p) {
+        Ok(t) => t,
+        // Unreadable as you (0600 root files): the root side checks the edit.
+        Err(e) if root && e.kind() == ErrorKind::PermissionDenied => {
+            return Ok((asm, format!("edit {}", show(ctx, &p)), None, true, None));
+        }
+        Err(e) => return Err(io_msg(&p, &e)),
+    };
     let new = apply_edit(&old, a)?;
     let rule = rule_for("fs_write", &asm, &p);
     Ok((
@@ -266,11 +302,14 @@ pub(super) fn plan_move(ctx: &ToolCtx, a: &MoveArgs) -> Planned {
 pub(super) fn plan_delete(ctx: &ToolCtx, a: &DeleteArgs) -> Planned {
     let p = ctx.paths.resolve(&a.path);
     let is_dir = fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir());
-    let asm = if is_dir {
+    let mut asm = if is_dir {
         policy::recursive(&ctx.paths, &a.path)
     } else {
         policy::write(&ctx.paths, &a.path)
     };
+    if !is_dir {
+        as_root(&mut asm, &p);
+    }
     let preview = if is_dir {
         None
     } else {
@@ -607,14 +646,86 @@ fn changed(
             path: p.to_string_lossy().into_owned(),
             pre,
             post,
+            root: false,
         }],
     });
     e.diff = Some(d);
     e
 }
 
-pub(super) fn write(ctx: &ToolCtx, a: &WriteArgs) -> Executed {
+/// Run one root operation through `sudo reeve root`.
+async fn root_exec(ctx: &ToolCtx, op: RootOp) -> Executed {
+    let Ok(json) = serde_json::to_vec(&op) else {
+        return fail("couldn't encode the root request".into());
+    };
+    let command = format!("sudo {} root", quote(&ctx.exe.to_string_lossy()));
+    let out = run_command(
+        ctx,
+        RunSpec {
+            command: &command,
+            cwd: &ctx.paths.home,
+            timeout: Duration::from_secs(180),
+            sudo: true,
+            stdin: Some(json),
+        },
+    )
+    .await;
+    if let Some(f) = out.failure {
+        return fail(f);
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let reply = stdout
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<RootReply>(l).ok());
+    let Some(reply) = reply else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let why = err
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("no reply");
+        return fail(format!("root step failed: {why}"));
+    };
+    if !reply.ok {
+        return fail(reply.error.unwrap_or_else(|| "root step failed".into()));
+    }
+    let d = match (&reply.old_text, &reply.new_text) {
+        (o, Some(n)) => Some(diff(o.as_deref().unwrap_or(""), n, DIFF_ROWS)),
+        _ => None,
+    };
+    let summary = match &d {
+        Some(d) => format!("{} +{} −{} (as root)", reply.summary, d.added, d.removed),
+        None => format!("{} (as root)", reply.summary),
+    };
+    let mut e = ok(format!("{summary}\n"), summary);
+    e.undo = reply.undo;
+    e.diff = d;
+    e
+}
+
+/// Reverse root-owned file changes.
+pub(crate) async fn root_revert(ctx: &ToolCtx, undo: &Undo) -> Result<(Undo, String), String> {
+    let e = root_exec(ctx, RootOp::Revert { undo: undo.clone() }).await;
+    match (e.outcome.status, e.undo) {
+        (Status::Ok, Some(u)) => Ok((u, e.outcome.summary)),
+        _ => Err(e.outcome.summary),
+    }
+}
+
+pub(super) async fn write(ctx: &ToolCtx, a: &WriteArgs) -> Executed {
     let p = ctx.paths.resolve(&a.path);
+    if needs_root(&p) {
+        return root_exec(
+            ctx,
+            RootOp::Write {
+                path: p.to_string_lossy().into_owned(),
+                content: a.content.clone(),
+                create_dirs: a.create_dirs,
+            },
+        )
+        .await;
+    }
     if p.is_dir() {
         return fail(format!("{} is a directory", p.display()));
     }
@@ -655,8 +766,20 @@ fn put(p: &Path, bytes: &[u8], pre: Option<&crate::undo::Blob>) -> std::io::Resu
     }
 }
 
-pub(super) fn edit(ctx: &ToolCtx, a: &EditArgs) -> Executed {
+pub(super) async fn edit(ctx: &ToolCtx, a: &EditArgs) -> Executed {
     let p = ctx.paths.resolve(&a.path);
+    if needs_root(&p) {
+        return root_exec(
+            ctx,
+            RootOp::Edit {
+                path: p.to_string_lossy().into_owned(),
+                old: a.old.clone(),
+                new: a.new.clone(),
+                replace_all: a.replace_all,
+            },
+        )
+        .await;
+    }
     let old = match fs::read_to_string(&p) {
         Ok(t) => t,
         Err(e) => return fail(io_msg(&p, &e)),
@@ -727,12 +850,21 @@ pub(super) fn mv(ctx: &ToolCtx, a: &MoveArgs) -> Executed {
     e
 }
 
-pub(super) fn delete(ctx: &ToolCtx, a: &DeleteArgs) -> Executed {
+pub(super) async fn delete(ctx: &ToolCtx, a: &DeleteArgs) -> Executed {
     let p = ctx.paths.resolve(&a.path);
     let meta = match fs::symlink_metadata(&p) {
         Ok(m) => m,
         Err(e) => return fail(io_msg(&p, &e)),
     };
+    if !meta.is_dir() && needs_root(&p) {
+        return root_exec(
+            ctx,
+            RootOp::Delete {
+                path: p.to_string_lossy().into_owned(),
+            },
+        )
+        .await;
+    }
     if meta.is_dir() {
         if !a.recursive {
             return fail(format!(
@@ -771,6 +903,7 @@ pub(super) fn delete(ctx: &ToolCtx, a: &DeleteArgs) -> Executed {
             path: p.to_string_lossy().into_owned(),
             pre,
             post: None,
+            root: false,
         }],
     });
     e

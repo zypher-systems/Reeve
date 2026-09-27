@@ -10,7 +10,6 @@ use reeve_core::config::{self, Config};
 use reeve_core::llm::{HttpProvider, Provider};
 use reeve_core::receipts::ReceiptBook;
 use reeve_core::spend::{PriceBook, format_rates, format_tokens};
-use reeve_core::undo::UndoStore;
 
 #[derive(Parser)]
 #[command(name = "reeve", version, about = "An operator agent for your computer")]
@@ -78,6 +77,18 @@ enum KeyCmd {
 }
 
 fn main() -> ExitCode {
+    // sudo runs the askpass link; `sudo reeve root` is the root file helper.
+    // Neither reads Reeve's config or touches the network.
+    let argv0 = std::env::args().next().unwrap_or_default();
+    if std::path::Path::new(&argv0)
+        .file_name()
+        .is_some_and(|n| n == reeve_core::sudo::HELPER_NAME)
+    {
+        return ExitCode::from(reeve_core::sudo::helper_main() as u8);
+    }
+    if std::env::args().nth(1).as_deref() == Some("root") {
+        return ExitCode::from(reeve_core::root::root_main() as u8);
+    }
     let cli = Cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -123,8 +134,15 @@ fn run(cli: Cli) -> Result<(), String> {
             if !yes && !confirm("Undo it? [y/N] ")? {
                 return Ok(());
             }
-            let done = book
-                .undo(&UndoStore::new(&home), seq, "cli")
+            // Root files, packages, and units need sudo: ask on this terminal.
+            let mut ctx = reeve_core::tools::ToolCtx::new(home.clone(), vec![]);
+            ctx.interactive_sudo = true;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let done = rt
+                .block_on(reeve_core::tools::undo_receipt(&ctx, &book, seq, "cli"))
                 .map_err(|e| e.to_string())?;
             println!("{} (receipt #{})", done.outcome.summary, done.seq);
             Ok(())
