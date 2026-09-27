@@ -177,7 +177,10 @@ if [ "$service" -eq 1 ]; then
     if [ "$start" -eq 1 ]; then
         if user_systemd; then
             systemctl --user daemon-reload
-            if systemctl --user enable --now reeved.service >/dev/null 2>&1; then
+            # An update: the running observer is still the old binary.
+            if systemctl --user is-active --quiet reeved.service; then
+                systemctl --user restart reeved.service && say "reeved restarted on the new version"
+            elif systemctl --user enable --now reeved.service >/dev/null 2>&1; then
                 say "reeved is running (systemctl --user status reeved)"
             else
                 warn "couldn't start reeved; check: systemctl --user status reeved"
