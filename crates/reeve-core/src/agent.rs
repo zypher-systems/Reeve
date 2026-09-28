@@ -51,6 +51,8 @@ pub struct ApprovalRequest {
     pub command: Option<String>,
     /// Resolved paths it changes, for file tools.
     pub paths: Vec<String>,
+    /// The verified change it's part of: its goal and checks.
+    pub txn: Option<crate::txn::TxnBrief>,
 }
 
 /// The owner's answer.
@@ -145,6 +147,8 @@ pub enum AgentEvent {
         /// Its receipt.
         receipt: Option<Box<Receipt>>,
     },
+    /// A receipt written outside a tool call: a rollback's undo.
+    Receipt(Box<Receipt>),
 }
 
 /// One conversation with one model.
@@ -166,6 +170,7 @@ pub struct Agent {
     approver: Arc<dyn Approver>,
     allowed: HashSet<String>,
     role: Option<String>,
+    txn: Option<crate::txn::Txn>,
 }
 
 /// Environment variables that hold API keys, to keep out of commands.
@@ -223,6 +228,7 @@ impl Agent {
             approver: Arc::new(DenyAll),
             allowed: HashSet::new(),
             role: None,
+            txn: None,
         })
     }
 
@@ -283,6 +289,8 @@ impl Agent {
         self.transcript.clear();
         self.tally = Tally::default();
         self.allowed.clear();
+        // Its changes keep their receipts; the commit receipt never comes.
+        self.txn = None;
         Ok(())
     }
 
@@ -494,7 +502,21 @@ impl Agent {
             self.session.append(&reply)?;
             self.transcript.push(reply);
             if calls.is_empty() {
-                return Ok(truncated);
+                if self.txn.is_none() {
+                    return Ok(truncated);
+                }
+                // A change left open is checked now, and the model reports it.
+                let id = format!("auto-{}", self.txn.as_ref().map_or("", |t| &t.id));
+                let result = self.commit(&id, emit).await?;
+                let msg = Message::new(
+                    "user",
+                    format!(
+                        "[Reeve, not the owner] You ended your turn with a verified change still open, so Reeve checked it:\n{result}\nTell the owner the result in a sentence or two."
+                    ),
+                );
+                self.session.append(&msg)?;
+                self.transcript.push(msg);
+                continue;
             }
             for call in &calls {
                 let output = if truncated {
@@ -523,6 +545,11 @@ impl Agent {
         call: &AssistantToolCall,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<String> {
+        match call.name.as_str() {
+            "change_begin" => return self.begin(call, emit),
+            "change_commit" => return self.commit(&call.id, emit).await,
+            _ => {}
+        }
         let plan = match tools::prepare(&self.tools, &call.name, &call.arguments) {
             Ok(p) => p,
             Err(msg) => {
@@ -558,6 +585,7 @@ impl Agent {
         );
         draft.reasons = a.reasons.clone();
         draft.why = plan.why.clone();
+        let mut executed = false;
 
         let (output, diff) = if let Some(why) = a.deny.clone() {
             draft.outcome = outcome(Status::Refused, format!("refused: {why}"));
@@ -581,6 +609,10 @@ impl Agent {
                 }
                 Ok(by) => {
                     draft.approved_by = by;
+                    executed = true;
+                    if a.tier >= Tier::T1 {
+                        draft.txn = self.txn.as_ref().map(|t| t.id.clone());
+                    }
                     // Root changes get a snapper pair when snapper covers `/`.
                     let snap =
                         if plan.assessment.sudo && a.tier >= Tier::T2 && self.cfg.snapshots.enabled
@@ -607,10 +639,24 @@ impl Agent {
             }
         };
         let sealed = self.receipts.append(draft)?;
-        let tag = if sealed.undo.is_some() {
-            format!("\n(receipt #{}, can be undone)", sealed.seq)
-        } else {
-            format!("\n(receipt #{})", sealed.seq)
+        let in_txn = match (&mut self.txn, &sealed.txn) {
+            (Some(t), Some(_)) if executed => {
+                t.record(sealed.seq, sealed.undo.is_some());
+                Some(t.id.clone())
+            }
+            _ => None,
+        };
+        let tag = match (in_txn, sealed.undo.is_some()) {
+            (Some(t), true) => format!(
+                "\n(receipt #{}, part of change {t}: rolled back if its checks fail)",
+                sealed.seq
+            ),
+            (Some(t), false) => format!(
+                "\n(receipt #{}, part of change {t}, but this one can't be rolled back automatically)",
+                sealed.seq
+            ),
+            (None, true) => format!("\n(receipt #{}, can be undone)", sealed.seq),
+            (None, false) => format!("\n(receipt #{})", sealed.seq),
         };
         emit(AgentEvent::ToolFinished {
             id: call.id.clone(),
@@ -646,6 +692,7 @@ impl Agent {
             can_allow_session: tier == Tier::T1 && plan.rule.is_some(),
             command: plan.command(),
             paths: plan.paths(&self.tools),
+            txn: self.txn.as_ref().map(crate::txn::Txn::brief),
         };
         match self.approver.decide(req).await {
             Decision::Approve => Ok(self.approver.label()),
@@ -657,6 +704,232 @@ impl Agent {
             }
             Decision::Deny(note) => Err(note),
         }
+    }
+
+    /// `change_begin`: open a verified change. Checked before anything changes.
+    fn begin(
+        &mut self,
+        call: &AssistantToolCall,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+    ) -> Result<String> {
+        let parsed =
+            serde_json::from_str::<crate::txn::BeginArgs>(if call.arguments.trim().is_empty() {
+                "{}"
+            } else {
+                &call.arguments
+            })
+            .map_err(|e| format!("bad arguments for change_begin: {e}"))
+            .and_then(|a| {
+                if let Some(open) = &self.txn {
+                    return Err(format!(
+                        "change {} ({}) is still open; change_commit it first",
+                        open.id, open.goal
+                    ));
+                }
+                if a.goal.trim().is_empty() {
+                    return Err("say what the change is for (goal)".into());
+                }
+                if a.checks.is_empty() {
+                    return Err(
+                        "give at least one check that would fail if the problem remained".into(),
+                    );
+                }
+                if a.checks.len() > 8 {
+                    return Err("at most 8 checks".into());
+                }
+                match a.checks.iter().find_map(|c| c.problem(&self.tools)) {
+                    Some(p) => Err(p),
+                    None => Ok(a),
+                }
+            });
+        emit(AgentEvent::ToolStarted {
+            id: call.id.clone(),
+            tool: call.name.clone(),
+            tier: Tier::T0,
+            summary: match &parsed {
+                Ok(a) => format!("verified change: {}", a.goal.trim()),
+                Err(_) => "verified change".into(),
+            },
+        });
+        let a = match parsed {
+            Ok(a) => a,
+            Err(msg) => {
+                emit(AgentEvent::ToolFinished {
+                    id: call.id.clone(),
+                    status: Status::Error,
+                    summary: msg.clone(),
+                    diff: None,
+                    receipt: None,
+                });
+                return Ok(format!("error: {msg}"));
+            }
+        };
+        let t = crate::txn::Txn::new(&a.goal, a.checks, a.wait_secs);
+        let checks: Vec<String> = t.checks.iter().map(crate::txn::Check::describe).collect();
+        let mut draft = Receipt::draft(
+            &self.session.meta.id,
+            "change_begin",
+            serde_json::json!({"goal": t.goal, "checks": t.checks, "wait_secs": t.wait_secs}),
+            Tier::T0,
+        );
+        draft.approved_by = "policy".into();
+        draft.txn = Some(t.id.clone());
+        draft.outcome = outcome(Status::Ok, format!("will check: {}", checks.join("; ")));
+        let sealed = self.receipts.append(draft)?;
+        let output = format!(
+            "Change {} is open: {}.\nAfter your changes Reeve will check:\n{}\nMake the changes, then call change_commit. If any check fails, every change made in it that has an undo record is undone automatically.\n(receipt #{})",
+            t.id,
+            t.goal,
+            checks
+                .iter()
+                .map(|c| format!("- {c}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            sealed.seq
+        );
+        emit(AgentEvent::ToolFinished {
+            id: call.id.clone(),
+            status: Status::Ok,
+            summary: sealed.outcome.summary.clone(),
+            diff: None,
+            receipt: Some(Box::new(sealed)),
+        });
+        self.txn = Some(t);
+        Ok(output)
+    }
+
+    /// `change_commit` (or the end of a turn): run the checks; if one fails,
+    /// undo the change's actions newest first. Reeve's own results decide.
+    async fn commit(
+        &mut self,
+        id: &str,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+    ) -> Result<String> {
+        let Some(t) = self.txn.take() else {
+            emit(AgentEvent::ToolStarted {
+                id: id.into(),
+                tool: "change_commit".into(),
+                tier: Tier::T0,
+                summary: "check the change".into(),
+            });
+            let msg = "no change is open; call change_begin before making changes".to_string();
+            emit(AgentEvent::ToolFinished {
+                id: id.into(),
+                status: Status::Error,
+                summary: msg.clone(),
+                diff: None,
+                receipt: None,
+            });
+            return Ok(format!("error: {msg}"));
+        };
+        emit(AgentEvent::ToolStarted {
+            id: id.into(),
+            tool: "change_commit".into(),
+            tier: Tier::T0,
+            summary: format!("check: {}", t.goal),
+        });
+        let results = t.verify(&self.tools).await;
+        let passed = results.iter().all(|r| r.ok);
+        let mut rolled = Vec::new();
+        let mut stuck: Vec<(u64, String)> = t
+            .unrevertable
+            .iter()
+            .map(|s| (*s, "no undo record".to_string()))
+            .collect();
+        if !passed {
+            let by = format!("txn:{}", t.id);
+            for seq in t.changes.iter().rev() {
+                match tools::undo_receipt_by(
+                    &self.tools,
+                    &self.receipts,
+                    *seq,
+                    &self.session.meta.id,
+                    &by,
+                )
+                .await
+                {
+                    Ok(r) => {
+                        rolled.push((*seq, r.seq));
+                        emit(AgentEvent::Receipt(Box::new(r)));
+                    }
+                    Err(e) => stuck.push((*seq, e.to_string())),
+                }
+            }
+            stuck.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
+        }
+        let failed: Vec<&str> = results
+            .iter()
+            .filter(|r| !r.ok)
+            .map(|r| r.check.as_str())
+            .collect();
+        let summary = if passed {
+            if t.changes.is_empty() && t.unrevertable.is_empty() {
+                format!("verified, no changes made: {}", t.goal)
+            } else {
+                format!("verified: {} ({} checks passed)", t.goal, results.len())
+            }
+        } else if stuck.is_empty() {
+            format!(
+                "failed ({}), so rolled back {}",
+                failed.join("; "),
+                changes(rolled.len())
+            )
+        } else {
+            format!(
+                "failed ({}); rolled back {}, {} left in place",
+                failed.join("; "),
+                changes(rolled.len()),
+                stuck.len()
+            )
+        };
+        let mut draft = Receipt::draft(
+            &self.session.meta.id,
+            "change_commit",
+            serde_json::json!({
+                "goal": t.goal,
+                "changes": t.changes.iter().chain(&t.unrevertable).collect::<Vec<_>>(),
+                "results": results,
+                "rolled_back": rolled.iter().map(|(s, u)| serde_json::json!({"seq": s, "by": u})).collect::<Vec<_>>(),
+                "not_rolled_back": stuck.iter().map(|(s, e)| serde_json::json!({"seq": s, "why": e})).collect::<Vec<_>>(),
+            }),
+            Tier::T0,
+        );
+        draft.approved_by = "policy".into();
+        draft.txn = Some(t.id.clone());
+        draft.outcome = outcome(if passed { Status::Ok } else { Status::Error }, summary);
+        let sealed = self.receipts.append(draft)?;
+        let mut text = format!("Checked change {} ({}):\n", t.id, t.goal);
+        for r in &results {
+            text.push_str(&format!(
+                "{} {} — saw: {}\n",
+                if r.ok { "✓" } else { "✗" },
+                r.check,
+                r.seen
+            ));
+        }
+        if passed {
+            text.push_str("Verified: the change is kept.");
+        } else {
+            text.push_str("A check failed, so Reeve rolled the change back.");
+            for (s, u) in &rolled {
+                text.push_str(&format!("\n↶ #{s} undone (receipt #{u})"));
+            }
+            for (s, e) in &stuck {
+                text.push_str(&format!("\n! #{s} is still in place: {e}"));
+            }
+            if !stuck.is_empty() {
+                text.push_str("\nTell the owner what's still in place. Don't try the same fix again without saying what's different.");
+            }
+        }
+        text.push_str(&format!("\n(receipt #{})", sealed.seq));
+        emit(AgentEvent::ToolFinished {
+            id: id.into(),
+            status: sealed.outcome.status,
+            summary: sealed.outcome.summary.clone(),
+            diff: None,
+            receipt: Some(Box::new(sealed)),
+        });
+        Ok(text)
     }
 
     /// Reverse receipt `seq`, writing a receipt for the undo itself.
@@ -702,6 +975,14 @@ impl Agent {
             totals: Box::new(ledger::totals(&self.home, Local::now())),
         });
         Ok(())
+    }
+}
+
+fn changes(n: usize) -> String {
+    if n == 1 {
+        "1 change".into()
+    } else {
+        format!("{n} changes")
     }
 }
 
@@ -781,9 +1062,18 @@ actions also get a snapper snapshot pair when snapper is set up for /. If a pass
 isn't given, don't retry; say what you needed.\n\
 Each result ends with its receipt number; mention it when you change something, so the \
 owner can undo it.\n\n\
+## Verified changes\n\
+Make every fix a verified change. First call change_begin with the goal and checks that \
+would fail if the problem remained: a unit is active, a unit logs no errors after the \
+change, a disk is under some percentage, or a read-only command succeeds (and shows some \
+text). Then make the changes, then call change_commit. Reeve runs the checks itself; if \
+any fails, it undoes every change made in the transaction and tells you. Pick checks that \
+test the fix, never ones that always pass. Changes without an undo record (most shell \
+commands) can't be rolled back, so inside a change prefer fs_ edits and the pkg_ and svc_ \
+tools. If you end your turn with a change open, Reeve checks it then.\n\n\
 ## Memory\n\
 You remember this machine between sessions. Before diagnosing a problem, memory_search \
-for a runbook. After a fix you've checked, record it (memory_write runbook, or its outcome \
+for a runbook. After a fix passes its checks, record it (memory_write runbook, or its outcome \
 on the runbook you used). Save facts you learn from tool output that will matter again. \
 When the owner tells you how they want things done, save it as a preference in their \
 words: it takes effect once they confirm it. Never store secrets.\n\n\
@@ -1002,6 +1292,179 @@ mod tests {
             2,
             "the repeat was covered, the new command asked"
         );
+    }
+
+    fn calls(list: Vec<(&str, serde_json::Value)>) -> Vec<StreamDelta> {
+        let mut v: Vec<StreamDelta> = list
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, args))| StreamDelta::ToolCall {
+                id: format!("c{i}"),
+                name: name.into(),
+                arguments: args.to_string(),
+            })
+            .collect();
+        v.push(StreamDelta::Done);
+        v
+    }
+
+    fn begin(check: &str) -> (&'static str, serde_json::Value) {
+        (
+            "change_begin",
+            serde_json::json!({"goal": "say bye", "checks": [{"kind": "command", "command": check}], "wait_secs": 0}),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_verified_change_that_passes_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let note = tmp.path().canonicalize().unwrap().join("note.txt");
+        let n = note.to_string_lossy().to_string();
+        let (_home, mut a) = agent(
+            vec![
+                calls(vec![
+                    begin(&format!("grep -q bye {n}")),
+                    (
+                        "fs_write",
+                        serde_json::json!({"path": n, "content": "bye\n"}),
+                    ),
+                    ("change_commit", serde_json::json!({})),
+                ]),
+                done("fixed"),
+            ],
+            fixed(Decision::Approve, false),
+        );
+        run(&mut a).await;
+        assert!(note.exists());
+        let rs = ReceiptBook::new(&a.home).all();
+        let tools: Vec<&str> = rs.iter().map(|r| r.tool.as_str()).collect();
+        assert_eq!(tools, ["change_begin", "fs_write", "change_commit"]);
+        assert!(rs.iter().all(|r| r.txn == rs[0].txn && r.txn.is_some()));
+        assert_eq!(rs[2].outcome.status, Status::Ok, "{:?}", rs[2].outcome);
+        assert!(rs[2].outcome.summary.starts_with("verified"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_rolls_everything_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let (note, other) = (dir.join("note.txt"), dir.join("other.txt"));
+        std::fs::write(&other, "old\n").unwrap();
+        let approver = fixed(Decision::Approve, false);
+        let (_home, mut a) = agent(
+            vec![
+                calls(vec![
+                    begin(&format!("grep -q bye {}", note.display())),
+                    (
+                        "fs_write",
+                        serde_json::json!({"path": note, "content": "hi\n"}),
+                    ),
+                    (
+                        "fs_edit",
+                        serde_json::json!({"path": other, "old": "old", "new": "new"}),
+                    ),
+                    (
+                        "shell",
+                        serde_json::json!({"command": format!("touch {}/stamp", dir.display())}),
+                    ),
+                    ("change_commit", serde_json::json!({})),
+                ]),
+                done("sorry"),
+            ],
+            approver.clone(),
+        );
+        run(&mut a).await;
+        assert!(!note.exists(), "the new file was removed");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "old\n");
+        assert!(dir.join("stamp").exists(), "shell commands have no undo");
+        // Every change's card said it was part of the verified change.
+        let asked = approver.asked.lock().unwrap();
+        assert!(
+            asked
+                .iter()
+                .all(|r| r.txn.as_ref().is_some_and(|t| t.goal == "say bye"))
+        );
+        let rs = ReceiptBook::new(&a.home).all();
+        let commit = rs.iter().find(|r| r.tool == "change_commit").unwrap();
+        assert_eq!(commit.outcome.status, Status::Error);
+        assert_eq!(commit.args["rolled_back"].as_array().unwrap().len(), 2);
+        assert_eq!(commit.args["not_rolled_back"][0]["seq"], 4);
+        // Rolled back newest first, recorded as the transaction's doing.
+        let undos: Vec<(u64, &str)> = rs
+            .iter()
+            .filter_map(|r| r.undoes.map(|u| (u, r.approved_by.as_str())))
+            .collect();
+        let by = format!("txn:{}", commit.txn.as_deref().unwrap());
+        assert_eq!(undos, [(3, by.as_str()), (2, by.as_str())]);
+        let told = a
+            .transcript
+            .iter()
+            .rev()
+            .find(|m| m.role == "tool")
+            .unwrap();
+        assert!(
+            told.content.contains("✗") && told.content.contains("#4 is still in place"),
+            "{}",
+            told.content
+        );
+        assert_eq!(ReceiptBook::new(&a.home).verify().problem, None);
+    }
+
+    #[tokio::test]
+    async fn an_open_change_is_checked_when_the_turn_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let note = tmp.path().canonicalize().unwrap().join("note.txt");
+        let (_home, mut a) = agent(
+            vec![
+                calls(vec![
+                    begin(&format!("grep -q bye {}", note.display())),
+                    (
+                        "fs_write",
+                        serde_json::json!({"path": note, "content": "hi\n"}),
+                    ),
+                ]),
+                done("all done"),
+                done("it didn't work, so it was rolled back"),
+            ],
+            fixed(Decision::Approve, false),
+        );
+        run(&mut a).await;
+        assert!(!note.exists());
+        assert!(a.txn.is_none());
+        assert!(
+            a.transcript
+                .iter()
+                .any(|m| m.role == "user" && m.content.starts_with("[Reeve, not the owner]"))
+        );
+        assert_eq!(
+            a.last_reply(),
+            Some("it didn't work, so it was rolled back")
+        );
+    }
+
+    #[tokio::test]
+    async fn checks_that_change_things_are_refused() {
+        let (_home, mut a) = agent(
+            vec![
+                calls(vec![
+                    begin("rm -rf /tmp/whatever"),
+                    ("change_commit", serde_json::json!({})),
+                ]),
+                done("ok"),
+            ],
+            fixed(Decision::Approve, false),
+        );
+        run(&mut a).await;
+        assert!(a.txn.is_none());
+        let answers: Vec<&str> = a
+            .transcript
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(answers[0].contains("checks must only read"), "{answers:?}");
+        assert!(answers[1].contains("no change is open"));
+        assert!(ReceiptBook::new(&a.home).all().is_empty());
     }
 
     #[test]

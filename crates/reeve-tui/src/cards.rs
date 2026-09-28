@@ -195,7 +195,36 @@ fn card_lines(p: &Pending, width: usize, t: &Theme) -> Vec<Line<'static>> {
         )));
         out.extend(diff_lines(d, width, CARD_DIFF_ROWS, t));
     }
-    out.push(Line::from(if r.undoable {
+    if let Some(txn) = &r.txn {
+        out.push(Line::from(vec![
+            Span::styled("✓ ", Style::default().fg(t.teal)),
+            Span::styled("verified change  ", t.ghost()),
+            Span::styled(
+                truncate(&txn.goal, width.saturating_sub(19)),
+                Style::default().fg(t.fg),
+            ),
+        ]));
+        for (i, c) in txn.checks.iter().enumerate() {
+            out.push(Line::from(vec![
+                Span::styled(if i == 0 { "  checks " } else { "         " }, t.ghost()),
+                Span::styled(truncate(c, width.saturating_sub(9)), t.muted()),
+            ]));
+        }
+    }
+    out.push(Line::from(if r.txn.is_some() && r.undoable {
+        vec![
+            Span::styled("↶ ", Style::default().fg(t.teal)),
+            Span::styled("rolled back automatically if a check fails", t.ghost()),
+        ]
+    } else if r.txn.is_some() {
+        vec![
+            Span::styled("! ", Style::default().fg(t.warn)),
+            Span::styled(
+                "this step can't be rolled back if a check fails; the rest can",
+                t.ghost(),
+            ),
+        ]
+    } else if r.undoable {
         vec![
             Span::styled("↶ ", Style::default().fg(t.teal)),
             Span::styled(
@@ -378,7 +407,11 @@ pub fn receipt_lines(v: &View, width: usize, t: &Theme) -> Vec<Line<'static>> {
 }
 
 fn short_tool(tool: &str) -> String {
-    tool.strip_prefix("fs_").unwrap_or(tool).to_string()
+    match tool {
+        "change_begin" => "begin".into(),
+        "change_commit" => "verify".into(),
+        _ => tool.strip_prefix("fs_").unwrap_or(tool).to_string(),
+    }
 }
 
 fn wrap_hard(s: &str, width: usize) -> Vec<String> {
@@ -435,6 +468,7 @@ mod tests {
             preview: Some(diff("a\nb\n", "a\nc\n", 20)),
             undoable: true,
             can_allow_session: tier == Tier::T1,
+            txn: None,
             command: None,
             paths: vec!["/home/u/.bashrc".into()],
         }
@@ -462,6 +496,30 @@ mod tests {
             assert!(s.contains(needle), "missing {needle:?}\n{s}");
         }
         assert!(!s.contains("Ask Reeve"), "the composer should be hidden");
+    }
+
+    #[test]
+    fn a_verified_change_says_so_on_the_card() {
+        let mut v = View::new(HostInfo::default());
+        v.push(Speaker::User, "fix bluetooth");
+        let mut r = req(Tier::T2);
+        r.txn = Some(reeve_core::txn::TxnBrief {
+            goal: "bluetooth works again".into(),
+            checks: vec!["bluetooth.service is active".into()],
+        });
+        v.approval = Some(Pending {
+            req: r,
+            typed: String::new(),
+        });
+        let s = render(&v);
+        for needle in [
+            "verified change",
+            "bluetooth works again",
+            "bluetooth.service is active",
+            "rolled back automatically",
+        ] {
+            assert!(s.contains(needle), "missing {needle:?}\n{s}");
+        }
     }
 
     #[test]

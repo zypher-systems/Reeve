@@ -61,6 +61,12 @@ cargo build --release --locked -p reeve-cli && ./target/release/reeve
 
 Reeve's own keys can't be read, and its receipts and undo store can't be written, by any tool, in any mode.
 
+## Verified changes
+
+A fix states up front how Reeve will know it worked. For example: "bluetooth.service is active", "bluetooth.service logs no errors", "/ is under 90% full", or "`bluetoothctl show` prints `Powered: yes`". Reeve makes the changes, then runs those checks itself. If one fails, it undoes every change in the fix, newest first, and says so. The receipts read "verified" or "failed and rolled back", with a receipt for each undo.
+
+The approval card shows when a step is part of a verified change, and whether that step can be rolled back. File edits, packages, and units can. Most raw shell commands can't, and the card says so.
+
 ## Root
 
 When an approved action needs root, Reeve asks for your password in a masked panel. The password goes to

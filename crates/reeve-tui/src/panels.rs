@@ -1006,7 +1006,7 @@ fn orders(f: &mut Frame, r: Rect, p: &crate::overlay::OrdersPanel, t: &Theme) {
             for run in st.runs.iter().rev().take(6) {
                 let c = match run.status.as_str() {
                     "done" => t.good,
-                    "blocked" => t.warn,
+                    "blocked" | "rolled_back" => t.warn,
                     "skipped" => t.dim,
                     _ => t.bad,
                 };

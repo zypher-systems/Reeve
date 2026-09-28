@@ -415,11 +415,11 @@ impl Observer {
             let _ = orders.save_states(&states);
             // A blocked run left a proposal: that's worth a popup. A finished
             // or failed one only if the order asks for it.
-            let proposal = status == "blocked";
+            let proposal = status == "blocked" || status == "rolled_back";
             if cfg.observer.notify && (proposal || order.notify == "after") {
                 let title = match status.as_str() {
                     "done" => format!("Reeve did: {}", order.name),
-                    "blocked" => format!("Reeve has a proposal: {}", order.name),
+                    "blocked" | "rolled_back" => format!("Reeve has a proposal: {}", order.name),
                     _ => format!("Reeve couldn't: {}", order.name),
                 };
                 notify::plain(

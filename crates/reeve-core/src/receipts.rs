@@ -82,6 +82,9 @@ pub struct Receipt {
     /// Snapper snapshots taken around it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<crate::snapshots::SnapPair>,
+    /// The verified change (transaction) it belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txn: Option<String>,
 }
 
 impl Receipt {
@@ -108,6 +111,7 @@ impl Receipt {
             undo: None,
             undoes: None,
             snapshot: None,
+            txn: None,
         }
     }
 
@@ -121,7 +125,7 @@ impl Receipt {
     /// What it acted on, for one-line lists: the command, path, unit,
     /// packages, query, or process.
     pub fn target(&self) -> String {
-        for k in ["command", "path", "from", "unit", "name", "query"] {
+        for k in ["command", "path", "from", "unit", "name", "query", "goal"] {
             if let Some(v) = self.args.get(k).and_then(|v| v.as_str()) {
                 return v.to_string();
             }
@@ -291,6 +295,7 @@ impl ReceiptBook {
         &self,
         target: &Receipt,
         session: &str,
+        by: &str,
         result: std::result::Result<(Undo, String), String>,
     ) -> Result<Receipt> {
         let mut r = Receipt::draft(
@@ -299,8 +304,9 @@ impl ReceiptBook {
             serde_json::json!({ "seq": target.seq }),
             target.tier,
         );
-        r.approved_by = "user".into();
+        r.approved_by = by.into();
         r.undoes = Some(target.seq);
+        r.txn = by.strip_prefix("txn:").map(String::from);
         r.why = Some(format!("undo #{}: {}", target.seq, target.outcome.summary));
         match result {
             Ok((inverse, summary)) => {
@@ -331,7 +337,7 @@ impl ReceiptBook {
     pub fn undo(&self, store: &crate::undo::UndoStore, seq: u64, session: &str) -> Result<Receipt> {
         let (target, undo) = self.undo_target(seq)?;
         let result = store.revert(&undo).map_err(|e| e.to_string());
-        self.record_undo(&target, session, result)
+        self.record_undo(&target, session, "user", result)
     }
 
     /// Walk the whole chain: sequence, links, and hashes.

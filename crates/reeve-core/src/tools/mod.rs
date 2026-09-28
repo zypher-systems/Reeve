@@ -306,6 +306,28 @@ pub(crate) async fn shell_exec(ctx: &ToolCtx, command: &str, sudo: bool) -> Opti
     (out.code == Some(0)).then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Run a read-only command (a check): its exit code and its output, stdout
+/// then stderr.
+pub(crate) async fn shell_exec_status(ctx: &ToolCtx, command: &str) -> (Option<i32>, String) {
+    let out = shell::run_command(
+        ctx,
+        shell::RunSpec {
+            command,
+            cwd: &ctx.paths.home,
+            timeout: std::time::Duration::from_secs(30),
+            sudo: false,
+            stdin: None,
+        },
+    )
+    .await;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    if let Some(f) = out.failure {
+        text.push_str(&f);
+    }
+    (out.code, text)
+}
+
 /// Undo receipt `seq` (files, root files, packages, or a unit) and write a
 /// receipt for the undo. May need sudo; with the TUI, the password prompt
 /// appears there.
@@ -315,6 +337,17 @@ pub async fn undo_receipt(
     seq: u64,
     session: &str,
 ) -> crate::Result<crate::receipts::Receipt> {
+    undo_receipt_by(ctx, book, seq, session, "user").await
+}
+
+/// [`undo_receipt`], recorded as approved by `by` (`txn:<id>` for a rollback).
+pub async fn undo_receipt_by(
+    ctx: &ToolCtx,
+    book: &crate::receipts::ReceiptBook,
+    seq: u64,
+    session: &str,
+    by: &str,
+) -> crate::Result<crate::receipts::Receipt> {
     let (target, undo) = book.undo_target(seq)?;
     let root_files = matches!(&undo, Undo::Files { changes } if changes.iter().any(|c| c.root));
     let result = match &undo {
@@ -322,7 +355,7 @@ pub async fn undo_receipt(
         _ if root_files => fs::root_revert(ctx, &undo).await,
         _ => ctx.undo.revert(&undo).map_err(|e| e.to_string()),
     };
-    book.record_undo(&target, session, result)
+    book.record_undo(&target, session, by, result)
 }
 
 /// Arguments as they go into a receipt: file contents become size and hash.
@@ -501,6 +534,35 @@ pub fn specs() -> Vec<ToolSpec> {
             "findings",
             "What reeved, the background observer, has noticed: open findings (crashes, full disks, failed units, journal spikes, pending updates), or one finding's details and evidence by id.",
             json!({"id": {"type": "string"}, "include_closed": {"type": "boolean", "description": "Include resolved and dismissed ones"}}),
+            &[],
+        ),
+        spec(
+            "change_begin",
+            "Open a verified change before fixing something: the goal, and checks Reeve will run after your changes. If any check fails, Reeve undoes every change made until change_commit. Kinds: unit_active {unit, user?}; journal_quiet {unit, max?, user?} (no more than max errors after the last change); disk_below {mount, percent}; command {command, expect?} (read-only, no sudo; passes on exit 0 and, with expect, when the output contains it).",
+            json!({
+                "goal": {"type": "string", "description": "What the change fixes, in a line"},
+                "checks": {"type": "array", "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["unit_active", "journal_quiet", "disk_below", "command"]},
+                        "unit": {"type": "string"},
+                        "user": {"type": "boolean"},
+                        "max": {"type": "integer"},
+                        "mount": {"type": "string"},
+                        "percent": {"type": "integer"},
+                        "command": {"type": "string"},
+                        "expect": {"type": "string"}
+                    },
+                    "required": ["kind"]
+                }},
+                "wait_secs": {"type": "integer", "description": "Let things settle before checking (default 3, max 120)"}
+            }),
+            &["goal", "checks"],
+        ),
+        spec(
+            "change_commit",
+            "Finish the open verified change: Reeve waits, runs its checks, and keeps the change if they pass or rolls it back if any fails. The result says which.",
+            json!({}),
             &[],
         ),
         spec(

@@ -18,7 +18,7 @@ use reeve_core::findings::{Finding, FindingStore, Proposal, Severity, Signal};
 use reeve_core::llm::{HttpProvider, Provider};
 use reeve_core::orders::{Action, Order, Run};
 use reeve_core::policy::PathCtx;
-use reeve_core::receipts::ReceiptBook;
+use reeve_core::receipts::{ReceiptBook, Status};
 
 /// Says yes only inside an order's scope.
 pub struct OrderApprover {
@@ -223,11 +223,17 @@ pub async fn run(home: &Path, cfg: &Config, order: &Order, cause: Cause, profile
         .await;
     let _ = agent.write_report();
     let session = agent.session_id().to_string();
-    record.receipts = ReceiptBook::new(home)
+    let mine: Vec<_> = ReceiptBook::new(home)
         .all()
         .into_iter()
         .filter(|r| r.session == session)
-        .map(|r| r.seq)
+        .collect();
+    record.receipts = mine.iter().map(|r| r.seq).collect();
+    // A fix that failed its checks was rolled back: the owner decides next.
+    let rolled_back: Vec<String> = mine
+        .iter()
+        .filter(|r| r.tool == "change_commit" && r.outcome.status == Status::Error)
+        .map(|r| format!("#{}: {}", r.seq, r.outcome.summary))
         .collect();
     record.usd = Some(agent.tally().usd);
     let reply = agent.last_reply().map(str::to_string);
@@ -243,54 +249,80 @@ pub async fn run(home: &Path, cfg: &Config, order: &Order, cause: Cause, profile
         .unwrap_or_else(|| "no report".into());
     record.status = if !blocked.is_empty() {
         "blocked".into()
+    } else if !rolled_back.is_empty() {
+        "rolled_back".into()
     } else if reply.is_none() {
         "failed".into()
     } else {
         "done".into()
     };
     if !blocked.is_empty() {
+        let head = format!(
+            "Standing order \"{}\" stopped: it needed things outside its scope.",
+            order.name
+        );
+        let tail = "To allow them, widen the order's scope (/orders, `e`), or do it now with `p`.";
+        let p = Proposal {
+            text: proposal_text(&head, &blocked, &record.summary, tail),
+            drafted_at: Utc::now(),
+            model: model.clone(),
+            usd: record.usd,
+        };
         propose(
             home,
             order,
             &cause,
             &blocked,
-            &record.summary,
-            &model,
-            record.usd,
+            "It stopped at something outside its scope.",
+            p,
+        );
+    } else if !rolled_back.is_empty() {
+        let head = format!(
+            "Standing order \"{}\" tried a fix that failed its checks, so Reeve rolled it back.",
+            order.name
+        );
+        let tail =
+            "The receipts show each step and its undo (/receipts). Try another way with `p`.";
+        let p = Proposal {
+            text: proposal_text(&head, &rolled_back, &record.summary, tail),
+            drafted_at: Utc::now(),
+            model: model.clone(),
+            usd: record.usd,
+        };
+        propose(
+            home,
+            order,
+            &cause,
+            &rolled_back,
+            "Its fix failed its checks and was rolled back.",
+            p,
         );
     }
     record
 }
 
-/// A blocked run leaves a proposal for the owner: on the finding that set
-/// it off, or on a finding of its own.
+fn proposal_text(head: &str, items: &[String], report: &str, tail: &str) -> String {
+    format!(
+        "{head}\n\n{}\n\n{report}\n\n{tail}",
+        items
+            .iter()
+            .map(|b| format!("- {b}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+/// A blocked or rolled-back run leaves a proposal for the owner: on the
+/// finding that set it off, or on a finding of its own.
 fn propose(
     home: &Path,
     order: &Order,
     cause: &Cause,
-    blocked: &[String],
-    report: &str,
-    model: &str,
-    usd: Option<f64>,
+    evidence: &[String],
+    detail: &str,
+    proposal: Proposal,
 ) {
     let store = FindingStore::new(home);
-    let text = format!(
-        "Standing order \"{}\" stopped: it needed things outside its scope.\n\n{}\n\n{}\n\n\
-         To allow them, widen the order's scope (/orders, `e`), or do it now with `p`.",
-        order.name,
-        blocked
-            .iter()
-            .map(|b| format!("- {b}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        report
-    );
-    let proposal = Proposal {
-        text,
-        drafted_at: Utc::now(),
-        model: model.into(),
-        usd,
-    };
     let finding = match cause {
         Cause::Finding(f) => store.get(&f.id),
         _ => store
@@ -299,8 +331,8 @@ fn propose(
                     id: format!("order-blocked:{}", order.id),
                     severity: Severity::Warning,
                     title: format!("Standing order \"{}\" needs you", order.name),
-                    detail: "It stopped at something outside its scope.".into(),
-                    evidence: blocked.to_vec(),
+                    detail: detail.into(),
+                    evidence: evidence.to_vec(),
                     count: 1,
                 },
                 Utc::now(),

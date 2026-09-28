@@ -330,6 +330,7 @@ impl View {
                 self.push(Speaker::Error, e);
             }
             AgentEvent::Models(_) => {}
+            AgentEvent::Receipt(r) => self.add_receipt(*r),
             AgentEvent::ToolStarted {
                 id,
                 tool,

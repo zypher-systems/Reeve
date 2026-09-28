@@ -216,6 +216,31 @@ Each receipt has four parts:
    single pair. If snapper isn't configured, Reeve offers to set up a root config once. It never
    does so silently.
 
+### 6.1 Verified changes
+
+A fix is a transaction that has to prove it worked.
+
+1. **`change_begin`** states the goal and the checks before anything changes. Checks are a fixed
+   set that Reeve runs itself:
+   - `unit_active`: a unit is active;
+   - `journal_quiet`: a unit logs no more than `max` errors after the last change;
+   - `disk_below`: a mount is under some percentage full;
+   - `command`: a T0 command, with no sudo, exits 0 and, optionally, prints some text.
+
+   A check that would change something is refused at begin.
+2. **Each change** made while the transaction is open is tagged with its id (`txn` on the
+   receipt). Its approval card shows the goal and the checks, and says whether that step can be
+   rolled back.
+3. **`change_commit`** waits `wait_secs` (default 3), then runs the checks. If they all pass, the
+   receipt says `verified`. If any fails, every tagged change that has an undo record is undone,
+   newest first. Each undo gets its own receipt, approved by `txn:<id>`. A change without an
+   undo record (most shell commands) is listed as still in place.
+4. **A transaction left open** when the model ends its turn is committed then, and the model is
+   told the result so it can report it.
+
+Only Reeve's check results decide pass or fail. The model's report doesn't count. In a standing
+order, a rollback ends the run `rolled_back` and leaves a proposal, like a blocked run.
+
 ---
 
 ## 7. Memory

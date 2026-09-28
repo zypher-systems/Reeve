@@ -24,6 +24,7 @@ pub mod snapshots;
 pub mod spend;
 pub mod sudo;
 pub mod tools;
+pub mod txn;
 pub mod undo;
 
 pub use error::{Error, Result};

@@ -2,6 +2,25 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-27: Fixes prove they worked, or are rolled back
+- **Decision:**
+  - A fix is a transaction. `change_begin` declares the goal and checks before anything changes; tagged changes follow; `change_commit` runs the checks.
+  - If any check fails, Reeve undoes the tagged changes newest first. Each undo gets its own receipt, approved by `txn:<id>`.
+  - Checks come from a fixed set Reeve runs itself: unit active, journal quiet since the last change, disk below a threshold, or a T0 command (no sudo) with optional expected text.
+  - A transaction still open at the end of a turn is committed then, and the model is told the result.
+  - In standing orders, a rollback ends the run `rolled_back` and leaves a proposal, which is worth a popup.
+- **Chosen vs rejected:**
+  - Rejected the model reporting whether its fix worked: only Reeve's own check results count.
+  - Rejected free-form check scripts: any check command must classify T0.
+  - Rejected rolling back with snapper: undoing a whole snapshot pair would revert unrelated changes. Snapper pairs stay a manual last resort.
+  - Rejected refusing changes that have no undo record: restarting a service through `shell` is normal. Instead the card warns, and the result lists what's still in place.
+- **Why:** Other tools report that they ran a command. Reeve should report that the problem is gone, and put things back when it isn't. The receipts, undo store, and unit/package undo already existed, so a rollback is just a series of undos.
+- **Where:** `reeve-core/src/txn.rs`, `agent.rs` (`begin`, `commit`, auto-commit in `turn_inner`), `receipts.rs` (`txn`), `tools/mod.rs` (`undo_receipt_by`, `shell_exec_status`, specs), `reeve-tui/src/cards.rs`, `reeve-observer/src/orders.rs`
+- **Residual risks:**
+  - The model chooses the checks, so a weak check (one that passes anyway) proves little. The approval card shows them so the owner can judge.
+  - A rollback of root changes needs the password again if the 5-minute remember has expired. In an order, a rollback needs exact sudoers lines like everything else, or it fails and is reported.
+  - Starting a new session with a transaction open drops it: its changes keep their receipts, but it's never checked.
+
 ### 2026-09-27: The observer reports; a popup means a fix is ready
 - **Decision:**
   - Findings no longer pop up. They wait in `/findings`, the header badge, and the agent's prompt.
