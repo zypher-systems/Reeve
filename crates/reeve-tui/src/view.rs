@@ -91,6 +91,11 @@ impl Tab {
         Tab::ALL[(i + Tab::ALL.len() - 1) % Tab::ALL.len()]
     }
 
+    /// Its function key, as the tab bar shows it: `F1`–`F6`.
+    pub fn fkey(self) -> String {
+        format!("F{}", self.key())
+    }
+
     /// From a number key.
     pub fn from_key(c: char) -> Option<Tab> {
         let i = c.to_digit(10)? as usize;

@@ -58,7 +58,7 @@ pub(crate) fn tab_positions(v: &View) -> Vec<(Tab, u16, u16)> {
     let mut x = " reeve   ".width();
     let mut out = Vec::new();
     for tab in Tab::ALL {
-        let mut w = format!("{} {}", tab.key(), tab.label()).width();
+        let mut w = format!("{} {}", tab.fkey(), tab.label()).width();
         if tab == Tab::Findings {
             w += findings_badge(v).map_or(0, |b| b.width());
         }
@@ -91,7 +91,7 @@ fn draw_tabs(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
         let on = tab == active;
         let start = width(&left);
         left.push(Span::styled(
-            format!("{} ", tab.key()),
+            format!("{} ", tab.fkey()),
             Style::default().fg(t.faint),
         ));
         left.push(Span::styled(
@@ -923,10 +923,10 @@ mod tests {
         let s = render(&busy_view(), 160, 44);
         for needle in [
             "reeve",
-            "1 ledger",
-            "2 findings",
-            "4 spend",
-            "6 system",
+            "F1 ledger",
+            "F2 findings",
+            "F4 spend",
+            "F6 system",
             "nexus · all quiet, except /boot 93%",
             "━━━━━━━━",
             "● you",
@@ -967,7 +967,7 @@ mod tests {
         let s = render(&v, 160, 44);
         let row0 = s.lines().next().unwrap();
         for tab in Tab::ALL {
-            let label = format!("{} {}", tab.key(), tab.label());
+            let label = format!("{} {}", tab.fkey(), tab.label());
             let col = row0.find(&label).unwrap();
             // Byte offset equals column here: the row before the labels is ASCII.
             assert_eq!(tab_at(&v, col as u16 + 2), Some(tab), "{label}");

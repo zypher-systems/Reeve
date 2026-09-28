@@ -191,8 +191,8 @@ a node on the spine, and what happened:
   Tool calls and checks cost nothing, and a drafter's draft is marked as its own budget.
 - **Approvals:** whatever needs you sits at the bottom, where you type.
 
-The other tabs are full screens: **2 findings** (list, detail, evidence, drafted fix), **3 orders**,
-**4 spend** (a statement by day, week, or month; by role and model; export to CSV), **5 memory**, and **6
+The other tabs are full screens: **F2 findings** (list, detail, evidence, drafted fix), **F3 orders**,
+**F4 spend** (a statement by day, week, or month; by role and model; export to CSV), **F5 memory**, and **F6
 system** (vitals over 24 h, 7 d, or 30 d, disks, what changed, headlines). The line above the tabs says how
 the machine is: "nexus · all quiet, except swap 99%".
 
@@ -200,7 +200,7 @@ the machine is: "nexus · all quiet, except swap 99%".
 | --- | --- |
 | `⏎` / `alt+⏎` | send / newline |
 | `ctrl+k` | search everything: drafted fixes, findings, orders, memory, receipts, tabs, commands. `tab` asks Reeve instead |
-| `tab` / `shift+tab` | next / previous screen. Also `F1`…`F6`, a click on the tab, or on a tab plain `1`…`6` (`alt+1`…`6` where the terminal doesn't keep it; Konsole does). `esc` goes back to the ledger |
+| `F1`…`F6` | the screens along the top, as labelled. Also `tab` / `shift+tab`, a click on the tab, or plain `1`…`6` on a tab. `esc` goes back to the ledger |
 | `$` | the spend statement (from an empty composer) |
 | `/` | commands: `/providers`, `/model`, `/findings`, `/orders`, `/spend`, `/system`, `/memory`, `/report`, `/privacy`, `/observer`, `/reflect`, `/receipts`, `/new`, `/yolo`, `/help`, `/quit` |
 | `^p` / `^r` | `/providers` / `/receipts` (`u` undo, `v` verify) |

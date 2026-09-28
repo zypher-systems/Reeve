@@ -365,14 +365,14 @@ fn shots() {
             group: "FIX",
             title: "Run the drafted fix: mailsync keeps crashing".into(),
             detail: "verified, in the ledger".into(),
-            place: "2 findings".into(),
+            place: "F2 findings".into(),
             action: crate::overlay::Action::None,
         },
         crate::overlay::Hit {
             group: "SEE",
             title: "mailsync keeps crashing".into(),
             detail: "warning · 103×".into(),
-            place: "2 findings".into(),
+            place: "F2 findings".into(),
             action: crate::overlay::Action::None,
         },
         crate::overlay::Hit {
@@ -386,14 +386,14 @@ fn shots() {
             group: "KNOW",
             title: "Mailspring crash loop".into(),
             detail: "runbook".into(),
-            place: "5 memory".into(),
+            place: "F5 memory".into(),
             action: crate::overlay::Action::None,
         },
         crate::overlay::Hit {
             group: "KEEP",
             title: "Standing order: restart mailsync when it loops".into(),
             detail: "off".into(),
-            place: "3 orders".into(),
+            place: "F3 orders".into(),
             action: crate::overlay::Action::None,
         },
     ];
@@ -472,7 +472,7 @@ fn everything_with_a_real_home() {
             group: "SEE",
             title: f.title.clone(),
             detail: f.severity.as_str().into(),
-            place: "2 findings".into(),
+            place: "F2 findings".into(),
             action: crate::overlay::Action::None,
         });
     }
@@ -481,7 +481,7 @@ fn everything_with_a_real_home() {
             group: "KNOW",
             title: n.title.clone(),
             detail: "fact".into(),
-            place: "5 memory".into(),
+            place: "F5 memory".into(),
             action: crate::overlay::Action::None,
         });
     }

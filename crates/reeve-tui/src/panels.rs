@@ -1559,8 +1559,8 @@ fn help(f: &mut Frame, r: Rect, t: &Theme) {
         ),
         ("ctrl+l", "redraw the screen (after the terminal clears it)"),
         (
-            "tab ⇧tab",
-            "next / previous screen (or F1…F6, or click a tab)",
+            "F1…F6",
+            "the screens along the top (or tab / ⇧tab, or click one)",
         ),
         ("$", "the spend statement (empty composer)"),
         ("^r", "receipts: undo, verify the chain"),

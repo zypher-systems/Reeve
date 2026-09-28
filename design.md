@@ -421,7 +421,7 @@ trait Distro {
 ## 11. The TUI: the ledger, and tabs for the rest
 
 ```
- reeve   1 ledger   2 findings 7   3 orders   4 spend   5 memory   6 system      nexus · all quiet, except swap 99%
+ reeve   F1 ledger   F2 findings 7   F3 orders   F4 spend   F5 memory   F6 system   nexus · all quiet, except swap 99%
 ─────────━━━━━━━━──────────────────────────────────────────────────────────────────────────────────────────────────
                                                                                                     cost    session
   09:34  ⚑ drafter  drafted a fix for mailsync keeps crashing                                    ($0.0276) own budget
@@ -447,8 +447,8 @@ trait Distro {
 - **Tabs** are the panels the old layout floated, drawn full-screen: findings (list and detail with
   evidence and the drafted fix), orders, spend (`ledger::statement`: one line per session and role, by
   day, week, or month, with by-role and by-model totals and CSV export), memory, and system (the report's
-  data for 24 h, 7 d, or 30 d, next to the live readout, what changed, and headlines). Switching: `tab` / `shift+tab`,
-  `F1…F6`, a click on the tab row, plain digits on a tab, or `alt+1…6` (Konsole keeps those for its own
+  data for 24 h, 7 d, or 30 d, next to the live readout, what changed, and headlines). Switching: `F1…F6` (as the tabs
+  are labelled), `tab` / `shift+tab`, a click on the tab row, plain digits on a tab, or `alt+1…6` (Konsole keeps those for its own
   tabs); `esc` returns to the ledger.
 - **⌃K** searches one index built when it opens: drafted fixes, open findings, orders, memory notes,
   recent receipts, tabs, and commands. The query itself is always the first row ("ask Reeve"). Each

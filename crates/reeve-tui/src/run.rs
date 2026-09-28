@@ -1553,7 +1553,7 @@ impl App {
                     group: "FIX",
                     title: format!("Run the drafted fix: {}", f.title),
                     detail: "verified, in the ledger".into(),
-                    place: "2 findings".into(),
+                    place: "F2 findings".into(),
                     action: Action::UseProposal(f.id.clone()),
                 });
             }
@@ -1561,7 +1561,7 @@ impl App {
                 group: "SEE",
                 title: f.title.clone(),
                 detail: format!("{} · {}×", f.severity.as_str(), f.count),
-                place: "2 findings".into(),
+                place: "F2 findings".into(),
                 action: Action::TabSelect(Tab::Findings, f.id.clone()),
             });
         }
@@ -1570,7 +1570,7 @@ impl App {
                 group: "KEEP",
                 title: format!("Standing order: {}", o.name),
                 detail: if o.enabled { "on".into() } else { "off".into() },
-                place: "3 orders".into(),
+                place: "F3 orders".into(),
                 action: Action::TabSelect(Tab::Orders, o.id.clone()),
             });
         }
@@ -1582,7 +1582,7 @@ impl App {
                 group: "KNOW",
                 title: n.title.clone(),
                 detail: n.layer.dir().trim_end_matches('s').to_string(),
-                place: "5 memory".into(),
+                place: "F5 memory".into(),
                 action: Action::TabSelect(Tab::Memory, n.id.clone()),
             });
         }
@@ -1600,7 +1600,7 @@ impl App {
                 group: "GO",
                 title: format!("{} tab", tab.label()),
                 detail: String::new(),
-                place: format!("{} {}", tab.key(), tab.label()),
+                place: format!("{} {}", tab.fkey(), tab.label()),
                 action: Action::Tab(tab),
             });
         }
