@@ -37,6 +37,7 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
             area.height.saturating_sub(4),
         ),
         Overlay::Observer(_) => (92, 26),
+        Overlay::Privacy(_) => (88, 28),
         Overlay::Orders(_) => (
             area.width.saturating_sub(6).min(130),
             area.height.saturating_sub(4),
@@ -55,6 +56,7 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::Memory(_) => "memory",
         Overlay::Findings(_) => "findings",
         Overlay::Observer(_) => "observer",
+        Overlay::Privacy(_) => "privacy",
         Overlay::Orders(_) => "standing orders",
         Overlay::Help => "help",
     };
@@ -77,6 +79,7 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::Memory(m) => memory(f, inner, m, t),
         Overlay::Findings(p) => findings(f, inner, p, t),
         Overlay::Observer(o) => observer(f, inner, o, t),
+        Overlay::Privacy(p) => privacy(f, inner, p, t),
         Overlay::Orders(o) => orders(f, inner, o, t),
         Overlay::Help => help(f, inner, t),
     }
@@ -1065,6 +1068,152 @@ fn orders(f: &mut Frame, r: Rect, p: &crate::overlay::OrdersPanel, t: &Theme) {
         ],
         t,
     ));
+    f.render_widget(Paragraph::new(lines), r);
+}
+
+fn privacy(f: &mut Frame, r: Rect, p: &crate::overlay::PrivacyPanel, t: &Theme) {
+    use reeve_core::privacy::Level;
+    let w = r.width as usize;
+    let mut lines = Vec::new();
+    let key = |k: &str| {
+        Span::styled(
+            format!(" {k} "),
+            Style::default().fg(t.brass).add_modifier(Modifier::BOLD),
+        )
+    };
+    let level_line = |k: &str, label: &str, value: &str, about: &str| {
+        let lvl = Level::parse(value);
+        let c = match lvl {
+            Level::Off => t.warn,
+            Level::Standard => t.teal,
+            Level::Strict => t.good,
+        };
+        Line::from(vec![
+            key(k),
+            Span::styled(pad(label, 13), t.muted()),
+            Span::styled(
+                pad(lvl.as_str(), 10),
+                Style::default().fg(c).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(truncate(about, w.saturating_sub(27)), t.ghost()),
+        ])
+    };
+    lines.push(Line::from(Span::styled(
+        truncate(
+            "Before anything leaves this machine, Reeve swaps these for placeholders, and back here.",
+            w,
+        ),
+        t.ghost(),
+    )));
+    lines.push(Line::raw(""));
+    if p.local {
+        lines.push(Line::from(Span::styled(
+            "  This connection is local: nothing leaves the machine, so nothing is masked.",
+            Style::default().fg(t.good),
+        )));
+    }
+    lines.push(level_line(
+        "l",
+        "chat",
+        &p.cfg.level,
+        "standard: secrets, emails, public IPs, user and host names",
+    ));
+    lines.push(level_line(
+        "b",
+        "background",
+        &p.cfg.background,
+        "the drafter and standing orders; strict adds private IPs, MACs, UUIDs",
+    ));
+    lines.push(Line::raw(""));
+    let toggle = |k: &str, on: bool, label: &str, about: &str| {
+        Line::from(vec![
+            key(k),
+            Span::styled(
+                if on { "● " } else { "○ " },
+                Style::default().fg(if on { t.good } else { t.dim }),
+            ),
+            Span::styled(pad(label, 25), Style::default().fg(t.fg)),
+            Span::styled(truncate(about, w.saturating_sub(32)), t.ghost()),
+        ])
+    };
+    lines.push(Line::from(vec![
+        Span::styled("OpenRouter routing", t.accent()),
+        Span::styled(
+            if p.openrouter {
+                ""
+            } else {
+                "   (not the connection in use)"
+            },
+            t.ghost(),
+        ),
+    ]));
+    lines.push(toggle(
+        "t",
+        p.cfg.no_training,
+        "no training on prompts",
+        "only providers that don't store or train on them",
+    ));
+    lines.push(toggle(
+        "z",
+        p.cfg.zdr,
+        "zero data retention",
+        "only ZDR endpoints (fewer models)",
+    ));
+    if !p.cfg.terms.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("   your terms  ", t.muted()),
+            Span::styled(
+                truncate(&p.cfg.terms.join(", "), w.saturating_sub(15)),
+                Style::default().fg(t.fg),
+            ),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    let entries = p
+        .state
+        .as_ref()
+        .map(|s| s.entries.as_slice())
+        .unwrap_or(&[]);
+    lines.push(Line::from(vec![
+        Span::styled("Masked this session  ", t.accent()),
+        Span::styled(format!("{}", entries.len()), Style::default().fg(t.fg)),
+    ]));
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  nothing yet: the list fills as values turn up in what Reeve sends",
+            t.ghost(),
+        )));
+    }
+    let room = (r.height as usize).saturating_sub(lines.len() + 3);
+    let start = p.scroll.min(entries.len().saturating_sub(room.max(1)));
+    for e in entries.iter().skip(start).take(room) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                pad(&format!("  {}", e.placeholder), 14),
+                Style::default().fg(t.code),
+            ),
+            Span::styled(pad(e.kind.label(), 13), t.ghost()),
+            Span::styled(truncate(&e.preview(), w.saturating_sub(28)), t.muted()),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    match &p.note {
+        Some(Ok(n)) => lines.push(Line::from(Span::styled(
+            n.clone(),
+            Style::default().fg(t.good),
+        ))),
+        Some(Err(e)) => lines.push(Line::from(Span::styled(
+            e.clone(),
+            Style::default().fg(t.bad),
+        ))),
+        None => lines.push(Line::from(Span::styled(
+            truncate(
+                "Pattern matching, not a guarantee. Add your own terms in config.toml [privacy].",
+                w,
+            ),
+            t.ghost(),
+        ))),
+    }
     f.render_widget(Paragraph::new(lines), r);
 }
 

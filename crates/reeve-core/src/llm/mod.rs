@@ -114,6 +114,17 @@ pub struct CompletionRequest {
     /// Reasoning effort (`low`, `medium`, `high`), sent to OpenRouter only.
     /// `None` sends nothing, and then some models reason without limit.
     pub reasoning: Option<String>,
+    /// Where OpenRouter may send it. Other providers ignore it.
+    pub route: Option<Route>,
+}
+
+/// OpenRouter provider routing for privacy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Route {
+    /// Only providers that don't store or train on prompts.
+    pub no_training: bool,
+    /// Only zero-data-retention endpoints.
+    pub zdr: bool,
 }
 
 /// An entry from `GET /models`.
@@ -220,6 +231,7 @@ pub struct ReplayProvider {
     turns: Mutex<VecDeque<Vec<StreamDelta>>>,
     models: Vec<ModelInfo>,
     repeat_last: bool,
+    seen: std::sync::Arc<Mutex<Vec<CompletionRequest>>>,
 }
 
 impl ReplayProvider {
@@ -229,6 +241,7 @@ impl ReplayProvider {
             turns: Mutex::new(VecDeque::from([deltas])),
             models: Vec::new(),
             repeat_last: true,
+            seen: Default::default(),
         }
     }
 
@@ -243,13 +256,22 @@ impl ReplayProvider {
             turns: Mutex::new(VecDeque::from(turns)),
             models: Vec::new(),
             repeat_last: false,
+            seen: Default::default(),
         }
+    }
+
+    /// Every request it was sent, as sent (tests check what left).
+    pub fn requests(&self) -> std::sync::Arc<Mutex<Vec<CompletionRequest>>> {
+        self.seen.clone()
     }
 }
 
 #[async_trait]
 impl Provider for ReplayProvider {
-    async fn stream(&self, _req: CompletionRequest) -> Result<DeltaStream> {
+    async fn stream(&self, req: CompletionRequest) -> Result<DeltaStream> {
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.push(req);
+        }
         let mut q = self.turns.lock().expect("replay mutex");
         let deltas = if self.repeat_last && q.len() == 1 {
             q.front().cloned().unwrap_or_default()
@@ -331,6 +353,7 @@ mod tests {
                 tools: vec![],
                 max_tokens: None,
                 reasoning: None,
+                route: None,
             })
             .await
             .unwrap();

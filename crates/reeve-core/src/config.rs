@@ -36,6 +36,8 @@ pub struct Config {
     pub memory: MemoryConfig,
     /// The background observer (`reeved`).
     pub observer: ObserverConfig,
+    /// What the model gets to see, and where OpenRouter may send it.
+    pub privacy: PrivacyConfig,
     /// TUI presentation.
     pub ui: UiConfig,
 }
@@ -53,6 +55,7 @@ impl Default for Config {
             snapshots: SnapshotConfig::default(),
             memory: MemoryConfig::default(),
             observer: ObserverConfig::default(),
+            privacy: PrivacyConfig::default(),
             ui: UiConfig::default(),
         }
     }
@@ -166,6 +169,36 @@ impl Default for MemoryConfig {
         Self {
             survey: true,
             auto_reflect: true,
+        }
+    }
+}
+
+/// `[privacy]`: masking before anything leaves the machine, and OpenRouter
+/// routing. Local connections are never masked (nothing leaves).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrivacyConfig {
+    /// Masking in chat: `off`, `standard`, or `strict`.
+    pub level: String,
+    /// Masking for the drafter and standing orders (nobody is watching).
+    pub background: String,
+    /// OpenRouter: only providers that don't store or train on prompts
+    /// (`provider.data_collection = "deny"`).
+    pub no_training: bool,
+    /// OpenRouter: only zero-data-retention endpoints (`provider.zdr`).
+    pub zdr: bool,
+    /// More words to mask everywhere: a company, a project, a name.
+    pub terms: Vec<String>,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            level: "standard".into(),
+            background: "strict".into(),
+            no_training: true,
+            zdr: false,
+            terms: Vec::new(),
         }
     }
 }

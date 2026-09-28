@@ -15,6 +15,7 @@ pub mod llm;
 pub mod memory;
 pub mod orders;
 pub mod policy;
+pub mod privacy;
 pub mod receipts;
 pub mod report;
 pub mod root;

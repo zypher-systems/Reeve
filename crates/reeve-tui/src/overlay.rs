@@ -39,6 +39,10 @@ pub const COMMANDS: &[Command] = &[
         about: "reeved service and the drafter's budget",
     },
     Command {
+        name: "/privacy",
+        about: "what the model sees; OpenRouter routing",
+    },
+    Command {
         name: "/memory",
         about: "what Reeve knows: facts, runbooks, preferences",
     },
@@ -157,6 +161,8 @@ pub enum Action {
         /// Model id.
         model: String,
     },
+    /// Save privacy settings.
+    SavePrivacy(reeve_core::config::PrivacyConfig),
     /// Reflect on this session now.
     Reflect,
     /// Save a new connection.
@@ -191,6 +197,8 @@ pub enum Overlay {
     Observer(ObserverPanel),
     /// `/orders`.
     Orders(OrdersPanel),
+    /// `/privacy`.
+    Privacy(PrivacyPanel),
     /// `/help`.
     Help,
 }
@@ -212,6 +220,7 @@ impl Overlay {
             Self::Findings(f) => f.on_key(k),
             Self::Observer(o) => o.on_key(k),
             Self::Orders(o) => o.on_key(k),
+            Self::Privacy(p) => p.on_key(k),
             Self::Help => Action::Close,
         }
     }
@@ -1234,5 +1243,50 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+}
+
+// ── /privacy ────────────────────────────────────────────────────────────────
+
+/// The `/privacy` panel: masking levels, OpenRouter routing, and what's
+/// been masked this session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrivacyPanel {
+    /// Settings being edited.
+    pub cfg: reeve_core::config::PrivacyConfig,
+    /// This session's masking.
+    pub state: Option<reeve_core::agent::PrivacyState>,
+    /// The connection is local (never masked).
+    pub local: bool,
+    /// The connection is OpenRouter (routing applies).
+    pub openrouter: bool,
+    /// First row of the masked list shown.
+    pub scroll: usize,
+    /// Last result.
+    pub note: Option<Result<String, String>>,
+}
+
+impl PrivacyPanel {
+    fn on_key(&mut self, k: KeyEvent) -> Action {
+        use reeve_core::privacy::Level;
+        let c = &mut self.cfg;
+        match k.code {
+            KeyCode::Char('l') => c.level = Level::parse(&c.level).next().as_str().into(),
+            KeyCode::Char('b') => {
+                c.background = Level::parse(&c.background).next().as_str().into();
+            }
+            KeyCode::Char('t') => c.no_training = !c.no_training,
+            KeyCode::Char('z') => c.zdr = !c.zdr,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.scroll += 1;
+                return Action::None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.scroll = self.scroll.saturating_sub(1);
+                return Action::None;
+            }
+            _ => return Action::None,
+        }
+        Action::SavePrivacy(self.cfg.clone())
     }
 }

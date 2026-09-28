@@ -616,6 +616,7 @@ impl App {
                 view.overlays.push(Overlay::Findings(p));
             }
             "/observer" => self.open_observer(view),
+            "/privacy" => self.open_privacy(view),
             "/orders" => {
                 let orders = reeve_core::orders::Orders::new(&self.home);
                 let seeded = orders.seed_examples().unwrap_or(0);
@@ -910,6 +911,16 @@ impl App {
             Action::UninstallDaemon => {
                 let r = reeve_observer::service::uninstall();
                 self.observer_note(view, r);
+            }
+            Action::SavePrivacy(p) => {
+                self.edit_settings(view, |s| s.privacy = Some(p));
+                // The agent picks it up for its next request; the masked
+                // table is kept, so earlier placeholders still restore.
+                self.connect(view);
+                if let Some(Overlay::Privacy(panel)) = view.overlays.last_mut() {
+                    panel.cfg = self.cfg.privacy.clone();
+                    panel.note = Some(Ok("saved; applies from the next request".into()));
+                }
             }
             Action::SaveDrafter(d) => {
                 let on = d.enabled;
@@ -1282,6 +1293,19 @@ impl App {
                 _ => {}
             }
         }
+    }
+
+    fn open_privacy(&self, view: &mut View) {
+        let conn = self.cfg.connections.get(&self.cfg.default_connection);
+        view.overlays
+            .push(Overlay::Privacy(crate::overlay::PrivacyPanel {
+                cfg: self.cfg.privacy.clone(),
+                state: view.privacy.clone(),
+                local: conn.is_some_and(|c| c.is_local()),
+                openrouter: conn.is_some_and(|c| c.kind == "openrouter"),
+                scroll: 0,
+                note: None,
+            }));
     }
 
     fn open_observer(&self, view: &mut View) {

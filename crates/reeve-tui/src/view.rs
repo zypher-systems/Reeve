@@ -164,6 +164,8 @@ pub struct View {
     pub findings: Vec<reeve_core::findings::Finding>,
     /// Drafter spend today and its cap, when it's on.
     pub drafter: Option<(f64, f64)>,
+    /// What's masked from the model this session.
+    pub privacy: Option<reeve_core::agent::PrivacyState>,
 }
 
 /// Spending caps, USD; 0 is off.
@@ -216,6 +218,7 @@ impl View {
             observer_alive: false,
             findings: Vec::new(),
             drafter: None,
+            privacy: None,
         }
     }
 
@@ -331,6 +334,7 @@ impl View {
             }
             AgentEvent::Models(_) => {}
             AgentEvent::Receipt(r) => self.add_receipt(*r),
+            AgentEvent::Privacy(p) => self.privacy = Some(*p),
             AgentEvent::ToolStarted {
                 id,
                 tool,

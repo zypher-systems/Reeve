@@ -64,6 +64,13 @@ per_draft_usd = 0.05
 max_drafts_per_day = 10
 min_severity = "warning"
 
+[privacy]                               # masked before anything leaves; restored locally
+level = "standard"                      # chat: off | standard | strict
+background = "strict"                   # the drafter and standing orders
+no_training = true                      # OpenRouter: only providers that don't store or train on prompts
+zdr = false                             # OpenRouter: only zero-data-retention endpoints
+terms = []                              # more words to mask, e.g. ["Acme", "project-x"]
+
 [ui]
 theme = "brass"
 colors = "auto"                         # auto | truecolor | 256 | 16 ; NO_COLOR wins

@@ -149,6 +149,18 @@ the scope is receipted as `order:<id>`. Anything outside it is refused, and the 
 prints exact ones, and never wildcards. `reeve orders run <id>` runs one now, exactly as `reeved` would. Order
 files and Reeve's own config are floor-protected (T3), so the model can't give itself unattended powers.
 
+## Privacy
+
+Reeve reads your machine, so what it sends a model could include keys from dotfiles, email addresses, IPs, and your user and host names. Before anything leaves, Reeve swaps those for placeholders (`<secret1>`, `<email1>`, `<ip1>`, `<user>`, `<host>`), and swaps them back here before anything runs or is shown. The model can still say "restart the service on `<host>`", and the command that runs has the real name.
+
+- **Secrets go one way.** A `<secretN>` can only be written back into a file's content (an edit of a file that holds a key still works), never into a command. So an instruction hidden in a log can't have the model send your key anywhere.
+- **Levels:** `standard` in chat; `strict` for the drafter and standing orders, which also masks private IPs, MACs, and UUIDs. Add your own words (a company, a project) with `[privacy] terms`.
+- **OpenRouter routing:** by default, requests go only to providers that don't store or train on prompts (`data_collection = "deny"`). Zero data retention (`zdr`) is one key away. If no provider for your model qualifies, Reeve says so.
+- **`/privacy`** shows all of it, and every value masked this session. Secrets are shown only by their ends.
+- Local models are never masked, since nothing leaves.
+
+It's pattern matching, not a guarantee: a secret in a format Reeve doesn't recognize gets through.
+
 ## Keys in the TUI
 
 | key | does |

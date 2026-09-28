@@ -27,6 +27,9 @@ pub struct Settings {
     /// The drafter, as set in `/observer`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drafter: Option<crate::config::DrafterConfig>,
+    /// Privacy, as set in `/privacy`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub privacy: Option<crate::config::PrivacyConfig>,
 }
 
 impl Settings {
@@ -84,6 +87,9 @@ impl Settings {
             if let Some(c) = cfg.connections.get_mut(name) {
                 c.default_model = Some(model.clone());
             }
+        }
+        if let Some(p) = &self.privacy {
+            cfg.privacy = p.clone();
         }
         if let Some(d) = &self.drafter {
             cfg.observer.drafter = d.clone();

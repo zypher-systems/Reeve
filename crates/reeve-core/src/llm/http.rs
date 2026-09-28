@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use crate::config::ConnectionConfig;
 use crate::error::{Error, Result};
-use crate::llm::{CompletionRequest, DeltaStream, ModelInfo, Provider, StreamDelta, ToolSpec};
+use crate::llm::{
+    CompletionRequest, DeltaStream, ModelInfo, Provider, Route, StreamDelta, ToolSpec,
+};
 
 /// How long to wait for the connection itself.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -167,8 +169,44 @@ impl HttpProvider {
                 body["reasoning"] = json!({ "effort": effort });
             }
             body["usage"] = json!({ "include": true });
+            if let Some(r) = req.route {
+                let mut provider = json!({});
+                if r.no_training {
+                    provider["data_collection"] = json!("deny");
+                }
+                if r.zdr {
+                    provider["zdr"] = json!(true);
+                }
+                if provider.as_object().is_some_and(|o| !o.is_empty()) {
+                    body["provider"] = provider;
+                }
+            }
         }
         body
+    }
+
+    /// An error body, with a hint when OpenRouter found no provider that
+    /// meets the privacy routing.
+    fn explain(&self, status: reqwest::StatusCode, text: &str, route: Option<Route>) -> String {
+        let privacy = route.is_some_and(|r| r.no_training || r.zdr);
+        let t = text.to_ascii_lowercase();
+        if self.kind == "openrouter"
+            && privacy
+            && (t.contains("data policy") || t.contains("no endpoints found") || t.contains("zdr"))
+        {
+            return format!(
+                "OpenRouter has no provider for this model that meets your privacy routing \
+                 (no training on prompts{}). Pick another model, or change it in /privacy. \
+                 (http {status}: {})",
+                if route.is_some_and(|r| r.zdr) {
+                    ", zero data retention"
+                } else {
+                    ""
+                },
+                text.trim()
+            );
+        }
+        format!("http {status}: {text}")
     }
 }
 
@@ -216,7 +254,7 @@ impl Provider for HttpProvider {
             }
             let wait = retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            last = format!("http {status}: {text}");
+            last = self.explain(status, &text, req.route);
             if !is_retryable_status(status.as_u16()) || attempt == MAX_RETRIES {
                 return Err(Error::Provider(last));
             }
@@ -640,6 +678,7 @@ mod tests {
             tools: vec![],
             max_tokens: Some(16),
             reasoning: Some("medium".into()),
+            route: None,
         };
         let or = crate::config::connection_template("openrouter").unwrap();
         let body = HttpProvider::new(&or, "k".into()).body(&req);
@@ -651,6 +690,50 @@ mod tests {
     }
 
     #[test]
+    fn privacy_routing_goes_to_openrouter_only() {
+        let req = CompletionRequest {
+            model: "deepseek/deepseek-v4-pro".into(),
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            max_tokens: None,
+            reasoning: None,
+            route: Some(Route {
+                no_training: true,
+                zdr: true,
+            }),
+        };
+        let or = HttpProvider::new(
+            &crate::config::connection_template("openrouter").unwrap(),
+            "k".into(),
+        );
+        let body = or.body(&req);
+        assert_eq!(body["provider"]["data_collection"], "deny");
+        assert_eq!(body["provider"]["zdr"], true);
+        let off = CompletionRequest {
+            route: Some(Route::default()),
+            ..req.clone()
+        };
+        assert!(or.body(&off).get("provider").is_none());
+        let openai = crate::config::connection_template("openai").unwrap();
+        assert!(
+            HttpProvider::new(&openai, "k".into())
+                .body(&req)
+                .get("provider")
+                .is_none()
+        );
+        let msg = or.explain(
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"error":{"message":"No endpoints found matching your data policy"}}"#,
+            req.route,
+        );
+        assert!(
+            msg.contains("/privacy") && msg.contains("zero data retention"),
+            "{msg}"
+        );
+    }
+
+    #[test]
     fn claude_over_openrouter_is_marked_for_cache() {
         let req = CompletionRequest {
             model: "anthropic/claude-sonnet-4.6".into(),
@@ -659,6 +742,7 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             reasoning: None,
+            route: None,
         };
         let wire = chat_body(&req).to_string();
         assert_eq!(wire.matches("cache_control").count(), 2, "{wire}");

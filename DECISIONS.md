@@ -2,6 +2,26 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-27: Mask before it leaves; ask OpenRouter not to keep it
+- **Decision:**
+  - A `MaskingProvider` wraps every provider. It replaces secrets, emails, public IPs, and the user and host names with stable placeholders (`standard`, the chat default). `strict` also masks private IPs, MACs, and UUIDs, and is the default for the drafter and standing orders.
+  - Placeholders are restored locally in streamed text and in tool call arguments.
+  - A secret's placeholder is restored only into `fs_write`/`fs_edit` content. Anywhere else, and for any placeholder Reeve never issued, the call is refused before it runs.
+  - Secrets stay masked in the chat.
+  - OpenRouter requests carry `provider.data_collection = "deny"` (on by default) and optionally `provider.zdr = true`. A no-provider error points to `/privacy`.
+  - Local connections are never masked.
+- **Chosen vs rejected:**
+  - Rejected "use a local model" as the privacy answer: the owner uses OpenRouter and wants it to stay the default.
+  - Rejected removing secrets outright: the model then can't edit a file that holds one, and it would guess at what was there.
+  - Rejected restoring secrets anywhere: that makes masking a way to use a key without seeing it, which is exactly what a prompt injection in a log would want.
+  - Rejected a model-based filter: it would cost money, and it would still have to see the data.
+- **Why:** An operator agent reads dotfiles, journals, and configs. Masking locally means a leak needs a secret format Reeve doesn't know. Routing means what does leave isn't used for training.
+- **Where:** `reeve-core/src/privacy.rs`, `agent.rs` (wrapping, `restore_call`, `PRIVACY_NOTE`), `llm/http.rs` (`provider` routing, `explain`), `config.rs` (`PrivacyConfig`), `reeve-tui` (`/privacy`, the header count)
+- **Residual risks:**
+  - It's pattern matching: an unknown token format, or a password in free text, gets through.
+  - A file that really contains the text `<user>` or `<ip1>` would have it replaced when written back.
+  - `no_training` defaults on, so a model whose only providers collect data stops working until it's turned off in `/privacy`. The error says so.
+
 ### 2026-09-27: Fixes prove they worked, or are rolled back
 - **Decision:**
   - A fix is a transaction. `change_begin` declares the goal and checks before anything changes; tagged changes follow; `change_commit` runs the checks.

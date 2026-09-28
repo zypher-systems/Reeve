@@ -110,6 +110,18 @@ fn draw_header(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
             Style::default().fg(c).add_modifier(Modifier::BOLD),
         ));
     }
+    if let Some(p) = v.privacy.as_ref() {
+        use reeve_core::privacy::Level;
+        if p.level != Level::Off {
+            right.push(Span::styled("▣ ", Style::default().fg(t.teal)));
+            right.push(Span::styled(
+                format!("{} masked  ", p.entries.len()),
+                t.muted(),
+            ));
+        } else if !p.entries.is_empty() {
+            right.push(Span::styled("▣ unmasked  ", Style::default().fg(t.warn)));
+        }
+    }
     right.push(Span::styled("observer ", t.ghost()));
     if v.observer_alive {
         right.push(Span::styled("● live  ", Style::default().fg(t.good)));

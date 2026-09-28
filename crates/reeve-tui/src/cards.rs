@@ -523,6 +523,47 @@ mod tests {
     }
 
     #[test]
+    fn privacy_shows_what_was_masked_without_showing_secrets() {
+        use reeve_core::privacy::{Level, Masker};
+        let mut m = Masker::with(
+            Level::Standard,
+            Some("zypher".into()),
+            Some("nexus".into()),
+            &[],
+        );
+        m.mask("OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz0123 from 203.0.113.9");
+        let state = reeve_core::agent::PrivacyState {
+            level: m.level(),
+            entries: m.entries().to_vec(),
+        };
+        let mut v = View::new(HostInfo::default());
+        v.apply(AgentEvent::Privacy(Box::new(state.clone())));
+        v.overlays.push(crate::overlay::Overlay::Privacy(
+            crate::overlay::PrivacyPanel {
+                cfg: reeve_core::config::PrivacyConfig::default(),
+                state: Some(state),
+                local: false,
+                openrouter: true,
+                scroll: 0,
+                note: None,
+            },
+        ));
+        let s = render(&v);
+        for needle in [
+            "4 masked",
+            "<secret1>",
+            "sk-p…23",
+            "<ip1>",
+            "203.0.113.9",
+            "no training on prompts",
+            "strict",
+        ] {
+            assert!(s.contains(needle), "missing {needle:?}\n{s}");
+        }
+        assert!(!s.contains("abcdefghijklmnop"), "{s}");
+    }
+
+    #[test]
     fn the_floor_asks_for_a_typed_yes() {
         let mut v = View::new(HostInfo::default());
         v.push(Speaker::User, "x");

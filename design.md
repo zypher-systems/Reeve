@@ -94,6 +94,30 @@ Reeve needs.
   variable (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`). The `keys/` directory is on the policy's
   never-read list (§5.4).
 
+### 3.1 Privacy
+
+Reeve reads the machine, so what it sends a model can include keys in dotfiles, email addresses,
+IPs, and names. Two layers keep that down, without asking anyone to run a local model:
+
+1. **Masking, locally.** `MaskingProvider` wraps every provider. It swaps values for stable
+   placeholders in each outgoing request (system prompt, messages, earlier tool calls), then
+   swaps them back in the streamed text and in tool call arguments before anything runs or is
+   shown.
+   - **standard** (chat): secrets (known token formats, `*_TOKEN=`/`password:` values, URL
+     credentials, private keys), emails, public IPs, the user and host names, and `[privacy] terms`.
+   - **strict** (the drafter and standing orders): also private IPs, MACs, and UUIDs.
+
+   A placeholder always means the same value within a session. A secret's placeholder is written
+   back only into file content (`fs_write`, `fs_edit`). Anywhere else, and for a placeholder
+   Reeve never handed out, the call is refused and never runs. Secrets stay masked in the chat
+   too. Local connections are never masked.
+2. **Routing, at OpenRouter.** Requests carry `provider.data_collection = "deny"`
+   (`no_training`, on by default) and optionally `provider.zdr = true`. When no provider
+   qualifies, the error says so and points to `/privacy`.
+
+`/privacy` shows the levels, the routing, and every value masked this session (secrets only by
+their ends). The header shows how many.
+
 ---
 
 ## 4. Tools

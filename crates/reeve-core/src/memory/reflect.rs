@@ -202,6 +202,7 @@ pub async fn reflect(
         tools: Vec::new(),
         max_tokens: Some(2000),
         reasoning: Some("low".into()),
+        route: None,
     };
     let mut stream = provider.stream(req).await?;
     let mut text = String::new();
