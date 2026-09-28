@@ -4,7 +4,7 @@ members = ["crates/reeve-core", "crates/reeve-observer", "crates/reeve-tui", "cr
 default-members = ["crates/reeve-cli"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
