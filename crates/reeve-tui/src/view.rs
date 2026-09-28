@@ -252,6 +252,8 @@ pub struct View {
     pub privacy: Option<reeve_core::agent::PrivacyState>,
     /// The agent's session id (the ledger's).
     pub session_id: String,
+    /// Repaint the whole screen on the next frame (ctrl+l).
+    pub redraw: bool,
 }
 
 /// Spending caps, USD; 0 is off.
@@ -307,6 +309,7 @@ impl View {
             drafter: None,
             privacy: None,
             session_id: String::new(),
+            redraw: false,
         }
     }
 

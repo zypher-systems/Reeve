@@ -305,7 +305,7 @@ fn draw_status(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
     ));
     right.push(Span::styled(" screens  ", Style::default().fg(t.dim)));
     right.push(Span::styled(
-        "⌃K",
+        "ctrl+k",
         Style::default().fg(t.brass).add_modifier(Modifier::BOLD),
     ));
     right.push(Span::styled(" everything ", Style::default().fg(t.dim)));
@@ -934,7 +934,7 @@ mod tests {
             "• remove",
             "LEDGER",
             "TIERED",
-            "⌃K everything",
+            "ctrl+k everything",
         ] {
             assert!(s.contains(needle), "missing {needle:?}\n{s}");
         }

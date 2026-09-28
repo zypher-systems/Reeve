@@ -121,7 +121,7 @@ fn everything(f: &mut Frame, area: Rect, e: &crate::overlay::EverythingPanel, t:
     let iw = inner.width as usize;
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            " ⌃K ",
+            " ctrl+k ",
             Style::default().fg(t.brass).add_modifier(Modifier::BOLD),
         ),
         Span::styled(e.query.clone(), Style::default().fg(t.fg)),
@@ -1554,10 +1554,14 @@ fn help(f: &mut Frame, r: Rect, t: &Theme) {
         ("⏎ / alt+⏎", "send / newline"),
         ("esc", "stop the turn · back to the ledger"),
         (
-            "⌃K",
+            "ctrl+k",
             "search everything: fixes, findings, orders, memory, receipts",
         ),
-        ("tab ⇧tab", "next / previous screen (or F1…F6, or click a tab)"),
+        ("ctrl+l", "redraw the screen (after the terminal clears it)"),
+        (
+            "tab ⇧tab",
+            "next / previous screen (or F1…F6, or click a tab)",
+        ),
         ("$", "the spend statement (empty composer)"),
         ("^r", "receipts: undo, verify the chain"),
         ("^y", "YOLO on/off"),

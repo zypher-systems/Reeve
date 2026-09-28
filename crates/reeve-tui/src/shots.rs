@@ -455,3 +455,60 @@ fn shots() {
         )));
     write(&dir, "5-memory", html(&v, &t, "memory"));
 }
+
+#[test]
+#[ignore = "needs REEVE_SHOTS_HOME"]
+fn everything_with_a_real_home() {
+    let Some(home) = std::env::var_os("REEVE_SHOTS_HOME").map(PathBuf::from) else {
+        return;
+    };
+    let mut items = Vec::new();
+    for f in reeve_core::findings::FindingStore::new(&home)
+        .list()
+        .iter()
+        .filter(|f| f.is_live())
+    {
+        items.push(crate::overlay::Hit {
+            group: "SEE",
+            title: f.title.clone(),
+            detail: f.severity.as_str().into(),
+            place: "2 findings".into(),
+            action: crate::overlay::Action::None,
+        });
+    }
+    for n in reeve_core::memory::Memory::new(&home).all() {
+        items.push(crate::overlay::Hit {
+            group: "KNOW",
+            title: n.title.clone(),
+            detail: "fact".into(),
+            place: "5 memory".into(),
+            action: crate::overlay::Action::None,
+        });
+    }
+    for r in reeve_core::receipts::ReceiptBook::new(&home).recent(40) {
+        items.push(crate::overlay::Hit {
+            group: "GO",
+            title: format!("#{} {} {}", r.seq, r.tool, r.target()),
+            detail: r.outcome.summary.clone(),
+            place: "receipts".into(),
+            action: crate::overlay::Action::None,
+        });
+    }
+    for (w, h) in [(150u16, 40u16), (120, 30), (80, 24), (200, 60)] {
+        let mut v = base();
+        v.overlays
+            .push(Overlay::Everything(crate::overlay::EverythingPanel {
+                query: String::new(),
+                items: items.clone(),
+                sel: 0,
+            }));
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| crate::draw::draw(f, &v, &Theme::ink()))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect();
+        println!("{w}x{h}:\n{text}");
+    }
+}

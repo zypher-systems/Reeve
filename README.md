@@ -199,7 +199,7 @@ the machine is: "nexus · all quiet, except swap 99%".
 | key | does |
 | --- | --- |
 | `⏎` / `alt+⏎` | send / newline |
-| `⌃K` | search everything: drafted fixes, findings, orders, memory, receipts, tabs, commands. `tab` asks Reeve instead |
+| `ctrl+k` | search everything: drafted fixes, findings, orders, memory, receipts, tabs, commands. `tab` asks Reeve instead |
 | `tab` / `shift+tab` | next / previous screen. Also `F1`…`F6`, a click on the tab, or on a tab plain `1`…`6` (`alt+1`…`6` where the terminal doesn't keep it; Konsole does). `esc` goes back to the ledger |
 | `$` | the spend statement (from an empty composer) |
 | `/` | commands: `/providers`, `/model`, `/findings`, `/orders`, `/spend`, `/system`, `/memory`, `/report`, `/privacy`, `/observer`, `/reflect`, `/receipts`, `/new`, `/yolo`, `/help`, `/quit` |
@@ -209,6 +209,7 @@ the machine is: "nexus · all quiet, except swap 99%".
 | `^y` | YOLO: auto-approve T0–T2 actions. The safeguard floor still asks. |
 | `pgup` / `pgdn`, mouse wheel | scroll |
 | `^c` | stop, clear, then quit |
+| `ctrl+l` | redraw the screen (if the terminal cleared it: Konsole's ctrl+shift+k does) |
 
 The default theme is **ink** (warm charcoal). `[ui] theme = "brass"` brings back the original navy and brass.
 

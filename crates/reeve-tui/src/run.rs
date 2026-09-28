@@ -297,6 +297,9 @@ fn event_loop(
             // A few small files: cheap enough every second.
             app.poll_observer(view);
         }
+        if std::mem::take(&mut view.redraw) {
+            term.clear()?;
+        }
         term.draw(|f| draw(f, view, theme))?;
         view.frame = view.frame.wrapping_add(1);
 
@@ -506,6 +509,12 @@ impl App {
             return;
         }
         let alt = k.modifiers.contains(KeyModifiers::ALT);
+        // ctrl+l: repaint everything, e.g. after the terminal was cleared
+        // under us (Konsole's ctrl+shift+k does that).
+        if ctrl && matches!(k.code, KeyCode::Char('l' | 'L')) {
+            view.redraw = true;
+            return;
+        }
         // Secrets are being typed: those panels get every key.
         let typing_secret = matches!(
             view.overlays.last(),
@@ -513,7 +522,7 @@ impl App {
         );
         if !typing_secret {
             // ⌃K: search everything, from anywhere.
-            if ctrl && k.code == KeyCode::Char('k') {
+            if ctrl && matches!(k.code, KeyCode::Char('k' | 'K')) {
                 if matches!(view.overlays.last(), Some(Overlay::Everything(_))) {
                     view.overlays.pop();
                 } else if view.approval.is_none() {
