@@ -2,6 +2,24 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-28: The TUI is a ledger with tabs
+- **Decision:**
+  - The conversation is drawn as a ledger: one timeline where tool calls branch off, verified changes are brackets, reeved's and the drafter's activity appear as rows, and each model round carries its cost and the session's running total.
+  - The panels that floated (findings, orders, memory) and two new screens (spend, system) are full-screen tabs.
+  - ⌃K searches everything.
+  - Inside a verified change, `a` approves the rest of the change.
+  - The default theme is ink; brass stays available.
+- **Chosen vs rejected:**
+  - From five directions (cockpit, ledger, quiet, workbench, briefing; see the design canvas), the owner chose ledger + quiet + workbench: the ledger's timeline and cost column, quiet chrome with ⌃K, and the workbench's tabs.
+  - Rejected keeping the right rail: its live numbers now live in the status sentence and the system tab, and the ledger gets the width.
+  - Rejected a text-less "reeve" row for rounds that only call tools: that round's cost goes on its first tool call.
+  - Rejected letting "yes to the rest of the change" cover T3, or outlive the change: it ends at `change_commit`, and T3 still asks every time.
+- **Why:** Cost, receipts, and verification were already there, but spread across a rail, popups, and the receipts panel. On one spine they read as a record of what happened and what it cost.
+- **Where:** `reeve-tui/src/ledger.rs`, `screens.rs`, `draw.rs` (tabs, status), `overlay.rs` (`Spend`, `System`, `Everything`), `view.rs` (`Tab`, `RoundCost`), `theme.rs` (`ink`), `reeve-core/src/ledger.rs` (`since`, `statement`), `agent.rs` (`Decision::AllowChange`)
+- **Residual risks:**
+  - The ledger shows this session only; earlier sessions are statement lines pointing to their `report.md`.
+  - Findings reach the ledger only when they're new since Reeve opened, so a finding that recurs stays in the findings tab.
+
 ### 2026-09-28: The state of the machine is drawn, not written by a model
 - **Decision:**
   - `reeve report` and `/report` render one HTML page locally from reeved's minute metrics, findings, receipts, the spend ledger, memory, and package/unit/`/etc` drift.

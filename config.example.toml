@@ -72,7 +72,7 @@ zdr = false                             # OpenRouter: only zero-data-retention e
 terms = []                              # more words to mask, e.g. ["Acme", "project-x"]
 
 [ui]
-theme = "brass"
+theme = "ink"                           # ink (the ledger) | brass (the original)
 colors = "auto"                         # auto | truecolor | 256 | 16 ; NO_COLOR wins
 mouse = true
 animate = true

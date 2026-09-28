@@ -178,19 +178,39 @@ Reeve reads your machine, so what it sends a model could include keys from dotfi
 
 It's pattern matching, not a guarantee: a secret in a format Reeve doesn't recognize gets through.
 
-## Keys in the TUI
+## The TUI
+
+Home is the **ledger**: the conversation and everything Reeve did, on one timeline. Each row has a time,
+a node on the spine, and what happened:
+- **Tool calls** branch off Reeve's replies, with their result and receipt number.
+- **A verified change** is a bracket around its steps (┏ … ┗), closing on "verified · kept" or "failed ·
+  rolled back", with each undo inside it.
+- **Background activity:** what reeved found and what the drafter drafted while you were here show up in
+  the ledger too.
+- **Money:** on a wide screen, two columns show each model round's cost and the session's running total.
+  Tool calls and checks cost nothing, and a drafter's draft is marked as its own budget.
+- **Approvals:** whatever needs you sits at the bottom, where you type.
+
+The other tabs are full screens: **2 findings** (list, detail, evidence, drafted fix), **3 orders**,
+**4 spend** (a statement by day, week, or month; by role and model; export to CSV), **5 memory**, and **6
+system** (vitals over 24 h, 7 d, or 30 d, disks, what changed, headlines). The line above the tabs says how
+the machine is: "nexus · all quiet, except swap 99%".
 
 | key | does |
 | --- | --- |
 | `⏎` / `alt+⏎` | send / newline |
-| `/` | commands: `/providers`, `/model`, `/orders`, `/findings`, `/observer`, `/memory`, `/reflect`, `/receipts`, `/new`, `/yolo`, `/help`, `/quit` |
+| `⌃K` | search everything: drafted fixes, findings, orders, memory, receipts, tabs, commands. `tab` asks Reeve instead |
+| `alt+1`…`alt+6` | tabs; on a tab, plain `1`…`6`; `esc` goes back to the ledger |
+| `$` | the spend statement (from an empty composer) |
+| `/` | commands: `/providers`, `/model`, `/findings`, `/orders`, `/spend`, `/system`, `/memory`, `/report`, `/privacy`, `/observer`, `/reflect`, `/receipts`, `/new`, `/yolo`, `/help`, `/quit` |
 | `^p` / `^r` | `/providers` / `/receipts` (`u` undo, `v` verify) |
-| `⏎` `a` `n` | on an approval card: approve, allow for session, deny |
+| `⏎` `a` `n` | on an approval: approve, allow for the session (in a verified change: yes to the rest of the change), deny |
 | `esc` | stop the running turn, or clear the composer |
 | `^y` | YOLO: auto-approve T0–T2 actions. The safeguard floor still asks. |
-| `^b` | on narrow terminals, switch between the chat and the live rail |
 | `pgup` / `pgdn`, mouse wheel | scroll |
 | `^c` | stop, clear, then quit |
+
+The default theme is **ink** (warm charcoal). `[ui] theme = "brass"` brings back the original navy and brass.
 
 ## Layout
 

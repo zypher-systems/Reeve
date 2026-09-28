@@ -39,6 +39,14 @@ pub const COMMANDS: &[Command] = &[
         about: "reeved service and the drafter's budget",
     },
     Command {
+        name: "/spend",
+        about: "what it cost: day, week, month, by session and role",
+    },
+    Command {
+        name: "/system",
+        about: "vitals over time, disks, what changed",
+    },
+    Command {
         name: "/report",
         about: "the state of the machine as a page: charts, drift, findings",
     },
@@ -169,6 +177,22 @@ pub enum Action {
     SavePrivacy(reeve_core::config::PrivacyConfig),
     /// Reflect on this session now.
     Reflect,
+    /// Go to a tab.
+    Tab(crate::view::Tab),
+    /// Go to a tab and select this item there (finding, order, or memory id).
+    TabSelect(crate::view::Tab, String),
+    /// Send this to Reeve, in the ledger.
+    Ask(String),
+    /// Run a slash command.
+    Command(&'static str),
+    /// Open the receipts panel on this receipt.
+    ShowReceipt(u64),
+    /// Draw the system tab's data for this many days.
+    SystemReport(u32),
+    /// Open the full report page in the browser.
+    OpenReport,
+    /// Write the statement shown to a CSV file.
+    ExportSpend,
     /// Save a new connection.
     AddConnection {
         /// Name (also the key's file name).
@@ -201,6 +225,12 @@ pub enum Overlay {
     Observer(ObserverPanel),
     /// `/orders`.
     Orders(OrdersPanel),
+    /// The spend tab.
+    Spend(SpendPanel),
+    /// The system tab.
+    System(SystemPanel),
+    /// ⌃K: search everything.
+    Everything(EverythingPanel),
     /// `/privacy`.
     Privacy(PrivacyPanel),
     /// `/help`.
@@ -224,8 +254,24 @@ impl Overlay {
             Self::Findings(f) => f.on_key(k),
             Self::Observer(o) => o.on_key(k),
             Self::Orders(o) => o.on_key(k),
+            Self::Spend(s) => s.on_key(k),
+            Self::System(s) => s.on_key(k),
+            Self::Everything(e) => e.on_key(k),
             Self::Privacy(p) => p.on_key(k),
             Self::Help => Action::Close,
+        }
+    }
+
+    /// The tab this panel is, when it's one of the screens along the top.
+    pub fn tab(&self) -> Option<crate::view::Tab> {
+        use crate::view::Tab;
+        match self {
+            Self::Findings(_) => Some(Tab::Findings),
+            Self::Orders(_) => Some(Tab::Orders),
+            Self::Spend(_) => Some(Tab::Spend),
+            Self::Memory(_) => Some(Tab::Memory),
+            Self::System(_) => Some(Tab::System),
+            _ => None,
         }
     }
 
@@ -233,6 +279,10 @@ impl Overlay {
     pub fn on_paste(&mut self, s: &str) {
         let line = s.trim();
         match self {
+            Self::Everything(e) => {
+                e.query.push_str(line);
+                e.sel = 0;
+            }
             Self::Key(e) => e.secret.push_str(line),
             Self::Password(p) => p.secret.push_str(line),
             Self::Models(m) => {
@@ -676,6 +726,18 @@ impl MemoryPanel {
     }
 
     /// Re-read from disk, keeping the tab and (where possible) the selection.
+    /// Show the note with this id, on its layer's tab.
+    pub fn select(&mut self, id: &str) {
+        for (tab, notes) in self.notes.iter().enumerate() {
+            if let Some(i) = notes.iter().position(|n| n.id == id) {
+                self.tab = tab;
+                self.sel = i;
+                return;
+            }
+        }
+    }
+
+    /// Reload every layer, keeping the selection.
     pub fn reload(&mut self, mem: &reeve_core::memory::Memory) {
         let keep = self.selected().map(|n| n.id.clone());
         self.notes = reeve_core::memory::Layer::ALL
@@ -1341,5 +1403,240 @@ impl PrivacyPanel {
             _ => return Action::None,
         }
         Action::SavePrivacy(self.cfg.clone())
+    }
+}
+
+// ── spend ───────────────────────────────────────────────────────────────────
+
+/// How far back the statement looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpendRange {
+    /// Since local midnight.
+    #[default]
+    Day,
+    /// The last 7 days.
+    Week,
+    /// This calendar month.
+    Month,
+}
+
+impl SpendRange {
+    /// The start of the range.
+    pub fn since(self) -> chrono::DateTime<chrono::Utc> {
+        use chrono::{Datelike, Local, TimeZone};
+        let now = Local::now();
+        let midnight = |d: chrono::NaiveDate| {
+            Local
+                .from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap_or_default())
+                .earliest()
+                .map_or_else(chrono::Utc::now, |t| t.with_timezone(&chrono::Utc))
+        };
+        match self {
+            Self::Day => midnight(now.date_naive()),
+            Self::Week => midnight(now.date_naive() - chrono::Duration::days(6)),
+            Self::Month => midnight(now.date_naive().with_day(1).unwrap_or(now.date_naive())),
+        }
+    }
+
+    /// For the tab bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+        }
+    }
+
+    fn step(self, up: bool) -> Self {
+        match (self, up) {
+            (Self::Day, true) => Self::Week,
+            (Self::Week, true) | (Self::Month, true) => Self::Month,
+            (Self::Month, false) => Self::Week,
+            (Self::Week, false) | (Self::Day, false) => Self::Day,
+        }
+    }
+}
+
+/// The spend tab: a statement of what each session and draft cost.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SpendPanel {
+    /// Range shown.
+    pub range: SpendRange,
+    /// Records in the range, oldest first.
+    pub records: Vec<reeve_core::ledger::SpendRecord>,
+    /// Records this month (for the month total and by-model).
+    pub month: Vec<reeve_core::ledger::SpendRecord>,
+    /// Selected statement line.
+    pub sel: usize,
+    /// The session in the ledger now.
+    pub current: String,
+    /// Daily, session, monthly caps and the warning level.
+    pub caps: (f64, f64, f64, f64),
+    /// The drafter's daily budget, when it's on.
+    pub drafter_cap: Option<f64>,
+    /// Last action's result.
+    pub note: Option<Result<String, String>>,
+}
+
+impl SpendPanel {
+    /// The statement lines for the range.
+    pub fn lines(&self) -> Vec<reeve_core::ledger::StatementLine> {
+        reeve_core::ledger::statement(&self.records)
+    }
+
+    fn on_key(&mut self, k: KeyEvent) -> Action {
+        let n = self.lines().len();
+        match k.code {
+            KeyCode::Left => return self.set_range(self.range.step(false)),
+            KeyCode::Right => return self.set_range(self.range.step(true)),
+            KeyCode::Up => self.sel = self.sel.saturating_sub(1),
+            KeyCode::Down => self.sel = (self.sel + 1).min(n.saturating_sub(1)),
+            KeyCode::Char('e') => return Action::ExportSpend,
+            KeyCode::Enter => {
+                let lines = self.lines();
+                if let Some(l) = lines.get(self.sel) {
+                    if l.session == self.current {
+                        return Action::Tab(crate::view::Tab::Ledger);
+                    }
+                    self.note = Some(Ok(format!(
+                        "an earlier session: its report is in ~/.reeve/sessions/{}/report.md",
+                        l.session
+                    )));
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn set_range(&mut self, r: SpendRange) -> Action {
+        if r != self.range {
+            self.range = r;
+            self.sel = usize::MAX;
+            return Action::Tab(crate::view::Tab::Spend);
+        }
+        Action::None
+    }
+}
+
+// ── system ──────────────────────────────────────────────────────────────────
+
+/// The system tab: vitals over time, disks, and what changed.
+#[derive(Debug, Clone, Default)]
+pub struct SystemPanel {
+    /// Window, in days.
+    pub days: u32,
+    /// The gathered page data (it takes a second or two).
+    pub report: Option<Box<reeve_observer::report::Report>>,
+    /// Being gathered.
+    pub loading: bool,
+}
+
+impl PartialEq for SystemPanel {
+    fn eq(&self, other: &Self) -> bool {
+        self.days == other.days
+            && self.loading == other.loading
+            && self.report.is_some() == other.report.is_some()
+    }
+}
+
+impl SystemPanel {
+    fn on_key(&mut self, k: KeyEvent) -> Action {
+        let steps = [1, 7, 30];
+        let i = steps.iter().position(|d| *d == self.days).unwrap_or(0);
+        match k.code {
+            KeyCode::Left if i > 0 => Action::SystemReport(steps[i - 1]),
+            KeyCode::Right if i + 1 < steps.len() => Action::SystemReport(steps[i + 1]),
+            KeyCode::Char('r') => Action::OpenReport,
+            _ => Action::None,
+        }
+    }
+}
+
+// ── ⌃K ──────────────────────────────────────────────────────────────────────
+
+/// One thing ⌃K can find.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hit {
+    /// `FIX`, `SEE`, `GO`, `KNOW`, `KEEP`, `DO`.
+    pub group: &'static str,
+    /// What it is.
+    pub title: String,
+    /// A little more, dim.
+    pub detail: String,
+    /// Where it lives, flush right.
+    pub place: String,
+    /// What ⏎ does.
+    pub action: Action,
+}
+
+/// ⌃K: one search over chat, findings, fixes, orders, memory, receipts, and commands.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EverythingPanel {
+    /// Typed so far.
+    pub query: String,
+    /// Everything there is to find.
+    pub items: Vec<Hit>,
+    /// Selected row of the matches.
+    pub sel: usize,
+}
+
+impl EverythingPanel {
+    /// Matches for the query, an "ask" first when something is typed.
+    pub fn matches(&self) -> Vec<Hit> {
+        let q = self.query.trim();
+        let words: Vec<String> = q.split_whitespace().map(str::to_lowercase).collect();
+        let mut out = Vec::new();
+        if !q.is_empty() {
+            out.push(Hit {
+                group: "ASK",
+                title: q.to_string(),
+                detail: String::new(),
+                place: "to the ledger".into(),
+                action: Action::Ask(q.to_string()),
+            });
+        }
+        out.extend(
+            self.items
+                .iter()
+                .filter(|h| {
+                    let hay = format!("{} {} {}", h.title, h.detail, h.place).to_lowercase();
+                    words.iter().all(|w| hay.contains(w.as_str()))
+                })
+                .cloned(),
+        );
+        out
+    }
+
+    fn on_key(&mut self, k: KeyEvent) -> Action {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let hits = self.matches();
+        match k.code {
+            KeyCode::Up => self.sel = self.sel.saturating_sub(1),
+            KeyCode::Down => self.sel = (self.sel + 1).min(hits.len().saturating_sub(1)),
+            KeyCode::Enter => {
+                if let Some(h) = hits.get(self.sel.min(hits.len().saturating_sub(1))) {
+                    return h.action.clone();
+                }
+            }
+            KeyCode::Tab if !self.query.trim().is_empty() => {
+                return Action::Ask(self.query.trim().to_string());
+            }
+            KeyCode::Backspace => {
+                self.query.pop();
+                self.sel = 0;
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.query.clear();
+                self.sel = 0;
+            }
+            KeyCode::Char('k') if ctrl => return Action::Close,
+            KeyCode::Char(c) if !ctrl => {
+                self.query.push(c);
+                self.sel = 0;
+            }
+            _ => {}
+        }
+        Action::None
     }
 }

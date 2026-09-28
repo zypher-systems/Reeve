@@ -1,5 +1,7 @@
-//! Colors. The default is **Brass**: a deep navy ground with brass and amber
-//! accents and a teal secondary. Everything degrades to 256, 16, or no color.
+//! Colors. The default is **Ink**: a warm charcoal ground with ink-colored
+//! text, ochre for what needs you, moss for what's verified, and vermilion
+//! for what failed. **Brass** (deep navy, brass and amber) is the original.
+//! Everything degrades to 256, 16, or no color.
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -118,6 +120,33 @@ impl Theme {
         }
     }
 
+    /// Ink, at full color: the ledger's palette.
+    pub fn ink() -> Self {
+        Self {
+            mode: ColorMode::TrueColor,
+            bg: rgb(0x151412),
+            panel: rgb(0x1b1916),
+            input: rgb(0x221f1a),
+            border: rgb(0x2d2a25),
+            border_hot: rgb(0x4a3d22),
+            fg: rgb(0xe9e4d8),
+            dim: rgb(0x8b8578),
+            faint: rgb(0x4f4a42),
+            brass: rgb(0xd9a441),
+            amber: rgb(0xe6b457),
+            copper: rgb(0xd98a5c),
+            teal: rgb(0x7fc4b8),
+            user: rgb(0x8fa7c4),
+            good: rgb(0xa3ba7c),
+            warn: rgb(0xd9a441),
+            bad: rgb(0xe5553b),
+            code: rgb(0xe0c89a),
+            code_bg: rgb(0x1d1b18),
+            add_bg: rgb(0x1f2a1a),
+            del_bg: rgb(0x2e1b17),
+        }
+    }
+
     /// The terminal's own 16 colors.
     pub fn ansi16() -> Self {
         Self {
@@ -146,9 +175,13 @@ impl Theme {
     }
 
     /// By name, reduced for the terminal.
-    pub fn named(_name: &str, mode: ColorMode) -> Self {
+    pub fn named(name: &str, mode: ColorMode) -> Self {
         // Custom themes from ~/.reeve/themes/ arrive with M6's theme import.
-        Self::brass().degrade(mode)
+        match name {
+            "brass" => Self::brass(),
+            _ => Self::ink(),
+        }
+        .degrade(mode)
     }
 
     /// Reduce to what the terminal can show.

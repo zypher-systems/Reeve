@@ -418,60 +418,53 @@ trait Distro {
 
 ---
 
-## 11. The TUI: mission control
+## 11. The TUI: the ledger, and tabs for the rest
 
 ```
-╭─ ◆ REEVE ── nexus · Fedora 44 · up 3d 4h ──────── observer ● · 2 findings · TIERED ─╮
-│ ╭─ conversation ─────────────────────────────╮ ╭─ system ─────────────────────────╮ │
-│ │ you   clean up old kernels                 │ │ cpu  ▁▂▅▃▂▁▂▃  18%  load 0.92     │ │
-│ │                                            │ │ mem  ███████░░░░  9.1 / 32 G      │ │
-│ │ ◆ reeve  Three kernels you no longer boot: │ │ /    ████████░░  71%  +0.4G/day   │ │
-│ │   ╭─ T2 · pkg_remove ─────────────────╮    │ │ /boot ██████████ 94%  ⚠           │ │
-│ │   │ kernel-6.9.4  kernel-6.9.7  …     │    │ │ temp 52°C   net ↓1.2M ↑80K        │ │
-│ │   │ frees 612 MB · snapshot first     │    │ ╰──────────────────────────────────╯ │
-│ │   │  ⏎ approve   e explain   esc deny │    │ ╭─ spend ──────────────────────────╮ │
-│ │   ╰───────────────────────────────────╯    │ │ session $0.0142  ▁▂▂▅  12.4k tok  │ │
-│ │                                            │ │ today   $0.31 / $2.00  ██░░░░░    │ │
-│ │                                            │ │ month   $4.12 / $30   █░░░░░░     │ │
-│ │                                            │ │ cache 61% · sonnet-5 · openrouter │ │
-│ │                                            │ ╰──────────────────────────────────╯ │
-│ │                                            │ ╭─ receipts ───────────────────────╮ │
-│ │                                            │ │ #1041 ✓ T0 logs_query  kernel     │ │
-│ │                                            │ │ #1040 ✓ T1 fs_edit ~/.bashrc  ↶   │ │
-│ │                                            │ │ #1039 ✓ T2 svc restart bluetooth  │ │
-│ ╰────────────────────────────────────────────╯ ╰──────────────────────────────────╯ │
-│ ❯ _                                                                                 │
-╰─ ⏎ send · ^y yolo · F2 receipts · F3 memory · F4 findings · F5 orders · F6 spend ───╯
+ reeve   1 ledger   2 findings 7   3 orders   4 spend   5 memory   6 system      nexus · all quiet, except swap 99%
+─────────━━━━━━━━──────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                    cost    session
+  09:34  ⚑ drafter  drafted a fix for mailsync keeps crashing                                    ($0.0276) own budget
+  10:38  ● you  mailsync keeps crashing and swap is full. what's going on?
+  10:39  ◆ reeve  7.9k in · 153 out                                                                $0.0120   $0.0120
+         ├ ✓  T0  coredumpctl list mailsync --since -24h ·········· 102 dumps  #81                    —
+         └ ✓  T0  memory_search "mailsync crash" ·················· 1 runbook  #83                    —
+  10:41  ┏ verified change  stop mailsync crashing
+         ┃ checks  unit active · no coredumps for 20 min
+         ┃ ✓  T1  stop app-com.getmailspring… (user) ················ stopped  #85 ↶                 —
+         ┗ verified · kept  stop mailsync crashing (2 checks passed)  #88                   $0.0048   $0.0180
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  › Ask Reeve about this machine · / commands · ⌃K everything
+ LEDGER  session $0.0180 · today $0.31                          grok-4.7 · ▣ 5 masked · reeved ●  TIERED   ⌃K everything
 ```
 
-**Layout:**
-- Wide (≥ 140 columns): conversation on the left (~60%), and a stacked right rail with System,
-  Spend, and Receipts.
-- Medium: the rail narrows to compact rows.
-- Narrow (< 100 columns): the rail becomes a single tabbed panel (`^b` cycles).
+- **The ledger** (home) is the transcript drawn as a timeline: time, spine, row, and on wide screens
+  (≥ 96 columns) a cost and a running-total column. A model round's cost goes on its reply, or, for a
+  round that only called tools, on its first tool call. Tool calls branch (├ └). `change_begin` and
+  `change_commit` draw a bracket (┏ ┃ ┗), and a rollback's undos go inside it. New findings (reeved) and
+  new drafts (the drafter) seen while Reeve is open appear as ⚑ rows; a draft's cost is its own budget,
+  not the session's. The approval card, or the composer, is at the bottom.
+- **Tabs** are the panels the old layout floated, drawn full-screen: findings (list and detail with
+  evidence and the drafted fix), orders, spend (`ledger::statement`: one line per session and role, by
+  day, week, or month, with by-role and by-model totals and CSV export), memory, and system (the report's
+  data for 24 h, 7 d, or 30 d, next to the live readout, what changed, and headlines). Switching: `alt+1…6`,
+  or plain digits on a tab; `esc` returns to the ledger.
+- **⌃K** searches one index built when it opens: drafted fixes, open findings, orders, memory notes,
+  recent receipts, tabs, and commands. The query itself is always the first row ("ask Reeve"). Each
+  result says where it goes.
+- **The status sentence** (top right) says how the machine is in a few words. The status line (bottom)
+  shows the tab's mode and context, the model, masking, reeved, and the approval mode.
+- **Approvals inside a verified change:** `a` approves the rest of the change (`Decision::AllowChange`):
+  T1/T2 steps until `change_commit`, never T3, recorded as `change-rule`. The checks and rollback still
+  guard the whole change. Outside a change, `a` is "allow this exact action for the session" (T1).
 
-**Views:**
-- F1 Chat
-- F2 Receipts (browse, filter, verify, `u` undo)
-- F3 Memory (four layers, "new" markers, edit, delete)
-- F4 Findings and Proposals
-- F5 Standing orders
-- F6 Spend (by day, model, and session; caps)
+**Themes:** the default **ink** is warm charcoal, with ochre for what needs you, moss for what's
+verified, and vermilion for what failed. **brass** (deep navy, brass and amber) is the original.
+Everything degrades to 256, 16, or mono colors, with `NO_COLOR` respected. Custom themes from
+`~/.reeve/themes/` come later.
 
-**Look.** It should not read like another dull coding harness:
-- Truecolor gradient header and accents.
-- Rounded borders.
-- Braille sparklines and charts (ratatui `Chart`/`Sparkline`).
-- Smooth gauge fills and an animated "thinking" glyph.
-- Risk tiers carry color throughout: T0 slate, T1 teal, T2 amber, T3 red.
-- The approval card pulses gently while it waits.
-- YOLO recolors the frame and puts a badge in the header.
-
-**Themes:**
-- Default **"Brass"**: deep navy ground, brass and amber accents, teal secondary.
-- Themes are TOML in `~/.reeve/themes/`. A partial theme fills in from the default, as in Ryter.
-- Later: import the palette from the active Omarchy, pywal, or KDE color scheme.
-- Everything degrades to 256, 16, or mono colors, with `NO_COLOR` respected.
+**Looking at it without a terminal:** `REEVE_SHOTS=<dir> cargo test -p reeve-tui shots -- --ignored`
+renders each screen to colored HTML (with `REEVE_SHOTS_HOME`, from a real Reeve home, read-only).
 
 ---
 

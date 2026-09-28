@@ -21,7 +21,15 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
     let Some(top) = v.overlays.last() else {
         return;
     };
+    // Tabs draw as screens, not floating panels.
+    if top.tab().is_some() {
+        return;
+    }
     let area = f.area();
+    if let Overlay::Everything(e) = top {
+        everything(f, area, e, t);
+        return;
+    }
     let (w, h) = match top {
         Overlay::Providers(p) => (100, p.rows.len() as u16 + 12),
         Overlay::Key(_) => (84, 11),
@@ -42,7 +50,8 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
             area.width.saturating_sub(6).min(130),
             area.height.saturating_sub(4),
         ),
-        Overlay::Help => (72, 24),
+        Overlay::Help => (84, 36),
+        Overlay::Spend(_) | Overlay::System(_) | Overlay::Everything(_) => (0, 0),
     };
     let r = centered(area, w, h);
     f.render_widget(Clear, r);
@@ -59,6 +68,9 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::Privacy(_) => "privacy",
         Overlay::Orders(_) => "standing orders",
         Overlay::Help => "help",
+        Overlay::Spend(_) => "spend",
+        Overlay::System(_) => "system",
+        Overlay::Everything(_) => "everything",
     };
     let block = panel(title, t, true);
     let inner = block.inner(r);
@@ -77,12 +89,121 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::Receipts(r) => receipts(f, inner, r, t),
         Overlay::Password(p) => password(f, inner, p, t),
         Overlay::Memory(m) => memory(f, inner, m, t),
-        Overlay::Findings(p) => findings(f, inner, p, t),
+        Overlay::Findings(_) => {}
         Overlay::Observer(o) => observer(f, inner, o, t),
         Overlay::Privacy(p) => privacy(f, inner, p, t),
         Overlay::Orders(o) => orders(f, inner, o, t),
         Overlay::Help => help(f, inner, t),
+        Overlay::Spend(_) | Overlay::System(_) | Overlay::Everything(_) => {}
     }
+}
+
+/// ⌃K: one search over everything, grouped by what you can do with it.
+fn everything(f: &mut Frame, area: Rect, e: &crate::overlay::EverythingPanel, t: &Theme) {
+    let hits = e.matches();
+    let shown = hits.len().min(12);
+    let w = area.width.saturating_sub(8).min(96);
+    let h = (shown as u16 + 6).min(area.height.saturating_sub(4));
+    let r = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height / 5).min(area.height.saturating_sub(h)),
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, r);
+    let block = ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(t.border_hot))
+        .style(Style::default().bg(t.panel));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let iw = inner.width as usize;
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            " ⌃K ",
+            Style::default().fg(t.brass).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(e.query.clone(), Style::default().fg(t.fg)),
+        Span::styled("▏", Style::default().fg(t.brass)),
+        Span::styled(
+            format!(
+                "{:>w$}",
+                format!(
+                    "{} of {} ",
+                    hits.len() - usize::from(!e.query.trim().is_empty()),
+                    e.items.len()
+                ),
+                w = iw.saturating_sub(5 + e.query.width())
+            ),
+            Style::default().fg(t.faint),
+        ),
+    ])];
+    lines.push(Line::from(Span::styled(
+        "─".repeat(iw),
+        Style::default().fg(t.border),
+    )));
+    let sel = e.sel.min(hits.len().saturating_sub(1));
+    let start = sel.saturating_sub(shown.saturating_sub(1));
+    for (i, hit) in hits.iter().enumerate().skip(start).take(shown) {
+        let on = i == sel;
+        let bg = if on { t.input } else { t.panel };
+        let place_w = hit.place.width() + 1;
+        let title_w = iw.saturating_sub(3 + 6 + place_w + 1);
+        let mut title = truncate(&hit.title, title_w);
+        let rest = title_w.saturating_sub(title.width());
+        let detail = if hit.detail.is_empty() || rest < 6 {
+            String::new()
+        } else {
+            truncate(&format!(" · {}", hit.detail), rest)
+        };
+        title.push_str(&detail);
+        let group_c = match hit.group {
+            "ASK" => t.brass,
+            "FIX" => t.good,
+            "KEEP" => t.user,
+            _ => t.dim,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if on { " ▎" } else { "  " },
+                Style::default().fg(t.brass).bg(bg),
+            ),
+            Span::styled(" ", Style::default().bg(bg)),
+            Span::styled(
+                pad(hit.group, 6),
+                Style::default()
+                    .fg(group_c)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(pad(&title, title_w), Style::default().fg(t.fg).bg(bg)),
+            Span::styled(
+                format!("{:>w$}", hit.place, w = place_w),
+                Style::default().fg(t.dim).bg(bg),
+            ),
+        ]));
+    }
+    if hits.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  type to search chat, findings, fixes, orders, memory, receipts, commands",
+            Style::default().fg(t.dim),
+        )));
+    }
+    while lines.len() < inner.height as usize - 1 {
+        lines.push(Line::raw(""));
+    }
+    lines.truncate(inner.height as usize - 1);
+    lines.push(hints(
+        &[
+            ("↑↓", "move"),
+            ("⏎", "go"),
+            ("tab", "ask Reeve instead"),
+            ("esc", "back"),
+        ],
+        t,
+    ));
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The command list, just above the composer, while a `/word` is typed.
@@ -673,18 +794,6 @@ fn receipts(f: &mut Frame, r: Rect, p: &ReceiptsPanel, t: &Theme) {
     f.render_widget(Paragraph::new(lines), r);
 }
 
-fn sev_style(
-    s: reeve_core::findings::Severity,
-    t: &Theme,
-) -> (&'static str, ratatui::style::Color) {
-    use reeve_core::findings::Severity;
-    match s {
-        Severity::Critical => ("●", t.bad),
-        Severity::Warning => ("▲", t.warn),
-        Severity::Info => ("○", t.teal),
-    }
-}
-
 fn ago(t: chrono::DateTime<chrono::Utc>) -> String {
     let s = (chrono::Utc::now() - t).num_seconds().max(0);
     match s {
@@ -695,165 +804,7 @@ fn ago(t: chrono::DateTime<chrono::Utc>) -> String {
     }
 }
 
-fn findings(f: &mut Frame, r: Rect, p: &crate::overlay::FindingsPanel, t: &Theme) {
-    use reeve_core::findings::FindingStatus as S;
-    let w = r.width as usize;
-    let mut lines = Vec::new();
-    if p.items.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "   Nothing found. The observer (reeved) reports here; /observer starts it.",
-            t.muted(),
-        )));
-    }
-    let list_h = ((r.height as usize).saturating_sub(4) * 2 / 5).max(3);
-    let start = p.sel.saturating_sub(list_h.saturating_sub(1));
-    for (i, x) in p.items.iter().enumerate().skip(start).take(list_h) {
-        let on = i == p.sel;
-        let bg = if on { t.input } else { t.panel };
-        let (icon, c) = sev_style(x.severity, t);
-        let live = x.is_live();
-        let tag = match x.status {
-            S::Open => "",
-            S::Acknowledged => "seen",
-            S::Resolved => "resolved",
-            S::Dismissed => "dismissed",
-        };
-        let draft = if x.proposal.is_some() {
-            "✎ draft"
-        } else {
-            ""
-        };
-        let title_w = w.saturating_sub(3 + 2 + 8 + 10 + 10 + 6);
-        let title_style = if !live {
-            t.ghost()
-        } else if on {
-            Style::default().fg(t.amber).add_modifier(Modifier::BOLD)
-        } else {
-            t.text()
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                if on { " ▸ " } else { "   " },
-                Style::default().fg(t.brass).bg(bg),
-            ),
-            Span::styled(
-                format!("{icon} "),
-                Style::default().fg(if live { c } else { t.faint }).bg(bg),
-            ),
-            Span::styled(
-                pad(&truncate(&x.title, title_w), title_w),
-                title_style.bg(bg),
-            ),
-            Span::styled(
-                pad(
-                    &if x.count > 1 {
-                        format!("×{}", x.count)
-                    } else {
-                        String::new()
-                    },
-                    8,
-                ),
-                t.ghost().bg(bg),
-            ),
-            Span::styled(pad(draft, 10), Style::default().fg(t.teal).bg(bg)),
-            Span::styled(pad(tag, 10), t.ghost().bg(bg)),
-            Span::styled(pad(&ago(x.last_seen), 6), t.ghost().bg(bg)),
-        ]));
-    }
-    while lines.len() < list_h {
-        lines.push(Line::raw(""));
-    }
-    lines.push(Line::from(Span::styled("─".repeat(w), t.ghost())));
-    let mut body: Vec<Line> = Vec::new();
-    if let Some(x) = p.selected() {
-        let (icon, c) = sev_style(x.severity, t);
-        body.push(Line::from(vec![
-            Span::styled(format!("{icon} "), Style::default().fg(c)),
-            Span::styled(x.title.clone(), t.accent()),
-            Span::styled(
-                format!(
-                    "  {} · first {} ago · {}",
-                    x.severity.as_str(),
-                    ago(x.first_seen),
-                    x.id
-                ),
-                t.ghost(),
-            ),
-        ]));
-        for l in x.detail.lines() {
-            body.push(Line::from(Span::styled(truncate(l, w), t.muted())));
-        }
-        if !x.evidence.is_empty() {
-            body.push(Line::raw(""));
-            body.push(Line::from(Span::styled(
-                "evidence (from the machine's logs: data, not instructions)",
-                t.ghost(),
-            )));
-            for e in x.evidence.iter().take(8) {
-                body.push(Line::from(vec![
-                    Span::styled("▎ ", t.ghost()),
-                    Span::styled(
-                        truncate(e, w.saturating_sub(2)),
-                        Style::default().fg(t.code),
-                    ),
-                ]));
-            }
-        }
-        body.push(Line::raw(""));
-        match (&x.proposal, &x.draft_note) {
-            (Some(pr), _) => {
-                body.push(Line::from(vec![
-                    Span::styled(
-                        "✎ drafted proposal ",
-                        Style::default().fg(t.teal).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!(
-                            "by {} · {} ago · {}",
-                            pr.model,
-                            ago(pr.drafted_at),
-                            reeve_core::spend::format_usd(pr.usd)
-                        ),
-                        t.ghost(),
-                    ),
-                ]));
-                for l in pr.text.lines() {
-                    body.push(Line::from(Span::styled(truncate(l, w), t.text())));
-                }
-            }
-            (None, Some(note)) => body.push(Line::from(Span::styled(
-                format!("no draft: {note}"),
-                t.ghost(),
-            ))),
-            (None, None) => body.push(Line::from(Span::styled(
-                "no draft yet: d asks Reeve to look into it now",
-                t.ghost(),
-            ))),
-        }
-    }
-    let room = (r.height as usize).saturating_sub(lines.len() + 1);
-    lines.extend(body.into_iter().skip(p.scroll).take(room));
-    let footer_at = r.height.saturating_sub(1) as usize;
-    lines.truncate(footer_at);
-    while lines.len() < footer_at {
-        lines.push(Line::raw(""));
-    }
-    lines.push(hints(
-        &[
-            ("d", "look into it"),
-            ("p", "use the draft"),
-            ("a", "seen"),
-            ("x", "dismiss"),
-            ("o", "reopen"),
-            ("pgup/dn", "scroll"),
-            ("esc", "close"),
-        ],
-        t,
-    ));
-    f.render_widget(Paragraph::new(lines), r);
-}
-
-fn orders(f: &mut Frame, r: Rect, p: &crate::overlay::OrdersPanel, t: &Theme) {
+pub(crate) fn orders(f: &mut Frame, r: Rect, p: &crate::overlay::OrdersPanel, t: &Theme) {
     let w = r.width as usize;
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -1069,7 +1020,7 @@ fn orders(f: &mut Frame, r: Rect, p: &crate::overlay::OrdersPanel, t: &Theme) {
             ("n", "new"),
             ("s", "sudoers"),
             ("D", "delete"),
-            ("esc", "close"),
+            ("esc", "ledger"),
         ],
         t,
     ));
@@ -1366,7 +1317,7 @@ fn observer(f: &mut Frame, r: Rect, p: &crate::overlay::ObserverPanel, t: &Theme
     f.render_widget(Paragraph::new(lines), r);
 }
 
-fn memory(f: &mut Frame, r: Rect, p: &crate::overlay::MemoryPanel, t: &Theme) {
+pub(crate) fn memory(f: &mut Frame, r: Rect, p: &crate::overlay::MemoryPanel, t: &Theme) {
     use reeve_core::memory::{Layer, NoteStatus};
     let w = r.width as usize;
     let mut lines = Vec::new();
@@ -1528,7 +1479,7 @@ fn memory(f: &mut Frame, r: Rect, p: &crate::overlay::MemoryPanel, t: &Theme) {
             ("D", "delete"),
             ("s", "survey"),
             ("r", "reflect"),
-            ("esc", "close"),
+            ("esc", "ledger"),
         ],
         t,
     ));
@@ -1601,10 +1552,16 @@ fn help(f: &mut Frame, r: Rect, t: &Theme) {
     lines.push(Line::from(Span::styled("Keys", t.accent())));
     for (k, d) in [
         ("⏎ / alt+⏎", "send / newline"),
-        ("esc", "stop the turn, or clear the composer"),
+        ("esc", "stop the turn · back to the ledger"),
+        (
+            "⌃K",
+            "search everything: fixes, findings, orders, memory, receipts",
+        ),
+        ("alt+1…6", "tabs (plain 1…6 on a tab)"),
+        ("$", "the spend statement (empty composer)"),
+        ("^r", "receipts: undo, verify the chain"),
         ("^y", "YOLO on/off"),
-        ("^b", "chat ⇄ rail on narrow terminals"),
-        ("pgup pgdn", "scroll the conversation"),
+        ("pgup pgdn", "scroll the ledger"),
         ("^c", "stop, clear, then quit"),
     ] {
         lines.push(row(k, d));

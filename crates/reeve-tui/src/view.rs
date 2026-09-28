@@ -28,6 +28,73 @@ pub enum Speaker {
     Error,
     /// A tool call (see [`Entry::tool`]).
     Tool,
+    /// reeved noticed something while you were here.
+    Reeved,
+    /// The drafter wrote a proposed fix (its cost is its own budget's).
+    Drafter,
+}
+
+/// The screens along the top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    /// The conversation and everything Reeve did, as one timeline.
+    Ledger,
+    /// What reeved noticed.
+    Findings,
+    /// Standing orders.
+    Orders,
+    /// What it cost.
+    Spend,
+    /// What Reeve knows.
+    Memory,
+    /// Vitals, disks, and what changed.
+    System,
+}
+
+impl Tab {
+    /// In tab-bar order.
+    pub const ALL: [Tab; 6] = [
+        Tab::Ledger,
+        Tab::Findings,
+        Tab::Orders,
+        Tab::Spend,
+        Tab::Memory,
+        Tab::System,
+    ];
+
+    /// Lowercase name.
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Ledger => "ledger",
+            Tab::Findings => "findings",
+            Tab::Orders => "orders",
+            Tab::Spend => "spend",
+            Tab::Memory => "memory",
+            Tab::System => "system",
+        }
+    }
+
+    /// Its number key, 1–6.
+    pub fn key(self) -> char {
+        char::from(b'1' + Tab::ALL.iter().position(|t| *t == self).unwrap_or(0) as u8)
+    }
+
+    /// From a number key.
+    pub fn from_key(c: char) -> Option<Tab> {
+        let i = c.to_digit(10)? as usize;
+        Tab::ALL.get(i.checked_sub(1)?).copied()
+    }
+}
+
+/// What one model round cost, shown in the ledger's money column.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RoundCost {
+    /// USD, when known.
+    pub usd: Option<f64>,
+    /// Tokens.
+    pub usage: Usage,
+    /// The session's total after this round.
+    pub session: f64,
 }
 
 /// A tool call as the chat shows it.
@@ -80,6 +147,8 @@ pub struct Entry {
     pub transient: bool,
     /// For [`Speaker::Tool`].
     pub tool: Option<ToolView>,
+    /// For a Reeve round (or a drafter's draft): what it cost.
+    pub cost: Option<RoundCost>,
 }
 
 /// The last call's cost details, for the Spend panel.
@@ -108,14 +177,17 @@ pub struct View {
     pub thinking: String,
     /// The last entry is the in-flight reply, still receiving text.
     streaming: bool,
+    /// Entries from this index on belong to the round in flight.
+    round_start: usize,
+    /// A round's cost with no reply to carry it: it goes on the round's
+    /// first tool call.
+    pending_cost: Option<RoundCost>,
     /// Frames drawn (drives animation).
     pub frame: u64,
     /// Whether to animate.
     pub animate: bool,
     /// Auto-approve mode.
     pub yolo: bool,
-    /// Show the right rail on a narrow screen instead of the chat.
-    pub rail_only: bool,
     /// Machine identity.
     pub host: HostInfo,
     /// Latest readings.
@@ -166,6 +238,8 @@ pub struct View {
     pub drafter: Option<(f64, f64)>,
     /// What's masked from the model this session.
     pub privacy: Option<reeve_core::agent::PrivacyState>,
+    /// The agent's session id (the ledger's).
+    pub session_id: String,
 }
 
 /// Spending caps, USD; 0 is off.
@@ -190,10 +264,11 @@ impl View {
             busy: false,
             thinking: String::new(),
             streaming: false,
+            round_start: 0,
+            pending_cost: None,
             frame: 0,
             animate: true,
             yolo: false,
-            rail_only: false,
             host,
             snap: Snapshot::default(),
             cpu_hist: VecDeque::with_capacity(HISTORY),
@@ -219,6 +294,7 @@ impl View {
             findings: Vec::new(),
             drafter: None,
             privacy: None,
+            session_id: String::new(),
         }
     }
 
@@ -252,8 +328,17 @@ impl View {
             at: Local::now(),
             transient: false,
             tool: None,
+            cost: None,
         });
         self.scroll = 0;
+    }
+
+    /// The screen showing: the tab whose panel is at the bottom of the stack.
+    pub fn tab(&self) -> Tab {
+        self.overlays
+            .first()
+            .and_then(crate::overlay::Overlay::tab)
+            .unwrap_or(Tab::Ledger)
     }
 
     /// A setup note, dropped by [`View::drop_transient`].
@@ -290,6 +375,7 @@ impl View {
                 self.busy = true;
                 self.streaming = false;
                 self.thinking.clear();
+                self.round_start = self.entries.len();
             }
             AgentEvent::Text(t) => {
                 match self.entries.last_mut() {
@@ -311,8 +397,28 @@ impl View {
                 self.last = Some(LastCall { usd, usage });
                 self.session = session;
                 self.totals = *totals;
+                // The round's cost goes on its reply; a round that only
+                // called tools gets a reply entry of its own to carry it.
+                let cost = RoundCost {
+                    usd,
+                    usage,
+                    session: session.usd,
+                };
+                let start = self.round_start.min(self.entries.len());
+                match self.entries[start..]
+                    .iter_mut()
+                    .rev()
+                    .find(|e| e.who == Speaker::Reeve)
+                {
+                    Some(e) => e.cost = Some(cost),
+                    None => self.pending_cost = Some(cost),
+                }
+                // The next round's text starts its own entry.
+                self.streaming = false;
+                self.round_start = self.entries.len();
             }
             AgentEvent::TurnDone { truncated } => {
+                self.flush_cost();
                 self.busy = false;
                 self.thinking.clear();
                 self.approval = None;
@@ -325,6 +431,7 @@ impl View {
                 self.close_reply();
             }
             AgentEvent::Error(e) => {
+                self.flush_cost();
                 self.busy = false;
                 self.thinking.clear();
                 self.approval = None;
@@ -333,7 +440,48 @@ impl View {
                 self.push(Speaker::Error, e);
             }
             AgentEvent::Models(_) => {}
-            AgentEvent::Receipt(r) => self.add_receipt(*r),
+            AgentEvent::Receipt(r) => {
+                // A rollback's undo: a row in the ledger, inside its bracket.
+                if let Some(target) = r.undoes {
+                    // Inside the bracket: before the check that is still
+                    // running, which is what rolled it back.
+                    let at = self
+                        .entries
+                        .iter()
+                        .rposition(|e| {
+                            e.tool
+                                .as_ref()
+                                .is_some_and(|t| t.tool == "change_commit" && t.status.is_none())
+                        })
+                        .unwrap_or(self.entries.len());
+                    self.entries.insert(
+                        at,
+                        Entry {
+                            who: Speaker::Tool,
+                            text: String::new(),
+                            at: Local::now(),
+                            transient: false,
+                            tool: None,
+                            cost: None,
+                        },
+                    );
+                    if let Some(e) = self.entries.get_mut(at) {
+                        e.tool = Some(ToolView {
+                            id: format!("undo-{}", r.seq),
+                            tool: "undo".into(),
+                            tier: r.tier,
+                            summary: format!("undo #{target}"),
+                            status: Some(r.outcome.status),
+                            result: r.outcome.summary.clone(),
+                            diff: None,
+                            seq: Some(r.seq),
+                            undoable: false,
+                            approved_by: Some(r.approved_by.clone()),
+                        });
+                    }
+                }
+                self.add_receipt(*r);
+            }
             AgentEvent::Privacy(p) => self.privacy = Some(*p),
             AgentEvent::ToolStarted {
                 id,
@@ -342,7 +490,9 @@ impl View {
                 summary,
             } => {
                 self.push(Speaker::Tool, String::new());
+                let cost = self.pending_cost.take();
                 if let Some(e) = self.entries.last_mut() {
+                    e.cost = cost;
                     e.tool = Some(ToolView {
                         id,
                         tool,
@@ -389,6 +539,16 @@ impl View {
         }
     }
 
+    /// A cost that never found a tool call gets a reply row of its own.
+    fn flush_cost(&mut self) {
+        if let Some(cost) = self.pending_cost.take() {
+            self.push(Speaker::Reeve, String::new());
+            if let Some(e) = self.entries.last_mut() {
+                e.cost = Some(cost);
+            }
+        }
+    }
+
     /// Mark tool calls still shown as running (the turn ended under them).
     fn settle_running(&mut self, why: &str) {
         for t in self.entries.iter_mut().filter_map(|e| e.tool.as_mut()) {
@@ -405,7 +565,7 @@ impl View {
             && self
                 .entries
                 .last()
-                .is_some_and(|e| e.text.trim().is_empty())
+                .is_some_and(|e| e.text.trim().is_empty() && e.cost.is_none())
         {
             self.entries.pop();
         }

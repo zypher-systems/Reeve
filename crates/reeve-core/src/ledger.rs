@@ -110,6 +110,88 @@ pub fn totals(home: &Path, now: DateTime<Local>) -> Totals {
     t
 }
 
+/// Every record since `since`, oldest first (reads the months it spans).
+pub fn since(home: &Path, since: DateTime<Utc>) -> Vec<SpendRecord> {
+    let mut out = Vec::new();
+    let start = since.with_timezone(&Local);
+    let now = Local::now();
+    let (mut y, mut m) = (start.year(), start.month());
+    while (y, m) <= (now.year(), now.month()) {
+        if let Ok(text) = fs::read_to_string(month_path(home, y, m)) {
+            out.extend(
+                text.lines()
+                    .filter_map(|l| serde_json::from_str::<SpendRecord>(l).ok())
+                    .filter(|r| r.ts >= since),
+            );
+        }
+        (y, m) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    }
+    out.sort_by_key(|r| r.ts);
+    out
+}
+
+/// Who spent it, for grouping: `chat`, `drafter`, `reflect`, `orders`.
+pub fn role_name(role: Option<&str>) -> &str {
+    match role {
+        None => "chat",
+        Some(r) if r.starts_with("order:") => "orders",
+        Some(r) => r,
+    }
+}
+
+/// One line of a statement: a session's (or a draft's) calls by one role.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatementLine {
+    /// First call.
+    pub first: DateTime<Utc>,
+    /// Session id.
+    pub session: String,
+    /// Role, as [`role_name`] gives it.
+    pub role: String,
+    /// The model of its last call.
+    pub model: String,
+    /// Calls.
+    pub calls: u64,
+    /// Tokens.
+    pub usage: Usage,
+    /// USD of the priced calls.
+    pub usd: f64,
+    /// Calls with no known price.
+    pub unpriced: u64,
+}
+
+/// Group records into statement lines, in order of their first call.
+pub fn statement(records: &[SpendRecord]) -> Vec<StatementLine> {
+    let mut lines: Vec<StatementLine> = Vec::new();
+    for r in records {
+        let role = role_name(r.role.as_deref()).to_string();
+        match lines
+            .iter_mut()
+            .find(|l| l.session == r.session && l.role == role)
+        {
+            Some(l) => {
+                l.calls += 1;
+                l.usage = l.usage + r.usage;
+                l.usd += r.usd.unwrap_or(0.0);
+                l.unpriced += u64::from(r.usd.is_none());
+                l.model.clone_from(&r.model);
+            }
+            None => lines.push(StatementLine {
+                first: r.ts,
+                session: r.session.clone(),
+                role,
+                model: r.model.clone(),
+                calls: 1,
+                usage: r.usage,
+                usd: r.usd.unwrap_or(0.0),
+                unpriced: u64::from(r.usd.is_none()),
+            }),
+        }
+    }
+    lines.sort_by_key(|l| l.first);
+    lines
+}
+
 /// Today's spend by one role.
 pub fn role_today(home: &Path, role: &str, now: DateTime<Local>) -> Tally {
     let path = month_path(home, now.year(), now.month());
@@ -146,6 +228,46 @@ pub fn over_cap(spend: &SpendConfig, session: &Tally, totals: &Totals) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn statements_group_by_session_and_role() {
+        let rec = |mins: i64, session: &str, role: Option<&str>, usd: Option<f64>| SpendRecord {
+            ts: Utc::now() - chrono::Duration::minutes(100 - mins),
+            session: session.into(),
+            connection: "openrouter".into(),
+            model: "m".into(),
+            usage: Usage {
+                input_tokens: 100,
+                ..Usage::default()
+            },
+            usd,
+            priced_by: None,
+            role: role.map(String::from),
+        };
+        let lines = statement(&[
+            rec(1, "a", None, Some(0.01)),
+            rec(2, "d", Some("drafter"), Some(0.02)),
+            rec(3, "a", None, Some(0.03)),
+            rec(4, "a", Some("reflect"), None),
+            rec(5, "o", Some("order:disk"), Some(0.001)),
+        ]);
+        let got: Vec<(&str, &str, u64)> = lines
+            .iter()
+            .map(|l| (l.session.as_str(), l.role.as_str(), l.calls))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("a", "chat", 2),
+                ("d", "drafter", 1),
+                ("a", "reflect", 1),
+                ("o", "orders", 1)
+            ]
+        );
+        assert!((lines[0].usd - 0.04).abs() < 1e-9);
+        assert_eq!(lines[0].usage.input_tokens, 200);
+        assert_eq!(lines[2].unpriced, 1);
+    }
     use chrono::TimeZone;
 
     fn rec(ts: DateTime<Utc>, usd: Option<f64>) -> SpendRecord {

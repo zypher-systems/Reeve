@@ -63,6 +63,9 @@ pub enum Decision {
     Approve,
     /// Yes, and the same action again this session (T1 only).
     AllowSession,
+    /// Yes, and every other step of the verified change in progress (not
+    /// T3): its checks and rollback still guard the whole change.
+    AllowChange,
     /// No, optionally with a word on why.
     Deny(Option<String>),
 }
@@ -174,6 +177,8 @@ pub struct Agent {
     allowed: HashSet<String>,
     role: Option<String>,
     txn: Option<crate::txn::Txn>,
+    /// The owner said yes to the rest of the open change.
+    change_allowed: bool,
     privacy: Arc<std::sync::Mutex<Masker>>,
     privacy_shown: Option<(Level, usize)>,
 }
@@ -272,6 +277,7 @@ impl Agent {
             allowed: HashSet::new(),
             role: None,
             txn: None,
+            change_allowed: false,
         })
     }
 
@@ -765,6 +771,9 @@ impl Agent {
         if tier <= Tier::T2 && self.approver.yolo() {
             return Ok("yolo".into());
         }
+        if tier <= Tier::T2 && self.change_allowed && self.txn.is_some() {
+            return Ok("change-rule".into());
+        }
         let req = ApprovalRequest {
             tool: plan.tool.clone(),
             summary: plan.summary.clone(),
@@ -784,6 +793,12 @@ impl Agent {
             Decision::AllowSession => {
                 if let (Tier::T1, Some(r)) = (tier, &plan.rule) {
                     self.allowed.insert(r.clone());
+                }
+                Ok(self.approver.label())
+            }
+            Decision::AllowChange => {
+                if tier <= Tier::T2 && self.txn.is_some() {
+                    self.change_allowed = true;
                 }
                 Ok(self.approver.label())
             }
@@ -880,6 +895,7 @@ impl Agent {
             receipt: Some(Box::new(sealed)),
         });
         self.txn = Some(t);
+        self.change_allowed = false;
         Ok(output)
     }
 
@@ -890,6 +906,7 @@ impl Agent {
         id: &str,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<String> {
+        self.change_allowed = false;
         let Some(t) = self.txn.take() else {
             emit(AgentEvent::ToolStarted {
                 id: id.into(),
@@ -1536,6 +1553,49 @@ mod tests {
             told.content
         );
         assert_eq!(ReceiptBook::new(&a.home).verify().problem, None);
+    }
+
+    #[tokio::test]
+    async fn yes_to_the_rest_of_a_change_covers_only_that_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let file = |n: &str| dir.join(n).to_string_lossy().to_string();
+        let approver = fixed(Decision::AllowChange, false);
+        let (_home, mut a) = agent(
+            vec![
+                calls(vec![
+                    begin("true"),
+                    (
+                        "fs_write",
+                        serde_json::json!({"path": file("a"), "content": "a"}),
+                    ),
+                    (
+                        "fs_write",
+                        serde_json::json!({"path": file("b"), "content": "b"}),
+                    ),
+                    ("change_commit", serde_json::json!({})),
+                    (
+                        "fs_write",
+                        serde_json::json!({"path": file("c"), "content": "c"}),
+                    ),
+                ]),
+                done("ok"),
+            ],
+            approver.clone(),
+        );
+        run(&mut a).await;
+        // Asked for the first step, not the second; asked again after the change.
+        let asked: Vec<String> = approver
+            .asked
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|r| r.paths.clone())
+            .collect();
+        assert_eq!(asked, [file("a"), file("c")], "{asked:?}");
+        let rs = ReceiptBook::new(&a.home).all();
+        let second = rs.iter().find(|r| r.args["path"] == file("b")).unwrap();
+        assert_eq!(second.approved_by, "change-rule");
     }
 
     #[tokio::test]

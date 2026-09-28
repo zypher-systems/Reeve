@@ -265,7 +265,10 @@ fn card_lines(p: &Pending, width: usize, t: &Theme) -> Vec<Line<'static>> {
         ]));
     } else {
         let mut spans = vec![key("⏎"), label("approve")];
-        if r.can_allow_session {
+        if r.txn.is_some() {
+            spans.push(key("a"));
+            spans.push(label("yes to the rest of this change"));
+        } else if r.can_allow_session {
             spans.push(key("a"));
             spans.push(label("allow for this session"));
         }

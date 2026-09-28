@@ -287,7 +287,7 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            theme: "brass".into(),
+            theme: "ink".into(),
             colors: "auto".into(),
             mouse: true,
             animate: true,
@@ -598,7 +598,7 @@ daily_usd = 2.0
         assert_eq!((name.as_str(), model.as_str()), ("box", "qwen3"));
         assert!(conn.is_local());
         assert!((cfg.spend.daily_usd - 2.0).abs() < 1e-9);
-        assert_eq!(cfg.ui.theme, "brass");
+        assert_eq!(cfg.ui.theme, "ink");
     }
 
     #[test]

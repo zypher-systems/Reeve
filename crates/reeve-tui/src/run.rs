@@ -47,7 +47,7 @@ use crate::overlay::{
     Action, KeyEntry, ModelPicker, Overlay, ProviderRow, Providers, ReceiptsPanel, palette,
 };
 use crate::theme::{ColorMode, Theme};
-use crate::view::{Caps, Pending, RAIL_RECEIPTS, Speaker, View};
+use crate::view::{Caps, Pending, RAIL_RECEIPTS, Speaker, Tab, View};
 
 /// What the UI asks of the worker.
 enum Work {
@@ -61,6 +61,8 @@ enum Work {
     Reflect,
     /// Draw the state-of-the-machine page and open it.
     Report,
+    /// Gather the system tab's data for this many days.
+    SystemReport(u32),
     /// Undo a receipt (may need sudo, so it runs on the worker).
     Undo {
         seq: u64,
@@ -78,6 +80,7 @@ enum UiMsg {
     Ready {
         connection: String,
         model: String,
+        session: String,
     },
     NotReady,
     Rates(String),
@@ -92,7 +95,9 @@ enum UiMsg {
         connection: String,
         result: Result<String, String>,
     },
-    SessionReset,
+    SessionReset(String),
+    /// The system tab's data.
+    SystemReport(u32, Box<reeve_observer::report::Report>),
     /// The agent needs a yes or no.
     Approval(Box<ApprovalRequest>, tokio::sync::oneshot::Sender<Decision>),
     /// sudo needs the password.
@@ -162,6 +167,10 @@ struct App {
     /// The approved action a password request belongs to.
     last_action: String,
     memory: Memory,
+    /// When the TUI started: findings and drafts newer than this go on the ledger.
+    started: chrono::DateTime<chrono::Utc>,
+    /// Findings and drafts already on the ledger.
+    announced: std::collections::HashSet<String>,
 }
 
 /// Run the TUI until the user quits.
@@ -217,6 +226,8 @@ pub fn run(cfg: Config, home: PathBuf) -> io::Result<()> {
         pw_used: None,
         last_action: String::new(),
         memory: Memory::new(&home_for_memory),
+        started: chrono::Utc::now(),
+        announced: std::collections::HashSet::new(),
     };
     view.memory = app.memory.counts();
     app.poll_observer(&mut view);
@@ -393,7 +404,12 @@ impl App {
                 view.scroll = 0;
                 self.reply = Some(reply);
             }
-            UiMsg::Ready { connection, model } => {
+            UiMsg::Ready {
+                connection,
+                model,
+                session,
+            } => {
+                view.session_id = session;
                 view.drop_transient();
                 if !view.ready && (view.connection != connection || view.model != model) {
                     view.push(
@@ -445,7 +461,16 @@ impl App {
                     }
                 }
             }
-            UiMsg::SessionReset => {
+            UiMsg::SystemReport(days, report) => {
+                if let Some(Overlay::System(p)) = view.overlays.first_mut() {
+                    if p.days == days {
+                        p.report = Some(report);
+                        p.loading = false;
+                    }
+                }
+            }
+            UiMsg::SessionReset(session) => {
+                view.session_id = session;
                 view.entries.clear();
                 view.session = Default::default();
                 view.last = None;
@@ -464,6 +489,39 @@ impl App {
             }
             return;
         }
+        let alt = k.modifiers.contains(KeyModifiers::ALT);
+        // Secrets are being typed: those panels get every key.
+        let typing_secret = matches!(
+            view.overlays.last(),
+            Some(Overlay::Password(_) | Overlay::Key(_) | Overlay::Add(_))
+        );
+        if !typing_secret {
+            // ⌃K: search everything, from anywhere.
+            if ctrl && k.code == KeyCode::Char('k') {
+                if matches!(view.overlays.last(), Some(Overlay::Everything(_))) {
+                    view.overlays.pop();
+                } else if view.approval.is_none() {
+                    let items = self.everything(view);
+                    view.overlays
+                        .push(Overlay::Everything(crate::overlay::EverythingPanel {
+                            query: String::new(),
+                            items,
+                            sel: 0,
+                        }));
+                }
+                return;
+            }
+            // alt+1…6 anywhere; plain digits when a tab (not a panel over it) has the keys.
+            if let KeyCode::Char(c) = k.code {
+                let on_tab = view.overlays.len() == 1 && view.overlays[0].tab().is_some();
+                if (alt || (on_tab && !ctrl)) && view.approval.is_none() {
+                    if let Some(tab) = Tab::from_key(c) {
+                        self.open_tab(view, tab);
+                        return;
+                    }
+                }
+            }
+        }
         if let Some(top) = view.overlays.last_mut() {
             let action = top.on_key(k);
             self.perform(view, action);
@@ -471,6 +529,11 @@ impl App {
         }
         if view.approval.is_some() {
             self.approval_key(view, k);
+            return;
+        }
+        // `$` on an empty composer folds the ledger into its statement.
+        if k.code == KeyCode::Char('$') && view.input.is_empty() {
+            self.open_tab(view, Tab::Spend);
             return;
         }
         // The slash palette steals arrows, tab, and enter while it's open.
@@ -524,7 +587,6 @@ impl App {
             KeyCode::Char('q' | 'd') if ctrl => view.quit = true,
             KeyCode::Char('y') if ctrl => self.toggle_yolo(view),
             KeyCode::Char('r') if ctrl => self.command(view, "/receipts"),
-            KeyCode::Char('b') if ctrl => view.rail_only = !view.rail_only,
             KeyCode::Char('p') if ctrl => self.command(view, "/providers"),
             KeyCode::Char('w') if ctrl => view.delete_word(),
             KeyCode::Char('u') if ctrl => {
@@ -611,34 +673,18 @@ impl App {
                 }));
             }
             "/help" => view.overlays.push(Overlay::Help),
-            "/findings" => {
-                self.poll_observer(view);
-                let mut p = crate::overlay::FindingsPanel::default();
-                p.refresh(FindingStore::new(&self.home).list());
-                view.overlays.push(Overlay::Findings(p));
-            }
+            "/findings" => self.open_tab(view, Tab::Findings),
+            "/spend" => self.open_tab(view, Tab::Spend),
+            "/system" => self.open_tab(view, Tab::System),
+            "/ledger" => self.open_tab(view, Tab::Ledger),
             "/observer" => self.open_observer(view),
             "/privacy" => self.open_privacy(view),
             "/report" => {
                 view.push_transient("Drawing the state of the machine (last 7 days)…");
                 let _ = self.work.send(Work::Report);
             }
-            "/orders" => {
-                let orders = reeve_core::orders::Orders::new(&self.home);
-                let seeded = orders.seed_examples().unwrap_or(0);
-                let mut p = crate::overlay::OrdersPanel::load(&orders);
-                if seeded > 0 {
-                    p.note = Some(Ok(format!(
-                        "wrote {seeded} example orders to start from; all are off until you turn them on"
-                    )));
-                }
-                view.overlays.push(Overlay::Orders(p));
-            }
-            "/memory" => view
-                .overlays
-                .push(Overlay::Memory(crate::overlay::MemoryPanel::load(
-                    &self.memory,
-                ))),
+            "/orders" => self.open_tab(view, Tab::Orders),
+            "/memory" => self.open_tab(view, Tab::Memory),
             "/reflect" => {
                 if view.busy {
                     view.push(Speaker::System, "Stop the running turn first (esc).");
@@ -654,6 +700,73 @@ impl App {
     fn perform(&mut self, view: &mut View, action: Action) {
         match action {
             Action::None => {}
+            Action::Tab(tab) => self.open_tab(view, tab),
+            Action::TabSelect(tab, id) => {
+                self.open_tab(view, tab);
+                match view.overlays.first_mut() {
+                    Some(Overlay::Findings(p)) => {
+                        if let Some(i) = p.items.iter().position(|f| f.id == id) {
+                            p.sel = i;
+                        }
+                    }
+                    Some(Overlay::Orders(p)) => {
+                        if let Some(i) = p.items.iter().position(|o| o.id == id) {
+                            p.sel = i;
+                        }
+                    }
+                    Some(Overlay::Memory(p)) => p.select(&id),
+                    _ => {}
+                }
+            }
+            Action::Ask(text) => {
+                view.overlays.clear();
+                if view.busy {
+                    view.push(
+                        Speaker::System,
+                        "Reeve is busy; ask again when this turn ends.",
+                    );
+                } else if !view.ready {
+                    self.command(view, "/providers");
+                } else {
+                    view.push(Speaker::User, text.clone());
+                    view.busy = true;
+                    let _ = self.work.send(Work::Send(text));
+                }
+            }
+            Action::Command(name) => {
+                view.overlays.clear();
+                self.command(view, name);
+            }
+            Action::ShowReceipt(seq) => {
+                view.overlays.retain(|o| o.tab().is_some());
+                self.command(view, "/receipts");
+                if let Some(Overlay::Receipts(p)) = view.overlays.last_mut() {
+                    if let Some(i) = p.items.iter().position(|r| r.seq == seq) {
+                        p.sel = i;
+                    }
+                }
+            }
+            Action::SystemReport(days) => {
+                if let Some(Overlay::System(p)) = view.overlays.first_mut() {
+                    p.days = days;
+                    p.loading = true;
+                    p.report = None;
+                }
+                let _ = self.work.send(Work::SystemReport(days));
+            }
+            Action::OpenReport => {
+                view.push_transient("Drawing the state of the machine (last 7 days)…");
+                let _ = self.work.send(Work::Report);
+            }
+            Action::ExportSpend => {
+                let note = match view.overlays.first() {
+                    Some(Overlay::Spend(p)) => export_spend(&self.home, p),
+                    _ => Err("open the spend tab first".into()),
+                };
+                if let Some(Overlay::Spend(p)) = view.overlays.first_mut() {
+                    p.note = Some(note);
+                }
+            }
             Action::Close => {
                 if let Some(Overlay::Password(_)) = view.overlays.pop() {
                     if let Some(r) = self.pw_reply.take() {
@@ -1275,11 +1388,12 @@ impl App {
     }
 
     /// Read reeved's heartbeat and the findings.
-    fn poll_observer(&self, view: &mut View) {
+    fn poll_observer(&mut self, view: &mut View) {
         let status = ObserverStatus::load(&self.home);
         view.observer_alive = status.as_ref().is_some_and(|s| s.alive(chrono::Utc::now()));
-        view.findings = FindingStore::new(&self.home)
-            .list()
+        let all = FindingStore::new(&self.home).list();
+        self.announce(view, &all);
+        view.findings = all
             .into_iter()
             .filter(|f| f.status == FindingStatus::Open)
             .collect();
@@ -1297,6 +1411,182 @@ impl App {
                     p.status.clone_from(&status);
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// Go to a tab. Its screen is rebuilt from disk each time; the spend
+    /// tab keeps its range and the system tab its window.
+    fn open_tab(&mut self, view: &mut View, tab: Tab) {
+        let keep_range = match view.overlays.first() {
+            Some(Overlay::Spend(p)) => Some((p.range, p.sel)),
+            _ => None,
+        };
+        let keep_days = match view.overlays.first() {
+            Some(Overlay::System(p)) => Some(p.days),
+            _ => None,
+        };
+        view.overlays.clear();
+        match tab {
+            Tab::Ledger => {}
+            Tab::Findings => {
+                self.poll_observer(view);
+                let mut p = crate::overlay::FindingsPanel::default();
+                p.refresh(FindingStore::new(&self.home).list());
+                view.overlays.push(Overlay::Findings(p));
+            }
+            Tab::Orders => {
+                let orders = reeve_core::orders::Orders::new(&self.home);
+                let seeded = orders.seed_examples().unwrap_or(0);
+                let mut p = crate::overlay::OrdersPanel::load(&orders);
+                if seeded > 0 {
+                    p.note = Some(Ok(format!(
+                        "wrote {seeded} example orders to start from; all are off until you turn them on"
+                    )));
+                }
+                view.overlays.push(Overlay::Orders(p));
+            }
+            Tab::Memory => view
+                .overlays
+                .push(Overlay::Memory(crate::overlay::MemoryPanel::load(
+                    &self.memory,
+                ))),
+            Tab::Spend => {
+                let (range, sel) =
+                    keep_range.unwrap_or((crate::overlay::SpendRange::Day, usize::MAX));
+                let records = ledger::since(&self.home, range.since());
+                let n = ledger::statement(&records).len();
+                let s = &self.cfg.spend;
+                view.overlays
+                    .push(Overlay::Spend(crate::overlay::SpendPanel {
+                        range,
+                        records,
+                        month: ledger::since(&self.home, crate::overlay::SpendRange::Month.since()),
+                        // Newest first in view: select the last line.
+                        sel: if sel == usize::MAX {
+                            n.saturating_sub(1)
+                        } else {
+                            sel
+                        },
+                        current: view.session_id.clone(),
+                        caps: (s.daily_usd, s.session_usd, s.monthly_usd, s.warn_usd),
+                        drafter_cap: self
+                            .cfg
+                            .observer
+                            .drafter
+                            .enabled
+                            .then_some(self.cfg.observer.drafter.daily_usd),
+                        note: None,
+                    }));
+            }
+            Tab::System => {
+                let days = keep_days.unwrap_or(1);
+                view.overlays
+                    .push(Overlay::System(crate::overlay::SystemPanel {
+                        days,
+                        report: None,
+                        loading: true,
+                    }));
+                let _ = self.work.send(Work::SystemReport(days));
+            }
+        }
+    }
+
+    /// Everything ⌃K can find, freshly read.
+    fn everything(&self, view: &View) -> Vec<crate::overlay::Hit> {
+        use crate::overlay::Hit;
+        let mut hits = Vec::new();
+        let findings = FindingStore::new(&self.home).list();
+        for f in findings.iter().filter(|f| f.is_live()) {
+            if f.proposal.is_some() {
+                hits.push(Hit {
+                    group: "FIX",
+                    title: format!("Run the drafted fix: {}", f.title),
+                    detail: "verified, in the ledger".into(),
+                    place: "2 findings".into(),
+                    action: Action::UseProposal(f.id.clone()),
+                });
+            }
+            hits.push(Hit {
+                group: "SEE",
+                title: f.title.clone(),
+                detail: format!("{} · {}×", f.severity.as_str(), f.count),
+                place: "2 findings".into(),
+                action: Action::TabSelect(Tab::Findings, f.id.clone()),
+            });
+        }
+        for o in reeve_core::orders::Orders::new(&self.home).load().0 {
+            hits.push(Hit {
+                group: "KEEP",
+                title: format!("Standing order: {}", o.name),
+                detail: if o.enabled { "on".into() } else { "off".into() },
+                place: "3 orders".into(),
+                action: Action::TabSelect(Tab::Orders, o.id.clone()),
+            });
+        }
+        for n in self.memory.all() {
+            if n.layer == reeve_core::memory::Layer::Baselines {
+                continue;
+            }
+            hits.push(Hit {
+                group: "KNOW",
+                title: n.title.clone(),
+                detail: n.layer.dir().trim_end_matches('s').to_string(),
+                place: "5 memory".into(),
+                action: Action::TabSelect(Tab::Memory, n.id.clone()),
+            });
+        }
+        for r in view.receipts.iter().take(40) {
+            hits.push(Hit {
+                group: "GO",
+                title: format!("#{} {} {}", r.seq, r.tool, r.target()),
+                detail: r.outcome.summary.clone(),
+                place: "receipts".into(),
+                action: Action::ShowReceipt(r.seq),
+            });
+        }
+        for tab in Tab::ALL {
+            hits.push(Hit {
+                group: "GO",
+                title: format!("{} tab", tab.label()),
+                detail: String::new(),
+                place: format!("{} {}", tab.key(), tab.label()),
+                action: Action::Tab(tab),
+            });
+        }
+        for c in crate::overlay::COMMANDS {
+            hits.push(Hit {
+                group: "DO",
+                title: c.name.to_string(),
+                detail: c.about.to_string(),
+                place: "command".into(),
+                action: Action::Command(c.name),
+            });
+        }
+        hits
+    }
+
+    /// Put findings and drafts that turned up while Reeve is open on the ledger.
+    fn announce(&mut self, view: &mut View, findings: &[reeve_core::findings::Finding]) {
+        for f in findings {
+            if f.first_seen > self.started && self.announced.insert(format!("f:{}", f.id)) {
+                view.push(Speaker::Reeved, f.title.clone());
+            }
+            if let Some(p) = &f.proposal {
+                if p.drafted_at > self.started
+                    && self
+                        .announced
+                        .insert(format!("d:{}:{}", f.id, p.drafted_at))
+                {
+                    view.push(Speaker::Drafter, format!("drafted a fix for {}", f.title));
+                    if let Some(e) = view.entries.last_mut() {
+                        e.cost = p.usd.map(|usd| crate::view::RoundCost {
+                            usd: Some(usd),
+                            usage: Default::default(),
+                            session: 0.0,
+                        });
+                    }
+                }
             }
         }
     }
@@ -1331,7 +1621,7 @@ impl App {
             }));
     }
 
-    fn observer_note(&self, view: &mut View, note: Result<String, String>) {
+    fn observer_note(&mut self, view: &mut View, note: Result<String, String>) {
         if let Some(Overlay::Observer(p)) = view
             .overlays
             .iter_mut()
@@ -1437,6 +1727,7 @@ impl App {
                 None
             }
             KeyCode::Enter | KeyCode::Char('y') => Some(Decision::Approve),
+            KeyCode::Char('a') if p.req.txn.is_some() => Some(Decision::AllowChange),
             KeyCode::Char('a') if p.req.can_allow_session => Some(Decision::AllowSession),
             KeyCode::Char('n') => Some(Decision::Deny(None)),
             _ => None,
@@ -1539,6 +1830,13 @@ fn spawn_worker(
                     }
                     Work::Survey => {
                         tokio::spawn(survey(tools.clone(), home.clone(), tx.clone(), false));
+                    }
+                    Work::SystemReport(days) => {
+                        let (tx, home) = (tx.clone(), home.clone());
+                        tokio::task::spawn_blocking(move || {
+                            let r = reeve_observer::report::gather(&home, days);
+                            let _ = tx.send(UiMsg::SystemReport(days, Box::new(r)));
+                        });
                     }
                     Work::Report => {
                         let (tx, home) = (tx.clone(), home.clone());
@@ -1670,7 +1968,7 @@ async fn agent_loop(
                     }
                     match a.reset() {
                         Ok(()) => {
-                            let _ = tx.send(UiMsg::SessionReset);
+                            let _ = tx.send(UiMsg::SessionReset(a.session_id().to_string()));
                         }
                         Err(e) => emit(AgentEvent::Error(e.to_string())),
                     }
@@ -1755,6 +2053,10 @@ async fn connect(
     let _ = tx.send(UiMsg::Ready {
         connection: name.clone(),
         model: model.clone(),
+        session: agent
+            .as_ref()
+            .map(|a| a.session_id().to_string())
+            .unwrap_or_default(),
     });
     let _ = tx.send(UiMsg::Rates("loading prices…".into()));
     let Some(a) = agent.as_mut() else { return };
@@ -1873,3 +2175,34 @@ per_run_usd = 0.05
 runs_per_day = 2
 cooldown_hours = 12
 "#;
+
+/// Write the spend tab's statement to `~/.reeve/reports/spend-<range>-<date>.csv`.
+fn export_spend(home: &std::path::Path, p: &crate::overlay::SpendPanel) -> Result<String, String> {
+    let dir = home.join("reports");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!(
+        "spend-{}-{}.csv",
+        p.range.label(),
+        Local::now().format("%Y-%m-%d")
+    ));
+    let mut csv = String::from(
+        "first_call,session,role,model,calls,input_tokens,cached_tokens,output_tokens,usd,unpriced\n",
+    );
+    for l in p.lines() {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{:.6},{}\n",
+            l.first.to_rfc3339(),
+            l.session,
+            l.role,
+            l.model,
+            l.calls,
+            l.usage.input_tokens,
+            l.usage.cached_tokens,
+            l.usage.output_tokens,
+            l.usd,
+            l.unpriced
+        ));
+    }
+    std::fs::write(&path, csv).map_err(|e| e.to_string())?;
+    Ok(format!("wrote {}", path.display()))
+}
