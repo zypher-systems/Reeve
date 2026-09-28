@@ -561,6 +561,22 @@ fn per_million(v: Option<&Value>) -> Option<f64> {
     (per_token >= 0.0).then_some(per_token * 1_000_000.0)
 }
 
+/// OpenRouter's `architecture`: `input_modalities`/`output_modalities`
+/// arrays, or the older `"modality": "text+image->text"`.
+fn text_in_and_out(arch: Option<&Value>) -> Option<bool> {
+    let arch = arch?;
+    let has_text = |k: &str| {
+        arch.get(k)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().any(|x| x.as_str() == Some("text")))
+    };
+    if let (Some(i), Some(o)) = (has_text("input_modalities"), has_text("output_modalities")) {
+        return Some(i && o);
+    }
+    let (i, o) = arch.get("modality")?.as_str()?.split_once("->")?;
+    Some(i.split('+').any(|x| x == "text") && o.split('+').any(|x| x == "text"))
+}
+
 pub(crate) fn parse_models_json(text: &str) -> Result<Vec<ModelInfo>> {
     let v: Value =
         serde_json::from_str(text).map_err(|e| Error::Provider(format!("models json: {e}")))?;
@@ -589,6 +605,7 @@ pub(crate) fn parse_models_json(text: &str) -> Result<Vec<ModelInfo>> {
                     .get("supported_parameters")
                     .and_then(Value::as_array)
                     .map(|p| p.iter().any(|x| x.as_str() == Some("tools"))),
+                chat: text_in_and_out(m.get("architecture")),
             })
         })
         .collect())
@@ -806,5 +823,34 @@ mod tests {
             r#"{"data":[{"id":"openrouter/auto","pricing":{"prompt":"-1","completion":"-1"}}]}"#;
         let m = &parse_models_json(json).unwrap()[0];
         assert_eq!(m.input_per_million, None);
+    }
+
+    #[test]
+    fn models_reeve_cant_drive_are_marked() {
+        let j = r#"{"data":[
+          {"id":"deepseek/deepseek-v4-pro","architecture":{"input_modalities":["text"],"output_modalities":["text"]},"supported_parameters":["tools","reasoning"]},
+          {"id":"google/gemini-3-pro-image","architecture":{"input_modalities":["text","image"],"output_modalities":["image","text"]},"supported_parameters":["temperature"]},
+          {"id":"black-forest-labs/flux","architecture":{"modality":"text->image"}},
+          {"id":"text-embedding-3-large"},
+          {"id":"gpt-4o-mini-tts"},
+          {"id":"gpt-5-batch"},
+          {"id":"gpt-5"},
+          {"id":"llama3.1:8b"}
+        ]}"#;
+        let m = parse_models_json(j).unwrap();
+        let why: Vec<Option<&str>> = m.iter().map(|x| x.unusable()).collect();
+        assert_eq!(
+            why,
+            [
+                None,
+                Some("no tools"),
+                Some("not a chat model"),
+                Some("embeddings"),
+                Some("speech"),
+                Some("batch only"),
+                None,
+                None
+            ]
+        );
     }
 }

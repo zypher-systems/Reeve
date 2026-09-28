@@ -154,6 +154,10 @@ pub struct ModelInfo {
     /// model that cannot call tools cannot do anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<bool>,
+    /// Whether it takes text and answers in text, when the catalog says
+    /// (OpenRouter's `architecture`). Image generators and embedders don't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<bool>,
 }
 
 impl ModelInfo {
@@ -163,6 +167,47 @@ impl ModelInfo {
             id: id.into(),
             ..Self::default()
         }
+    }
+
+    /// Why Reeve can't drive this model, if it can't: Reeve needs text in,
+    /// text out, and tool calls over Chat Completions. The catalog's word
+    /// wins; for lists that say nothing (OpenAI's own, local servers), the
+    /// name gives away embedders, speech, image, and batch-only models.
+    pub fn unusable(&self) -> Option<&'static str> {
+        if self.chat == Some(false) {
+            return Some("not a chat model");
+        }
+        if self.tools == Some(false) {
+            return Some("no tools");
+        }
+        if self.tools.is_some() || self.chat.is_some() {
+            return None;
+        }
+        let id = self.id.to_ascii_lowercase();
+        let name = id.rsplit('/').next().unwrap_or(&id);
+        const NOT_CHAT: &[(&str, &str)] = &[
+            ("embed", "embeddings"),
+            ("rerank", "reranker"),
+            ("whisper", "speech"),
+            ("tts", "speech"),
+            ("transcribe", "speech"),
+            ("audio", "audio"),
+            ("realtime", "realtime only"),
+            ("dall-e", "images"),
+            ("gpt-image", "images"),
+            ("imagen", "images"),
+            ("sora", "video"),
+            ("moderation", "moderation"),
+            ("batch", "batch only"),
+            ("search-preview", "no tools"),
+            ("computer-use", "not chat"),
+            ("davinci", "completions only"),
+            ("babbage", "completions only"),
+        ];
+        NOT_CHAT
+            .iter()
+            .find(|(pat, _)| name.contains(pat))
+            .map(|(_, why)| *why)
     }
 }
 

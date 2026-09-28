@@ -43,7 +43,7 @@ cargo build --release --locked -p reeve-cli && ./target/release/reeve
 ## Commands
 
 - `reeve key set <connection>` stores an API key (the same as `/providers` in the TUI).
-- `reeve models [filter]` lists a connection's models with live prices, including cache read and write rates.
+- `reeve models [filter]` lists a connection's models with live prices, including cache read and write rates. Models Reeve can't drive are hidden: ones without tool calling, and image, speech, embedding, and batch-only models. `--all` shows them, and so does `tab` in `/model`.
 - `reeve spend` shows today and this month, across every Reeve session.
 - `reeve receipts [list|show N|verify]` lists receipts, prints one in full, or checks the whole chain.
 - `reeve undo N` reverses the action on receipt N and writes a receipt for the undo.

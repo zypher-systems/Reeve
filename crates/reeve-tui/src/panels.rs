@@ -321,7 +321,7 @@ fn models(f: &mut Frame, r: Rect, m: &ModelPicker, t: &Theme) {
         ]),
         Line::from(vec![
             Span::styled(
-                pad(&format!("   on {}", m.connection), w.saturating_sub(34)),
+                pad(&format!("   on {}", m.connection), w.saturating_sub(42)),
                 t.ghost(),
             ),
             Span::styled(pad("in/out $/M", 14), t.ghost()),
@@ -368,8 +368,9 @@ fn models(f: &mut Frame, r: Rect, m: &ModelPicker, t: &Theme) {
         let ctx = model
             .context_length
             .map_or(String::new(), |c| format_tokens(c).replace(".0k", "k"));
-        let no_tools = model.tools == Some(false);
-        let id_w = w.saturating_sub(34 + 5);
+        let why_not = model.unusable();
+        let no_tools = why_not.is_some();
+        let id_w = w.saturating_sub(42 + 5);
         let id_style = if no_tools {
             t.ghost()
         } else if on {
@@ -391,8 +392,9 @@ fn models(f: &mut Frame, r: Rect, m: &ModelPicker, t: &Theme) {
             Span::styled(pad(&cache, 10), Style::default().fg(t.teal).bg(bg)),
             Span::styled(
                 pad(
-                    &format!("{ctx}{}", if no_tools { " no tools" } else { "" }),
-                    10,
+                    &why_not
+                        .map_or_else(|| ctx.clone(), |w| format!("{ctx} {w}").trim().to_string()),
+                    18,
                 ),
                 Style::default().fg(t.dim).bg(bg),
             ),
@@ -402,15 +404,18 @@ fn models(f: &mut Frame, r: Rect, m: &ModelPicker, t: &Theme) {
         lines.push(Line::raw(""));
     }
     lines.truncate(r.height.saturating_sub(1) as usize);
-    lines.push(hints(
-        &[
-            ("type", "search"),
-            ("↑↓", "move"),
-            ("⏎", "use"),
-            ("esc", "close"),
-        ],
-        t,
-    ));
+    let hidden = m.hidden();
+    let toggle = if m.show_all {
+        "hide unusable".to_string()
+    } else {
+        format!("show {hidden} unusable")
+    };
+    let mut keys = vec![("type", "search"), ("↑↓", "move"), ("⏎", "use")];
+    if hidden > 0 || m.show_all {
+        keys.push(("tab", toggle.as_str()));
+    }
+    keys.push(("esc", "close"));
+    lines.push(hints(&keys, t));
     f.render_widget(Paragraph::new(lines), r);
     f.set_cursor_position(Position::new(
         r.x + 3 + m.query.width().min(w.saturating_sub(4)) as u16,

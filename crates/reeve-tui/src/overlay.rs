@@ -878,6 +878,8 @@ pub struct ModelPicker {
     pub current: Option<String>,
     /// Choosing for the drafter, not the main agent.
     pub for_drafter: bool,
+    /// Also list models Reeve can't drive (no tools, images, embeddings…).
+    pub show_all: bool,
 }
 
 impl ModelPicker {
@@ -907,12 +909,25 @@ impl ModelPicker {
         self.loading = false;
         self.error = None;
         if self.query.is_empty() {
-            if let Some(cur) = &self.current {
-                if let Some(i) = self.models.iter().position(|m| &m.id == cur) {
+            if let Some(cur) = self.current.clone() {
+                if let Some(i) = self.filtered().iter().position(|m| m.id == cur) {
                     self.sel = i;
                 }
             }
         }
+    }
+
+    /// Models hidden because Reeve can't drive them.
+    pub fn hidden(&self) -> usize {
+        if self.show_all {
+            return 0;
+        }
+        self.models.iter().filter(|m| !self.shown(m)).count()
+    }
+
+    /// Usable, the one in use, or everything with `show_all`.
+    fn shown(&self, m: &ModelInfo) -> bool {
+        self.show_all || m.unusable().is_none() || self.current.as_deref() == Some(m.id.as_str())
     }
 
     /// Models matching the query.
@@ -924,6 +939,7 @@ impl ModelPicker {
             .collect();
         self.models
             .iter()
+            .filter(|m| self.shown(m))
             .filter(|m| {
                 let hay = format!(
                     "{} {}",
@@ -945,6 +961,10 @@ impl ModelPicker {
             KeyCode::PageDown => self.sel = (self.sel + 10).min(n.saturating_sub(1)),
             KeyCode::Home => self.sel = 0,
             KeyCode::End => self.sel = n.saturating_sub(1),
+            KeyCode::Tab => {
+                self.show_all = !self.show_all;
+                self.sel = 0;
+            }
             KeyCode::Enter => {
                 let chosen = self
                     .filtered()
@@ -1119,6 +1139,35 @@ fn template_url(kind: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_picker_hides_models_reeve_cant_drive() {
+        let mut usable = ModelInfo::named("deepseek/deepseek-v4-pro");
+        usable.tools = Some(true);
+        let mut image = ModelInfo::named("openai/gpt-5-image");
+        image.tools = Some(false);
+        let mut p = ModelPicker::loading("openrouter", None, None);
+        p.set_models(vec![
+            usable,
+            image,
+            ModelInfo::named("text-embedding-3-small"),
+        ]);
+        let ids = |p: &ModelPicker| {
+            p.filtered()
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&p), ["deepseek/deepseek-v4-pro"]);
+        assert_eq!(p.hidden(), 2);
+        p.on_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(p.filtered().len(), 3);
+        // The model in use always shows, usable or not.
+        let mut q = ModelPicker::loading("openrouter", Some("openai/gpt-5-image".into()), None);
+        q.set_models(p.models.clone());
+        assert!(ids(&q).contains(&"openai/gpt-5-image".to_string()));
+        assert_eq!(q.filtered()[q.sel].id, "openai/gpt-5-image");
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

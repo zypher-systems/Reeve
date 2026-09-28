@@ -32,6 +32,9 @@ enum Cmd {
         connection: Option<String>,
         /// Only models whose id contains this.
         filter: Option<String>,
+        /// Also list models Reeve can't drive (no tools, images, embeddings…).
+        #[arg(long)]
+        all: bool,
     },
     /// Show what Reeve has spent today and this month.
     Spend,
@@ -167,7 +170,11 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("Stored in {} (mode 0600).", path.display());
             Ok(())
         }
-        Some(Cmd::Models { connection, filter }) => models(&cfg, &home, connection, filter),
+        Some(Cmd::Models {
+            connection,
+            filter,
+            all,
+        }) => models(&cfg, &home, connection, filter, all),
         Some(Cmd::Daemon { cmd }) => daemon(&home, cmd),
         Some(Cmd::Orders { cmd }) => orders_cmd(&cfg, &home, cmd.unwrap_or(OrdersCmd::List)),
         Some(Cmd::Doctor) => {
@@ -663,6 +670,7 @@ fn models(
     home: &std::path::Path,
     connection: Option<String>,
     filter: Option<String>,
+    all: bool,
 ) -> Result<(), String> {
     let name = connection.unwrap_or_else(|| cfg.default_connection.clone());
     let conn = cfg
@@ -686,6 +694,11 @@ fn models(
     list.sort_by(|a, b| a.id.cmp(&b.id));
     let mut book = PriceBook::from_config(cfg);
     book.ingest(&list);
+    let before = list.len();
+    if !all {
+        list.retain(|m| m.unusable().is_none());
+    }
+    let hidden = before - list.len();
     let width = list.iter().map(|m| m.id.len()).max().unwrap_or(10).min(60);
     for m in &list {
         let cache = match (m.cache_read_per_million, m.cache_write_per_million) {
@@ -693,18 +706,21 @@ fn models(
             (Some(r), None) => format!("  cache ${r:.3}r"),
             _ => String::new(),
         };
-        let tools = if m.tools == Some(false) {
-            "  (no tools)"
-        } else {
-            ""
-        };
+        let tools = m.unusable().map_or(String::new(), |w| format!("  ({w})"));
         println!(
             "{:<width$}  {}{cache}{tools}",
             m.id,
             format_rates(book.rates(&m.id))
         );
     }
-    eprintln!("{} models on {name}", list.len());
+    if hidden > 0 {
+        eprintln!(
+            "{} models on {name} ({hidden} Reeve can't use are hidden; --all shows them)",
+            list.len()
+        );
+    } else {
+        eprintln!("{} models on {name}", list.len());
+    }
     Ok(())
 }
 
