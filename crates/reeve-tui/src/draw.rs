@@ -48,6 +48,34 @@ fn width(spans: &[Span]) -> usize {
     spans.iter().map(|s| s.content.width()).sum()
 }
 
+/// The live-findings badge on the findings tab.
+fn findings_badge(v: &View) -> Option<String> {
+    (!v.findings.is_empty()).then(|| format!(" {}", v.findings.len()))
+}
+
+/// Where each tab's label sits on the tab row: (tab, first column, past the last).
+pub(crate) fn tab_positions(v: &View) -> Vec<(Tab, u16, u16)> {
+    let mut x = " reeve   ".width();
+    let mut out = Vec::new();
+    for tab in Tab::ALL {
+        let mut w = format!("{} {}", tab.key(), tab.label()).width();
+        if tab == Tab::Findings {
+            w += findings_badge(v).map_or(0, |b| b.width());
+        }
+        out.push((tab, x as u16, (x + w) as u16));
+        x += w + 3;
+    }
+    out
+}
+
+/// The tab under a click on the tab row, if any.
+pub fn tab_at(v: &View, column: u16) -> Option<Tab> {
+    tab_positions(v)
+        .into_iter()
+        .find(|(_, a, b)| column + 1 >= *a && column < *b + 1)
+        .map(|(tab, _, _)| tab)
+}
+
 fn draw_tabs(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
     let active = v.tab();
     let mut left = vec![
@@ -75,15 +103,14 @@ fn draw_tabs(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
             },
         ));
         if tab == Tab::Findings {
-            let live = v.findings.len();
-            if live > 0 {
+            if let Some(badge) = findings_badge(v) {
                 let worst = v.findings.iter().map(|f| f.severity).max();
                 let c = if worst == Some(Severity::Critical) {
                     t.bad
                 } else {
                     t.warn
                 };
-                left.push(Span::styled(format!(" {live}"), Style::default().fg(c)));
+                left.push(Span::styled(badge, Style::default().fg(c)));
             }
         }
         if on {
@@ -273,6 +300,11 @@ fn draw_status(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
     }
     right.push(Span::raw("   "));
     right.push(Span::styled(
+        "tab",
+        Style::default().fg(t.brass).add_modifier(Modifier::BOLD),
+    ));
+    right.push(Span::styled(" screens  ", Style::default().fg(t.dim)));
+    right.push(Span::styled(
         "⌃K",
         Style::default().fg(t.brass).add_modifier(Modifier::BOLD),
     ));
@@ -282,7 +314,7 @@ fn draw_status(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
     while left.len() > 3 && width(&left) + width(&right) > avail {
         left.pop();
     }
-    while right.len() > 4 && width(&left) + width(&right) > avail {
+    while right.len() > 6 && width(&left) + width(&right) > avail {
         right.remove(0);
     }
     put_split(f, area, left, right, t.bg);
@@ -927,6 +959,23 @@ mod tests {
             "{narrow}"
         );
         assert!(!narrow.contains("cost    session"), "{narrow}");
+    }
+
+    #[test]
+    fn clicking_a_tab_label_picks_that_tab() {
+        let v = busy_view();
+        let s = render(&v, 160, 44);
+        let row0 = s.lines().next().unwrap();
+        for tab in Tab::ALL {
+            let label = format!("{} {}", tab.key(), tab.label());
+            let col = row0.find(&label).unwrap();
+            // Byte offset equals column here: the row before the labels is ASCII.
+            assert_eq!(tab_at(&v, col as u16 + 2), Some(tab), "{label}");
+        }
+        assert_eq!(tab_at(&v, 1), None);
+        assert_eq!(Tab::System.next(), Tab::Ledger);
+        assert_eq!(Tab::Ledger.prev(), Tab::System);
+        assert!(s.lines().last().unwrap().contains("tab screens"));
     }
 
     #[test]

@@ -200,7 +200,7 @@ the machine is: "nexus · all quiet, except swap 99%".
 | --- | --- |
 | `⏎` / `alt+⏎` | send / newline |
 | `⌃K` | search everything: drafted fixes, findings, orders, memory, receipts, tabs, commands. `tab` asks Reeve instead |
-| `alt+1`…`alt+6` | tabs; on a tab, plain `1`…`6`; `esc` goes back to the ledger |
+| `tab` / `shift+tab` | next / previous screen. Also `F1`…`F6`, a click on the tab, or on a tab plain `1`…`6` (`alt+1`…`6` where the terminal doesn't keep it; Konsole does). `esc` goes back to the ledger |
 | `$` | the spend statement (from an empty composer) |
 | `/` | commands: `/providers`, `/model`, `/findings`, `/orders`, `/spend`, `/system`, `/memory`, `/report`, `/privacy`, `/observer`, `/reflect`, `/receipts`, `/new`, `/yolo`, `/help`, `/quit` |
 | `^p` / `^r` | `/providers` / `/receipts` (`u` undo, `v` verify) |

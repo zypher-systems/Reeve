@@ -447,8 +447,9 @@ trait Distro {
 - **Tabs** are the panels the old layout floated, drawn full-screen: findings (list and detail with
   evidence and the drafted fix), orders, spend (`ledger::statement`: one line per session and role, by
   day, week, or month, with by-role and by-model totals and CSV export), memory, and system (the report's
-  data for 24 h, 7 d, or 30 d, next to the live readout, what changed, and headlines). Switching: `alt+1…6`,
-  or plain digits on a tab; `esc` returns to the ledger.
+  data for 24 h, 7 d, or 30 d, next to the live readout, what changed, and headlines). Switching: `tab` / `shift+tab`,
+  `F1…F6`, a click on the tab row, plain digits on a tab, or `alt+1…6` (Konsole keeps those for its own
+  tabs); `esc` returns to the ledger.
 - **⌃K** searches one index built when it opens: drafted fixes, open findings, orders, memory notes,
   recent receipts, tabs, and commands. The query itself is always the first row ("ask Reeve"). Each
   result says where it goes.

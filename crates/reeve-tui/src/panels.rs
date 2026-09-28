@@ -1557,7 +1557,7 @@ fn help(f: &mut Frame, r: Rect, t: &Theme) {
             "⌃K",
             "search everything: fixes, findings, orders, memory, receipts",
         ),
-        ("alt+1…6", "tabs (plain 1…6 on a tab)"),
+        ("tab ⇧tab", "next / previous screen (or F1…F6, or click a tab)"),
         ("$", "the spend statement (empty composer)"),
         ("^r", "receipts: undo, verify the chain"),
         ("^y", "YOLO on/off"),

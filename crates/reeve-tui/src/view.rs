@@ -79,6 +79,18 @@ impl Tab {
         char::from(b'1' + Tab::ALL.iter().position(|t| *t == self).unwrap_or(0) as u8)
     }
 
+    /// The next tab, wrapping (Tab).
+    pub fn next(self) -> Tab {
+        let i = Tab::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Tab::ALL[(i + 1) % Tab::ALL.len()]
+    }
+
+    /// The previous tab, wrapping (Shift+Tab).
+    pub fn prev(self) -> Tab {
+        let i = Tab::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Tab::ALL[(i + Tab::ALL.len() - 1) % Tab::ALL.len()]
+    }
+
     /// From a number key.
     pub fn from_key(c: char) -> Option<Tab> {
         let i = c.to_digit(10)? as usize;

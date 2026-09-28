@@ -769,11 +769,11 @@ impl MemoryPanel {
             self.confirm_delete = None;
         }
         match k.code {
-            KeyCode::Left | KeyCode::BackTab => {
+            KeyCode::Left => {
                 self.tab = (self.tab + tabs - 1) % tabs;
                 self.sel = 0;
             }
-            KeyCode::Right | KeyCode::Tab => {
+            KeyCode::Right => {
                 self.tab = (self.tab + 1) % tabs;
                 self.sel = 0;
             }

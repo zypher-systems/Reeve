@@ -312,11 +312,27 @@ fn event_loop(
                             None => view.insert(&s),
                         }
                     }
-                    Event::Mouse(m) if view.overlays.is_empty() => match m.kind {
-                        MouseEventKind::ScrollUp => view.scroll += 3,
-                        MouseEventKind::ScrollDown => view.scroll = view.scroll.saturating_sub(3),
-                        _ => {}
-                    },
+                    Event::Mouse(m)
+                        if view.overlays.is_empty()
+                            || (view.overlays.len() == 1 && view.overlays[0].tab().is_some()) =>
+                    {
+                        match m.kind {
+                            MouseEventKind::Down(event::MouseButton::Left)
+                                if m.row == 0 && view.approval.is_none() =>
+                            {
+                                if let Some(tab) = crate::draw::tab_at(view, m.column) {
+                                    app.open_tab(view, tab);
+                                }
+                            }
+                            MouseEventKind::ScrollUp if view.overlays.is_empty() => {
+                                view.scroll += 3
+                            }
+                            MouseEventKind::ScrollDown if view.overlays.is_empty() => {
+                                view.scroll = view.scroll.saturating_sub(3);
+                            }
+                            _ => {}
+                        }
+                    }
                     _ => {}
                 }
                 if !event::poll(Duration::ZERO)? {
@@ -511,9 +527,34 @@ impl App {
                 }
                 return;
             }
+            let on_tab = view.overlays.len() == 1 && view.overlays[0].tab().is_some();
+            let on_screen = on_tab || view.overlays.is_empty();
+            if on_screen && view.approval.is_none() {
+                // Tab / Shift+Tab cycle the screens (on the ledger, unless
+                // the slash palette wants Tab to complete).
+                let completing = view.overlays.is_empty() && !palette(&view.input).is_empty();
+                match k.code {
+                    KeyCode::Tab if !completing => {
+                        let next = view.tab().next();
+                        self.open_tab(view, next);
+                        return;
+                    }
+                    KeyCode::BackTab => {
+                        let prev = view.tab().prev();
+                        self.open_tab(view, prev);
+                        return;
+                    }
+                    KeyCode::F(n @ 1..=6) => {
+                        if let Some(tab) = Tab::ALL.get(usize::from(n) - 1) {
+                            self.open_tab(view, *tab);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             // alt+1…6 anywhere; plain digits when a tab (not a panel over it) has the keys.
             if let KeyCode::Char(c) = k.code {
-                let on_tab = view.overlays.len() == 1 && view.overlays[0].tab().is_some();
                 if (alt || (on_tab && !ctrl)) && view.approval.is_none() {
                     if let Some(tab) = Tab::from_key(c) {
                         self.open_tab(view, tab);

@@ -134,7 +134,7 @@ fn draw_composer(f: &mut Frame, area: Rect, v: &View, t: &Theme, text_w: usize) 
         let hint = if v.busy {
             "Reeve is working…  esc to stop"
         } else if v.ready {
-            "Ask Reeve about this machine · / commands · ⌃K everything"
+            "Ask Reeve about this machine · / commands · tab screens · ⌃K everything"
         } else {
             "Type /providers to add an API key and pick a model."
         };
