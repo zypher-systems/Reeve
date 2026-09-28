@@ -2,6 +2,23 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-28: The state of the machine is drawn, not written by a model
+- **Decision:**
+  - `reeve report` and `/report` render one HTML page locally from reeved's minute metrics, findings, receipts, the spend ledger, memory, and package/unit/`/etc` drift.
+  - It uses inline SVG and a tiny inline script: no model call, no network, and no external assets.
+  - reeved keeps 31 days of metrics (was 14) and a daily package and unit snapshot (60 days).
+  - Pages are written 0600 to `~/.reeve/reports/`, and the last 20 are kept.
+- **Chosen vs rejected:**
+  - Rejected a "skill" where the model writes the HTML: it would cost tokens on every run, look different each time, and send the machine's details out just to draw a chart.
+  - Rejected a charting library from a CDN: the page would reach the network, and it wouldn't open offline.
+  - Rejected waiting for a snapshot history before showing drift: rpm install times, pacman's log, and file times give a useful answer on day one.
+- **Why:** The owner asked for a visual state of the system. Everything it needs was already on disk, so the only work is presenting it.
+- **Where:** `reeve-observer/src/report/` (`mod.rs` gather and headlines, `drift.rs`, `svg.rs`, `html.rs`), `daemon.rs` (retention, `save_daily`), `reeve-cli` (`report`), `reeve-tui` (`/report`)
+- **Residual risks:**
+  - Without a snapshot from before the window, Fedora can't tell an install from an upgrade, and removals and unit changes don't show.
+  - `/etc` changes are by modification time, so a package update that rewrites a config shows up as an edit.
+  - The page holds the machine's details in plain text: it's the owner's file, like the receipts.
+
 ### 2026-09-27: Mask before it leaves; ask OpenRouter not to keep it
 - **Decision:**
   - A `MaskingProvider` wraps every provider. It replaces secrets, emails, public IPs, and the user and host names with stable placeholders (`standard`, the chat default). `strict` also masks private IPs, MACs, and UUIDs, and is the default for the drafter and standing orders.

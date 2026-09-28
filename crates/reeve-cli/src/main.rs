@@ -36,6 +36,19 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// Draw the state of the machine as a page: charts, disks, what changed,
+    /// findings, and Reeve's work. Made locally; nothing leaves.
+    Report {
+        /// Days to cover (1–31).
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+        /// Write here instead of ~/.reeve/reports/.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Don't open it in the browser.
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Show what Reeve has spent today and this month.
     Spend,
     /// Check the install: binary, keys, sudo, journal, observer, snapper, receipts.
@@ -203,6 +216,27 @@ fn run(cli: Cli) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             println!("{} (receipt #{})", done.outcome.summary, done.seq);
             Ok(())
+        }
+        Some(Cmd::Report { days, out, no_open }) => {
+            let r = reeve_observer::report::gather(&home, days);
+            let path = match out {
+                Some(p) => std::fs::write(&p, reeve_observer::report::render(&r))
+                    .map(|()| p)
+                    .map_err(|e| e.to_string()),
+                None => reeve_observer::report::write(&home, &r).map_err(|e| e.to_string()),
+            };
+            match path {
+                Ok(p) => {
+                    println!("{}", p.display());
+                    if !no_open {
+                        if let Err(e) = reeve_observer::report::open(&p) {
+                            eprintln!("{e}");
+                        }
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
         }
         Some(Cmd::Spend) => {
             let t = reeve_core::ledger::totals(&home, chrono_now());

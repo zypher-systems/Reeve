@@ -348,6 +348,31 @@ Windows will need their own observer design later.
   them each second and shows "observer ○ off" when the heartbeat is stale. The service runs
   `reeve daemon run`, the same binary as the TUI.
 
+### 8.1 The state of the machine (`reeve report`, `/report`)
+
+One self-contained HTML page with inline SVG. There's no model and no network, and the page loads
+nothing from outside, not even fonts. Colors are CSS variables, so the page follows the system's
+light or dark theme; a small inline script adds a hover readout. Sources:
+
+- **Vital signs:** reeved's minute rows in `observer/metrics/<day>.jsonl`, now kept 31 days,
+  averaged into 360 points. A bucket with no rows is a gap. The charts start at the first reading
+  when reeved started after the window did.
+- **Disks:** a least-squares slope over hourly means gives growth per day and a days-to-full
+  estimate. It needs 20 h of history; below 0.01% a day, a disk counts as steady.
+- **What changed:**
+  - packages from rpm's `INSTALLTIME` (Fedora) or `/var/log/pacman.log` (Arch);
+  - removals and unit changes from the daily snapshot reeved writes to
+    `observer/state/<day>.json` (60 days kept);
+  - `/etc` from file modification times, matched against receipts to mark Reeve's own edits;
+  - a pending reboot from the newest `kernel-core` against `uname -r`, or on Arch, the running
+    kernel's missing modules.
+- **Findings, receipts, spend, memory:** the usual stores.
+- **Headlines:** rules over the above (a disk full within 90 days, swap full ≥ 50% of the time,
+  temperature past `temp_warn`, critical findings, fixes verified or rolled back, a pending
+  reboot).
+
+Everything shown is escaped. Log lines and finding text are data.
+
 ---
 
 ## 9. Standing orders

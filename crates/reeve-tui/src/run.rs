@@ -59,6 +59,8 @@ enum Work {
     Survey,
     /// Reflect on the current session now.
     Reflect,
+    /// Draw the state-of-the-machine page and open it.
+    Report,
     /// Undo a receipt (may need sudo, so it runs on the worker).
     Undo {
         seq: u64,
@@ -617,6 +619,10 @@ impl App {
             }
             "/observer" => self.open_observer(view),
             "/privacy" => self.open_privacy(view),
+            "/report" => {
+                view.push_transient("Drawing the state of the machine (last 7 days)…");
+                let _ = self.work.send(Work::Report);
+            }
             "/orders" => {
                 let orders = reeve_core::orders::Orders::new(&self.home);
                 let seeded = orders.seed_examples().unwrap_or(0);
@@ -1533,6 +1539,30 @@ fn spawn_worker(
                     }
                     Work::Survey => {
                         tokio::spawn(survey(tools.clone(), home.clone(), tx.clone(), false));
+                    }
+                    Work::Report => {
+                        let (tx, home) = (tx.clone(), home.clone());
+                        tokio::task::spawn_blocking(move || {
+                            let r = reeve_observer::report::gather(&home, 7);
+                            let msg = match reeve_observer::report::write(&home, &r) {
+                                Ok(path) => match reeve_observer::report::open(&path) {
+                                    Ok(()) => (
+                                        Speaker::System,
+                                        format!(
+                                            "Opened the state of the machine: {}",
+                                            path.display()
+                                        ),
+                                    ),
+                                    Err(e) => {
+                                        (Speaker::System, format!("Wrote {} ({e})", path.display()))
+                                    }
+                                },
+                                Err(e) => {
+                                    (Speaker::Error, format!("couldn't write the report: {e}"))
+                                }
+                            };
+                            let _ = tx.send(UiMsg::Notice(msg.0, msg.1));
+                        });
                     }
                     Work::Reflect => {
                         let _ = agent_tx.send(AgentWork::Reflect);

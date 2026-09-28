@@ -39,6 +39,10 @@ pub const COMMANDS: &[Command] = &[
         about: "reeved service and the drafter's budget",
     },
     Command {
+        name: "/report",
+        about: "the state of the machine as a page: charts, drift, findings",
+    },
+    Command {
         name: "/privacy",
         about: "what the model sees; OpenRouter routing",
     },

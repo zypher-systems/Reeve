@@ -445,7 +445,9 @@ impl Observer {
         let _ = self.baselines.save(&self.home);
         self.baselines.write_notes(&self.memory, &self.os);
         self.store.prune(30, now);
-        prune_metrics(&self.home.join("observer").join("metrics"), 14);
+        prune_metrics(&self.home.join("observer").join("metrics"), 31);
+        // Today's snapshot of packages and units, for the report's drift.
+        crate::report::drift::save_daily(&self.home, &reeve_core::distro::Distro::detect());
     }
 
     async fn slow_checks(&mut self) {

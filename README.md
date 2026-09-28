@@ -44,6 +44,7 @@ cargo build --release --locked -p reeve-cli && ./target/release/reeve
 
 - `reeve key set <connection>` stores an API key (the same as `/providers` in the TUI).
 - `reeve models [filter]` lists a connection's models with live prices, including cache read and write rates. Models Reeve can't drive are hidden: ones without tool calling, and image, speech, embedding, and batch-only models. `--all` shows them, and so does `tab` in `/model`.
+- `reeve report [--days N]` draws the state of the machine as a page and opens it (also `/report` in the TUI). See below.
 - `reeve spend` shows today and this month, across every Reeve session.
 - `reeve receipts [list|show N|verify]` lists receipts, prints one in full, or checks the whole chain.
 - `reeve undo N` reverses the action on receipt N and writes a receipt for the undo.
@@ -148,6 +149,22 @@ the scope is receipted as `order:<id>`. Anything outside it is refused, and the 
 `/findings`. Nobody is there to type a password, so root commands need a sudoers rule: `reeve orders sudoers <id>`
 prints exact ones, and never wildcards. `reeve orders run <id>` runs one now, exactly as `reeved` would. Order
 files and Reeve's own config are floor-protected (T3), so the model can't give itself unattended powers.
+
+## The state of the machine
+
+`/report` (or `reeve report --days 1|7|30`) draws one page and opens it in your browser:
+
+- **Headlines:** what needs you, worst first.
+- **Vital signs:** CPU, memory and swap, temperature, load, and network over the window. Hover for readings.
+- **Disks:** use, growth per day, and when each disk will be full at that rate.
+- **What changed:**
+  - packages installed, upgraded, or removed;
+  - kernels, and whether a reboot is pending;
+  - units enabled or disabled;
+  - files edited in `/etc`, with Reeve's own edits marked by receipt.
+- **Findings,** **Reeve's work** (verified, rolled back, undone), **spend** by day and role, and **what Reeve has learned**.
+
+It's drawn locally from what reeved and the receipts already recorded: no model, no cost, and nothing leaves the machine. Pages go to `~/.reeve/reports/`, readable only by you, and the last 20 are kept. reeved keeps 31 days of minute readings, and takes a daily snapshot of packages and units, so the "what changed" section fills in over time.
 
 ## Privacy
 
