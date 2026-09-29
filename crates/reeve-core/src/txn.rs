@@ -90,6 +90,10 @@ impl Check {
                         "checks must only read, and `{command}` is {}",
                         a.tier.label()
                     ))
+                } else if a.quiet_write {
+                    Some(format!(
+                        "checks must only read, and `{command}` writes files"
+                    ))
                 } else if a.sudo {
                     Some("checks run without root".into())
                 } else {
@@ -295,14 +299,23 @@ mod tests {
             .problem(&c)
             .is_none()
         );
-        assert!(
-            Check::Command {
-                command: "rm -rf /tmp/x".into(),
-                expect: None
-            }
-            .problem(&c)
-            .is_some()
-        );
+        // Whatever is or isn't in /tmp: deleting there, or writing a new
+        // file there, is still not a read.
+        for command in [
+            "rm -rf /tmp/x",
+            "rm -rf /tmp/reeve-test-not-there",
+            "echo hi > /tmp/reeve-test-not-there",
+        ] {
+            assert!(
+                Check::Command {
+                    command: command.into(),
+                    expect: None
+                }
+                .problem(&c)
+                .is_some(),
+                "{command}"
+            );
+        }
         assert!(
             Check::UnitActive {
                 unit: "a; rm".into(),
