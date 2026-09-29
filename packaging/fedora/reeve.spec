@@ -10,7 +10,7 @@
 %global __brp_mangle_shebangs_exclude_from ^/usr/src/debug/.*$
 
 Name:           reeve
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        An operator agent that manages this computer, with receipts
 
@@ -77,6 +77,10 @@ install -Dpm 0644 packaging/systemd/reeved.service %{buildroot}%{_userunitdir}/r
 %{_userunitdir}/reeved.service
 
 %changelog
+* Tue Sep 29 2026 Zypher Systems <zypher@zyphersystems.com> - 0.3.0-1
+- A new TUI: a board of eight tiles (F1-F8); an open tile keeps the others live in a strip along the top.
+- New screens: needs you, activity, and what changed. The default theme is slate.
+
 * Mon Sep 28 2026 Zypher Systems <zypher@zyphersystems.com> - 0.2.0-1
 - A new TUI: the ledger (one timeline of what Reeve did and what it cost), full-screen tabs, and ctrl+k search.
 - New spend and system screens; the default theme is ink.

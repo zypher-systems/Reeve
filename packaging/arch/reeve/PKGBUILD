@@ -2,7 +2,7 @@
 #
 # Built from source, following the Arch Rust package guidelines.
 pkgname=reeve
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="An operator agent that manages this computer, with receipts"
 arch=('x86_64' 'aarch64')
