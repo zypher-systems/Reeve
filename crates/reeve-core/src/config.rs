@@ -136,6 +136,10 @@ pub struct ApprovalConfig {
     /// Start every session in YOLO mode (auto-approve T0–T2). The safeguard
     /// floor still asks.
     pub yolo: bool,
+    /// Run user-level changes Reeve can undo (file writes, edits, moves, and
+    /// deletes it keeps a copy of) without asking. Changes it can't undo,
+    /// system changes, and the floor still ask. Off by default.
+    pub undoable: bool,
 }
 
 /// `[snapshots]`.

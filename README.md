@@ -55,12 +55,29 @@ cargo build --release --locked -p reeve-cli && ./target/release/reeve
 
 | tier | what | asks? |
 | --- | --- | --- |
-| **T0** observe | reads, listings, status commands | no |
-| **T1** user change | files under your home or /tmp, user services, your processes | yes. `a` allows the same action for the rest of the session |
+| **T0** observe | reads, listings, status commands, and writes to Reeve's scratch folder | no |
+| **T1** user change | files under your home, existing files in /tmp, user services, your processes | yes (see below for fewer asks) |
 | **T2** system change | system files, packages, system services, anything with sudo | yes, every time |
 | **T3** floor | formatting disks, partition tables, bootloader, `rm -rf` of top-level dirs, protected packages, secrets | you type `yes`, even in YOLO |
 
 Reeve's own keys can't be read, and its receipts and undo store can't be written, by any tool, in any mode.
+
+**Reading never asks.** Commands are read the way the shell will run them: `if`, `for … do … done`, `case`, functions,
+and builtins like `cd` and `export` are structure, not programs; awk and sed programs that only print are reads (one
+that writes a file, pipes to a command, or calls `system()` asks); `tool --help` and `tool --version` ask nothing.
+
+**Scratch is free.** Each session has its own folder, `~/.reeve/scratch/<session>` (`$REEVE_SCRATCH` in every shell
+command), for intermediate files; writing there, or creating a new file in `/tmp`, never asks. Folders are cleared
+after a week. Unattended runs (the drafter, standing orders) still count these as writes.
+
+**Fewer asks for a T1 change:**
+- `a`: **yes to the rest of this request.** Every other user-level change until Reeve finishes answering you runs
+  without asking. (Inside a verified change, `a` is yes to the rest of that change.)
+- `s`: **this kind of change, all session.** It remembers what the action does, not its exact text: writes in
+  `~/Documents`, deletes in `~/Downloads`, or runs `flatpak`. The card says which.
+- `[approvals] undoable = true` (off by default): changes Reeve can undo (file writes, edits, moves, and deletes it
+  keeps a copy of) run without asking, each with an undo in the chat. Shell commands, which can't be undone, still
+  ask. The top bar shows `tiered · ↶ auto`.
 
 ## Verified changes
 
@@ -215,7 +232,7 @@ The composer is always at the bottom. On an open tile it knows what's selected: 
 | `$` | the spend statement (from an empty composer) |
 | `/` | commands: `/providers`, `/model`, `/findings`, `/orders`, `/spend`, `/system`, `/memory`, `/report`, `/privacy`, `/observer`, `/reflect`, `/receipts`, `/new`, `/yolo`, `/help`, `/quit` |
 | `^p` / `^r` | `/providers` / activity (`u` undo, `v` verify) |
-| `⏎` `a` `n` | on an approval: approve, allow for the session (in a verified change: yes to the rest of the change), deny |
+| `⏎` `a` `s` `n` | on an approval: approve · yes to the rest of this request (or of the verified change) · this kind of change all session · deny |
 | `^y` | YOLO: auto-approve T0–T2 actions. The safeguard floor still asks. |
 | `pgup` / `pgdn`, mouse wheel | scroll the chat |
 | `^c` | stop, clear, then quit |

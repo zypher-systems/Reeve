@@ -431,6 +431,9 @@ pub fn top_bar(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
                 .bg(t.mix(t.copper, t.bad, pulse))
                 .add_modifier(Modifier::BOLD),
         ));
+    } else if v.auto_undo {
+        // Changes Reeve can undo run without asking.
+        right.push(Span::styled(" tiered · ↶ auto ", t.pill(t.dim)));
     } else {
         right.push(Span::styled(" tiered ", t.pill(t.dim)));
     }
@@ -774,10 +777,11 @@ fn needs(f: &mut Frame, r: Rect, v: &View, t: &Theme) {
             ]
         } else {
             let mut k = vec![("⏎", "yes")];
-            if req.txn.is_some() {
+            if req.txn.is_some() || req.can_allow_turn {
                 k.push(("a", "yes to the rest"));
-            } else if req.can_allow_session {
-                k.push(("a", "this session"));
+            }
+            if req.can_allow_session {
+                k.push(("s", "this session"));
             }
             k.push(("n", "no"));
             k.push(("F1", "details"));

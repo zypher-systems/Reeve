@@ -22,7 +22,7 @@ type Planned = (
     String,
     Option<crate::diff::FileDiff>,
     bool,
-    Option<String>,
+    Vec<String>,
 );
 
 #[derive(Debug, Clone, Deserialize)]
@@ -421,7 +421,6 @@ pub(super) fn plan(ctx: &ToolCtx, c: &SysCall) -> Planned {
     } else {
         classify::assess(&ctx.paths, &c.command)
     };
-    let rule = (asm.tier == Tier::T1).then(|| format!("{}:{}", c.tool, c.command));
     let undoable = match c.capture {
         Capture::Transaction => ctx.distro.last_transaction().is_some(),
         Capture::Unit { .. } => true,
@@ -430,6 +429,12 @@ pub(super) fn plan(ctx: &ToolCtx, c: &SysCall) -> Planned {
     if matches!(c.capture, Capture::Transaction) && asm.tier < Tier::T2 {
         asm.raise(Tier::T2, "changes installed packages");
     }
+    let rule = if asm.tier == Tier::T1 {
+        asm.session_keys()
+            .unwrap_or_else(|| vec![format!("{}:{}", c.tool, c.command)])
+    } else {
+        Vec::new()
+    };
     (asm, c.command.clone(), None, undoable, rule)
 }
 

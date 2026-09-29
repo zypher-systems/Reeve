@@ -222,10 +222,11 @@ impl Scope {
                     .commands
                     .iter()
                     .any(|g| command_glob(g, &words) || command_glob(g, bare));
-                // A part that only reads (`| tail -n 5`) is always fine.
+                // A part that only reads (`| tail -n 5`) is always fine;
+                // one that writes, even where that needs no yes, isn't.
                 let reads = {
                     let asm = shell::assess(ctx, &words);
-                    asm.tier == Tier::T0 && asm.deny.is_none()
+                    asm.tier == Tier::T0 && asm.deny.is_none() && !asm.quiet_write
                 };
                 if !(listed || reads) {
                     return Err(if self.commands.is_empty() {

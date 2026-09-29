@@ -263,6 +263,8 @@ pub struct View {
     pub animate: bool,
     /// Auto-approve mode.
     pub yolo: bool,
+    /// Changes Reeve can undo run without asking (`[approvals] undoable`).
+    pub auto_undo: bool,
     /// Machine identity.
     pub host: HostInfo,
     /// Latest readings.
@@ -352,6 +354,7 @@ impl View {
             frame: 0,
             animate: true,
             yolo: false,
+            auto_undo: false,
             host,
             snap: Snapshot::default(),
             cpu_hist: VecDeque::with_capacity(HISTORY),

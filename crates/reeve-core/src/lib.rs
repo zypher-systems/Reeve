@@ -19,6 +19,7 @@ pub mod privacy;
 pub mod receipts;
 pub mod report;
 pub mod root;
+pub mod scratch;
 pub mod session;
 pub mod settings;
 pub mod snapshots;

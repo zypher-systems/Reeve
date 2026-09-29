@@ -1018,6 +1018,10 @@ fn help(f: &mut Frame, r: Rect, t: &Theme) {
         ("esc", "stop the turn · back to where you were · the board"),
         ("?", "on a tile: ask Reeve about what's selected"),
         (
+            "⏎ a s n",
+            "an approval: yes · yes to the rest of this request · this kind of change all session · no",
+        ),
+        (
             "ctrl+k",
             "search everything: fixes, findings, orders, memory, receipts",
         ),

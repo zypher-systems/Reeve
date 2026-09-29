@@ -491,8 +491,11 @@ fn needs(f: &mut Frame, area: Rect, v: &View, p: &NeedsPanel, t: &Theme) {
                     k = vec![("⏎", "yes")];
                     if a.req.txn.is_some() {
                         k.push(("a", "yes to the rest of this change"));
-                    } else if a.req.can_allow_session {
-                        k.push(("a", "allow for this session"));
+                    } else if a.req.can_allow_turn {
+                        k.push(("a", "yes to the rest of this request"));
+                    }
+                    if a.req.can_allow_session {
+                        k.push(("s", "this session"));
                     }
                     k.push(("n", "no"));
                 }

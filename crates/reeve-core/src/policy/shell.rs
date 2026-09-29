@@ -6,6 +6,11 @@
 //! restrictive tier of its parts. Wrappers (`sudo`, `env`, `nohup`, `timeout`,
 //! `xargs`, `bash -c`, `find -exec`) are looked through.
 //!
+//! Shell grammar (`if`, `for … do … done`, `case` patterns, functions) and
+//! builtins (`cd`, `export`, `read`) are structure, not programs. awk and
+//! sed programs are read: printing and substituting are reads; writing a
+//! file or running a command asks.
+//!
 //! Anything not recognized is a user-level change (T1), or a system change
 //! (T2) under `sudo`. The classifier errs toward asking.
 
@@ -48,9 +53,40 @@ fn assess_at(ctx: &PathCtx, command: &str, depth: usize) -> Assessment {
     for sub in &parsed.substitutions {
         a.merge(assess_at(ctx, sub, depth + 1));
     }
+    // Functions defined in this line: their bodies are checked where they're
+    // written, so a call to one is not an unknown program.
+    let funcs: Vec<&str> = parsed
+        .segments
+        .iter()
+        .filter_map(|s| {
+            if s.func_def {
+                s.words.last().map(String::as_str)
+            } else if s.words.first().is_some_and(|w| w == "function") {
+                s.words.get(1).map(String::as_str)
+            } else {
+                None
+            }
+        })
+        .collect();
     let mut prev: Option<&Segment> = None;
     for seg in &parsed.segments {
-        a.merge(assess_segment(ctx, seg, prev, depth));
+        if seg.pattern || seg.func_def {
+            prev = Some(seg);
+            continue;
+        }
+        let calls_func = command_words(&seg.words)
+            .and_then(|(_, w)| w.first().cloned())
+            .is_some_and(|p| funcs.contains(&p.as_str()));
+        if calls_func {
+            // Only its redirects are new.
+            let only = Segment {
+                words: Vec::new(),
+                ..seg.clone()
+            };
+            a.merge(assess_segment(ctx, &only, prev, depth));
+        } else {
+            a.merge(assess_segment(ctx, seg, prev, depth));
+        }
         prev = Some(seg);
     }
     a
@@ -91,6 +127,10 @@ struct Segment {
     redirects: Vec<(String, bool)>,
     /// This segment reads the previous one's output (`|`).
     piped: bool,
+    /// A `case` pattern (`start)`), not a command.
+    pattern: bool,
+    /// `name()`: a function's name being defined.
+    func_def: bool,
 }
 
 #[derive(Debug, Default)]
@@ -110,6 +150,8 @@ fn tokenize(src: &str) -> Result<Parsed, &'static str> {
     let mut want_target: Option<bool> = None;
     let mut want_heredoc = false;
     let mut heredocs: Vec<(String, bool)> = Vec::new();
+    // Open `(` subshells: a `)` with none open ends a `case` pattern.
+    let mut paren_depth = 0usize;
     let mut i = 0;
 
     macro_rules! end_word {
@@ -195,7 +237,10 @@ fn tokenize(src: &str) -> Result<Parsed, &'static str> {
             }
             '$' if chars.get(i + 1) == Some(&'(') => {
                 let (inner, end) = balanced(&chars, i + 2)?;
-                out.substitutions.push(inner);
+                // `$(( … ))` is arithmetic, not a command.
+                if !inner.starts_with('(') {
+                    out.substitutions.push(inner);
+                }
                 word.push_str("$SUBST");
                 in_word = true;
                 i = end;
@@ -232,7 +277,34 @@ fn tokenize(src: &str) -> Result<Parsed, &'static str> {
                     }
                 }
             }
-            ';' | '(' | ')' => {
+            // `(( … ))`: an arithmetic command, nothing runs.
+            '(' if chars.get(i + 1) == Some(&'(') && !in_word && seg.words.is_empty() => {
+                while i + 1 < chars.len() && !(chars[i] == ')' && chars[i + 1] == ')') {
+                    i += 1;
+                }
+                i += 1;
+            }
+            '(' if chars.get(i + 1) == Some(&')') => {
+                // `name()`: a function definition; its body is checked as written.
+                end_word!();
+                seg.func_def = true;
+                end_segment!(false);
+                i += 1;
+            }
+            '(' => {
+                paren_depth += 1;
+                end_segment!(false);
+            }
+            ')' => {
+                if paren_depth > 0 {
+                    paren_depth -= 1;
+                } else {
+                    end_word!();
+                    seg.pattern = true;
+                }
+                end_segment!(false);
+            }
+            ';' => {
                 end_segment!(false);
             }
             '|' => {
@@ -443,6 +515,14 @@ fn writes_all(ctx: &PathCtx, args: &[String], a: &mut Assessment) {
     }
 }
 
+/// Programs whose arguments are another program or code to run.
+const RUNS_OTHERS: &[&str] = &[
+    "sudo", "doas", "pkexec", "run0", "env", "nohup", "time", "command", "exec", "builtin",
+    "chronic", "unbuffer", "stdbuf", "setsid", "nice", "ionice", "timeout", "watch", "flock",
+    "xargs", "bash", "sh", "zsh", "dash", "fish", "ksh", "python", "python3", "perl", "ruby",
+    "node", "lua", "php", "eval", "source", ".", "trap",
+];
+
 /// Programs with no side effects in any form we accept here.
 const READ_ONLY: &[&str] = &[
     "cat",
@@ -597,6 +677,51 @@ fn assess_words(
         a.merge(assess_words(ctx, rest, piped, prev_prog, sudo, depth + 1));
     };
 
+    // Shell grammar, not programs: look past a keyword to the command it
+    // starts; a loop's word list is only read.
+    match prog_raw.as_str() {
+        "if" | "then" | "else" | "elif" | "while" | "until" | "do" | "!" | "{" => {
+            if words.len() > 1 {
+                look_through(&mut a, &words[1..], sudo);
+            }
+            return a;
+        }
+        "for" | "select" => {
+            if words.get(2).is_some_and(|w| w == "in") {
+                reads(ctx, &words[3..], &mut a);
+            }
+            return a;
+        }
+        "function" => {
+            // `function name { body`: the body runs when it's called.
+            let body: Vec<String> = words
+                .iter()
+                .skip(2)
+                .skip_while(|w| *w == "{")
+                .cloned()
+                .collect();
+            if !body.is_empty() {
+                look_through(&mut a, &body, sudo);
+            }
+            return a;
+        }
+        "fi" | "done" | "esac" | "}" | "case" | "in" => return a,
+        _ => {}
+    }
+
+    // `tool --help`, `tool sub --version`: asking an installed program about
+    // itself runs nothing. Not a script by path (it may ignore the flag), and
+    // not a wrapper or interpreter, whose next word is a program of its own.
+    let about_itself = args.iter().any(|x| x == "--help" || x == "--version")
+        && args
+            .iter()
+            .all(|x| !x.starts_with('-') || x == "--help" || x == "--version")
+        && !prog_raw.contains('/')
+        && !RUNS_OTHERS.contains(&prog);
+    if about_itself {
+        return a;
+    }
+
     match prog {
         // ── wrappers ──
         "sudo" | "doas" | "pkexec" | "run0" => {
@@ -705,6 +830,20 @@ fn assess_words(
             }
         }
         "eval" | "source" | "." => a.raise(Tier::T1, "runs code built at run time"),
+
+        // ── shell builtins: they change only the shell running the command ──
+        "cd" | "pushd" | "popd" | "dirs" | "export" | "unset" | "local" | "declare" | "typeset"
+        | "readonly" | "read" | "set" | "shift" | "wait" | "break" | "continue" | "return"
+        | "exit" | ":" | "[[" | "let" | "getopts" | "hash" | "umask" | "ulimit" | "alias"
+        | "unalias" | "shopt" | "jobs" | "disown" | "caller" => {
+            reads(ctx, args, &mut a);
+        }
+        "trap" => {
+            // The handler runs later, in this same shell: check it as a command.
+            if let Some(body) = args.first().filter(|b| !b.starts_with('-')) {
+                a.merge(assess_at(ctx, body, depth + 1));
+            }
+        }
 
         // ── plain reads ──
         p if READ_ONLY.contains(&p) => {
@@ -1111,19 +1250,23 @@ fn assess_words(
         // ── files ──
         "rm" => {
             let rec = has_flag(args, 'r', "--recursive") || has_flag(args, 'R', "--recursive");
+            let mut d = Assessment::new(Tier::T0);
             for p in positional(args) {
                 if rec {
-                    a.merge(recursive(ctx, p));
+                    d.merge(recursive(ctx, p));
                     if p.ends_with("/*") {
-                        a.merge(recursive(ctx, p.trim_end_matches("/*")));
+                        d.merge(recursive(ctx, p.trim_end_matches("/*")));
                     }
                 } else {
-                    a.merge(write(ctx, p));
+                    d.merge(write(ctx, p));
                 }
             }
             if positional(args).is_empty() {
-                a.raise(Tier::T1, "deletes files");
+                d.raise(Tier::T1, "deletes files");
             }
+            // Allowing deletes in a folder is not allowing writes there.
+            d.rekey("write:", "delete:");
+            a.merge(d);
         }
         "chmod" | "chown" | "chgrp" | "chattr" | "setfacl" => {
             let rec = has_flag(args, 'R', "--recursive");
@@ -1163,30 +1306,8 @@ fn assess_words(
                 a.raise(Tier::T1, "writes files");
             }
         }
-        "sed" => {
-            if args
-                .iter()
-                .any(|x| x.starts_with("-i") || x == "--in-place" || x.starts_with("--in-place="))
-            {
-                // The first positional is the script, unless given with -e/-f.
-                let scripted = args.iter().any(|x| x == "-e" || x == "-f");
-                let pos = positional(args);
-                let files = if scripted {
-                    &pos[..]
-                } else {
-                    pos.get(1..).unwrap_or(&[])
-                };
-                for f in files {
-                    a.merge(write(ctx, f));
-                }
-            } else {
-                // `w` inside a script can write a file the classifier can't see.
-                a.raise(Tier::T1, "sed scripts can write files");
-            }
-        }
-        "awk" | "gawk" | "mawk" => {
-            a.raise(Tier::T1, "awk programs can write files and run commands")
-        }
+        "sed" | "gsed" => assess_sed(ctx, args, &mut a),
+        "awk" | "gawk" | "mawk" | "nawk" => assess_awk(ctx, args, &mut a),
         "tar" | "unzip" | "zip" | "gzip" | "gunzip" | "xz" | "unxz" | "zstd" | "bzip2"
         | "bunzip2" | "7z" => {
             let listing = (prog == "tar" && (has_flag(args, 't', "--list")))
@@ -1366,10 +1487,27 @@ fn assess_words(
                 a.raise(Tier::T2, "loads or unloads a kernel module");
             }
         }
+        "reeve" => assess_reeve(ctx, args, &mut a),
+        "udevadm" => {
+            let verb = positional(args).first().copied().unwrap_or("");
+            if !matches!(
+                verb,
+                "info" | "monitor" | "settle" | "test" | "test-builtin" | ""
+            ) {
+                a.raise(Tier::T2, "changes device rules or triggers devices");
+            }
+        }
+        "abrt-cli" | "abrt" => {
+            let verb = positional(args).first().copied().unwrap_or("");
+            if !matches!(verb, "list" | "ls" | "info" | "i" | "status" | "st" | "") {
+                a.raise_keyed(Tier::T1, "changes or reports crash records", "run:abrt-cli");
+            }
+        }
         _ => {
-            a.raise(
+            a.raise_keyed(
                 Tier::T1,
                 format!("runs `{prog}`, which Reeve doesn't know yet"),
+                format!("run:{prog}"),
             );
             reads(ctx, args, &mut a);
         }
@@ -1379,6 +1517,447 @@ fn assess_words(
         a.raise(Tier::T2, "runs as root");
     }
     a
+}
+
+/// awk: printing and pattern matching are reads; an awk program that
+/// writes a file, pipes to a command, or calls `system()` asks, and so does
+/// one Reeve can't see (`-f`). gawk's `-i inplace` edits its files.
+fn assess_awk(ctx: &PathCtx, args: &[String], a: &mut Assessment) {
+    let mut programs: Vec<&str> = Vec::new();
+    let mut hidden = false;
+    let mut inplace = false;
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut i = 0;
+    let mut options = true;
+    while i < args.len() {
+        let x = args[i].as_str();
+        if options && x == "--" {
+            options = false;
+        } else if options && x.len() > 1 && x.starts_with('-') {
+            let next = args.get(i + 1).map(String::as_str);
+            match x {
+                "-F" | "-v" | "--field-separator" | "--assign" => i += 1,
+                "-f" | "--file" | "-E" | "--exec" => {
+                    hidden = true;
+                    i += 1;
+                }
+                "-i" | "--include" | "-l" | "--load" => {
+                    if next.is_some_and(|l| l.starts_with("inplace")) {
+                        inplace = true;
+                    } else {
+                        hidden = true;
+                    }
+                    i += 1;
+                }
+                "-e" | "--source" => {
+                    if let Some(p) = next {
+                        programs.push(p);
+                    }
+                    i += 1;
+                }
+                _ if x.starts_with("--include=") || x.starts_with("--load=") => {
+                    if x.contains("inplace") {
+                        inplace = true;
+                    } else {
+                        hidden = true;
+                    }
+                }
+                _ if x.starts_with("--file=") || x.starts_with("--exec=") => hidden = true,
+                _ if x.starts_with("--source=") => {
+                    programs.push(x.trim_start_matches("--source="));
+                }
+                _ if x.starts_with("-f") || x.starts_with("-E") => hidden = true,
+                // -F: -v… -W… and the rest take their value attached or none.
+                _ => {}
+            }
+        } else {
+            positionals.push(x);
+        }
+        i += 1;
+    }
+    let files: Vec<&str> = if hidden || !programs.is_empty() {
+        positionals
+    } else {
+        if let Some(p) = positionals.first() {
+            programs.push(p);
+        }
+        positionals.into_iter().skip(1).collect()
+    };
+    // `name=value` operands are assignments, not files.
+    let files: Vec<&str> = files
+        .into_iter()
+        .filter(|f| !f.contains('=') || f.contains('/'))
+        .collect();
+    if hidden {
+        a.raise(Tier::T1, "runs an awk script Reeve can't see");
+    }
+    for p in &programs {
+        if let Some(why) = awk_effects(p) {
+            a.raise(Tier::T1, why);
+        }
+    }
+    if inplace {
+        for f in &files {
+            a.merge(write(ctx, f));
+        }
+    } else {
+        for f in &files {
+            if looks_like_path(f) {
+                a.merge(read(ctx, f));
+            }
+        }
+    }
+}
+
+/// What an awk program does beyond reading and printing, if anything.
+fn awk_effects(program: &str) -> Option<&'static str> {
+    // Printing to the terminal's own streams is still printing.
+    static STD: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#">>?\s*"/dev/(stdout|stderr|null)""#).expect("regex"));
+    let program = STD.replace_all(program, "");
+    // Blank out string literals: what's quoted is data.
+    let mut code = String::new();
+    let mut chars = program.chars();
+    let mut in_str = false;
+    while let Some(c) = chars.next() {
+        if in_str {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => {
+                    in_str = false;
+                    code.push('"');
+                }
+                _ => {}
+            }
+        } else {
+            if c == '"' {
+                in_str = true;
+            }
+            code.push(c);
+        }
+    }
+    static SYSTEM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bsystem\s*\(").expect("regex"));
+    static PIPE_GETLINE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(^|[^|])\|&?\s*getline\b").expect("regex"));
+    static FILE_GETLINE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\bgetline\b[^;}\n|]*<").expect("regex"));
+    static PRINT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bprintf?\b").expect("regex"));
+    if code.contains("@load") || code.contains("@include") {
+        return Some("the awk program loads code Reeve can't see");
+    }
+    if SYSTEM.is_match(&code) {
+        return Some("the awk program runs commands (system)");
+    }
+    if PIPE_GETLINE.is_match(&code) || code.contains("|&") {
+        return Some("the awk program runs a command for its input");
+    }
+    if FILE_GETLINE.is_match(&code) {
+        return Some("the awk program reads a file it names itself");
+    }
+    // A print whose statement goes on to `>` or `|` (outside parentheses)
+    // sends its output to a file or a command.
+    for m in PRINT.find_iter(&code) {
+        let rest: Vec<char> = code[m.end()..].chars().collect();
+        let mut depth = 0i32;
+        let mut i = 0;
+        while i < rest.len() {
+            match rest[i] {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                ';' | '}' | '{' | '\n' => break,
+                '>' if depth <= 0 => return Some("the awk program writes files"),
+                '|' if depth <= 0 => {
+                    if rest.get(i + 1) == Some(&'|') {
+                        i += 1;
+                    } else {
+                        return Some("the awk program pipes to a command");
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+/// sed: substituting and printing are reads. `-i` edits its files; a
+/// script that writes (`w`, `s///w`) or runs (`e`, `s///e`) asks, and so
+/// does one Reeve can't see (`-f`). `--sandbox` rules both out.
+fn assess_sed(ctx: &PathCtx, args: &[String], a: &mut Assessment) {
+    let mut scripts: Vec<&str> = Vec::new();
+    let mut explicit = false;
+    let mut hidden = false;
+    let mut inplace = false;
+    let mut sandbox = false;
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut i = 0;
+    let mut options = true;
+    while i < args.len() {
+        let x = args[i].as_str();
+        let next = args.get(i + 1).map(String::as_str);
+        if options && x == "--" {
+            options = false;
+        } else if options && x.starts_with("--") {
+            match x {
+                "--expression" => {
+                    explicit = true;
+                    scripts.extend(next);
+                    i += 1;
+                }
+                "--file" => {
+                    explicit = true;
+                    hidden = true;
+                    i += 1;
+                }
+                "--line-length" => i += 1,
+                "--sandbox" => sandbox = true,
+                _ if x.starts_with("--expression=") => {
+                    explicit = true;
+                    scripts.push(x.trim_start_matches("--expression="));
+                }
+                _ if x.starts_with("--file=") => {
+                    explicit = true;
+                    hidden = true;
+                }
+                _ if x.starts_with("--in-place") => inplace = true,
+                _ => {}
+            }
+        } else if options && x.len() > 1 && x.starts_with('-') {
+            // A cluster of short options: `-ne 's/a/b/p'`, `-i.bak`, `-Ei`.
+            let cluster: Vec<char> = x[1..].chars().collect();
+            for (k, c) in cluster.iter().enumerate() {
+                let attached: String = cluster[k + 1..].iter().collect();
+                match c {
+                    'e' => {
+                        explicit = true;
+                        if attached.is_empty() {
+                            scripts.extend(next);
+                            i += 1;
+                        } else {
+                            scripts.push(&x[1 + k + 1..]);
+                        }
+                        break;
+                    }
+                    'f' => {
+                        explicit = true;
+                        hidden = true;
+                        if attached.is_empty() {
+                            i += 1;
+                        }
+                        break;
+                    }
+                    'l' => {
+                        if attached.is_empty() {
+                            i += 1;
+                        }
+                        break;
+                    }
+                    // `-i` takes the rest of the cluster as a backup suffix.
+                    'i' => {
+                        inplace = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            positionals.push(x);
+        }
+        i += 1;
+    }
+    let files: Vec<&str> = if explicit {
+        positionals
+    } else {
+        if let Some(sc) = positionals.first() {
+            scripts.push(sc);
+        }
+        positionals.into_iter().skip(1).collect()
+    };
+    if !sandbox {
+        if hidden {
+            a.raise(Tier::T1, "runs a sed script Reeve can't see");
+        }
+        for sc in &scripts {
+            if let Err(why) = sed_effects(sc) {
+                a.raise(Tier::T1, why);
+            }
+        }
+    }
+    if inplace {
+        for f in &files {
+            a.merge(write(ctx, f));
+        }
+        if files.is_empty() {
+            a.raise(Tier::T1, "edits files in place");
+        }
+    } else {
+        for f in &files {
+            if looks_like_path(f) {
+                a.merge(read(ctx, f));
+            }
+        }
+    }
+}
+
+/// Walk a sed script command by command: `Err` if one writes a file, runs
+/// a command, or can't be read.
+fn sed_effects(script: &str) -> Result<(), &'static str> {
+    const UNREAD: &str = "the sed script couldn't be read";
+    let c: Vec<char> = script.chars().collect();
+    let n = c.len();
+    // The index after the next unescaped `d`.
+    let skip = |mut i: usize, d: char| -> Result<usize, &'static str> {
+        while i < n {
+            if c[i] == '\\' {
+                i += 2;
+                continue;
+            }
+            if c[i] == d {
+                return Ok(i + 1);
+            }
+            i += 1;
+        }
+        Err(UNREAD)
+    };
+    let mut i = 0;
+    loop {
+        while i < n && matches!(c[i], ' ' | '\t' | '\n' | ';') {
+            i += 1;
+        }
+        if i >= n {
+            return Ok(());
+        }
+        // Up to two addresses: a line, `$`, `/re/`, or `\%re%`.
+        for _ in 0..2 {
+            if c[i].is_ascii_digit() || c[i] == '$' {
+                while i < n && (c[i].is_ascii_digit() || matches!(c[i], '$' | '~' | '+')) {
+                    i += 1;
+                }
+            } else if c[i] == '/' {
+                i = skip(i + 1, '/')?;
+                while i < n && matches!(c[i], 'I' | 'M') {
+                    i += 1;
+                }
+            } else if c[i] == '\\' && i + 1 < n {
+                i = skip(i + 2, c[i + 1])?;
+                while i < n && matches!(c[i], 'I' | 'M') {
+                    i += 1;
+                }
+            } else {
+                break;
+            }
+            while i < n && c[i] == ' ' {
+                i += 1;
+            }
+            if i < n && c[i] == ',' {
+                i += 1;
+                while i < n && c[i] == ' ' {
+                    i += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        while i < n && matches!(c[i], ' ' | '!') {
+            i += 1;
+        }
+        if i >= n {
+            return Ok(());
+        }
+        let cmd = c[i];
+        i += 1;
+        match cmd {
+            '{' | '}' => {}
+            's' | 'y' => {
+                let d = *c.get(i).ok_or(UNREAD)?;
+                i = skip(i + 1, d)?;
+                i = skip(i, d)?;
+                // Flags, up to the end of the command.
+                while i < n && !matches!(c[i], ';' | '\n' | '}') {
+                    match c[i] {
+                        'w' | 'W' if cmd == 's' => return Err("the sed script writes a file"),
+                        'e' if cmd == 's' => return Err("the sed script runs commands"),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            'w' | 'W' => return Err("the sed script writes a file"),
+            'e' => return Err("the sed script runs commands"),
+            // Text, a file to read, or a comment: to the end of the line.
+            'a' | 'i' | 'c' | 'r' | 'R' | '#' => {
+                while i < n && c[i] != '\n' {
+                    i += 1;
+                }
+            }
+            // A label: to the end of the command.
+            ':' | 'b' | 't' | 'T' | 'v' => {
+                while i < n && !matches!(c[i], ';' | '\n') {
+                    i += 1;
+                }
+            }
+            'q' | 'Q' | 'l' | 'L' => {
+                while i < n && (c[i].is_ascii_digit() || c[i] == ' ') {
+                    i += 1;
+                }
+            }
+            'p' | 'P' | 'd' | 'D' | 'n' | 'N' | 'g' | 'G' | 'h' | 'H' | 'x' | '=' | 'z' | 'F' => {}
+            _ => return Err(UNREAD),
+        }
+    }
+}
+
+/// Reeve's own command line: most of it only reads.
+fn assess_reeve(ctx: &PathCtx, args: &[String], a: &mut Assessment) {
+    if args
+        .iter()
+        .any(|x| x == "--help" || x == "-h" || x == "--version" || x == "-V")
+    {
+        return;
+    }
+    let words: Vec<&str> = positional(args);
+    match words.as_slice() {
+        ["key", ..] => a.refuse("Reeve's API keys aren't managed by tools"),
+        ["models", ..] | ["spend"] | ["doctor"] | ["receipts", ..] | ["daemon", "status"] => {}
+        ["orders"]
+        | [
+            "orders",
+            "list" | "show" | "check" | "sudoers" | "examples",
+            ..,
+        ] => {}
+        ["orders", "run", ..] => a.raise_keyed(
+            Tier::T1,
+            "asks reeved to run a standing order now",
+            "run:reeve orders run",
+        ),
+        ["daemon", ..] => a.raise(Tier::T2, "changes the reeved service"),
+        ["report", ..] => {
+            if let Some(out) = args
+                .windows(2)
+                .find(|w| w[0] == "--out")
+                .map(|w| w[1].clone())
+            {
+                a.merge(write(ctx, &out));
+            }
+            if !args.iter().any(|x| x == "--no-open") {
+                a.raise_keyed(
+                    Tier::T1,
+                    "opens the report in your browser",
+                    "run:reeve report",
+                );
+            }
+        }
+        ["undo", ..] => a.raise(Tier::T1, "undoes an earlier action"),
+        [] => a.raise(Tier::T1, "starts another Reeve"),
+        _ => a.raise_keyed(
+            Tier::T1,
+            "runs a Reeve command it doesn't know",
+            "run:reeve",
+        ),
+    }
 }
 
 fn assess_find(ctx: &PathCtx, args: &[String], a: &mut Assessment, sudo: bool, depth: usize) {
@@ -1644,9 +2223,150 @@ mod tests {
 
     #[test]
     fn heredoc_bodies_are_data() {
-        let cmd = "cat > /tmp/notes <<'EOF'\nrm -rf /\nmkfs.ext4 /dev/sda\nEOF\necho done";
+        let cmd = "cat > ~/notes <<'EOF'\nrm -rf /\nmkfs.ext4 /dev/sda\nEOF\necho done";
         let a = assess(&PathCtx::for_tests(), cmd);
         assert_eq!(a.tier, Tier::T1, "{a:?}");
+    }
+
+    #[test]
+    fn the_package_list_session_asks_only_for_the_file() {
+        // Three of the four steps that asked on 2026-09-28 (the fourth, the
+        // write to ~/Nexus.md, still asks).
+        for cmd in [
+            r#"dnf repoquery --userinstalled --queryformat '%{name}\t%{evr}\t%{reason}\t%{summary}' 2>/dev/null | awk -F '\t' '$3=="User" || $3=="External User"' | sort > /tmp/reeve-test-not-there/user-rpms.tsv; wc -l /tmp/reeve-test-not-there/user-rpms.tsv; echo '---'; cut -f1,2,4 /tmp/reeve-test-not-there/user-rpms.tsv"#,
+            r#"dnf repoquery --userinstalled --queryformat '%{name}|%{evr}|%{reason}|%{summary}\n' > /tmp/reeve-test-not-there/user-rpms.raw; wc -l /tmp/reeve-test-not-there/user-rpms.raw; cut -d'|' -f3 /tmp/reeve-test-not-there/user-rpms.raw | sort | uniq -c; head -3 /tmp/reeve-test-not-there/user-rpms.raw | od -c | head -20"#,
+            r#"awk -F'|' '$3=="User" || $3=="External User"' /tmp/reeve-test-not-there/user-rpms.raw | sort > /tmp/reeve-test-not-there/user-explicit.tsv; cat /tmp/reeve-test-not-there/user-explicit.tsv"#,
+            r#"dnf repoquery --userinstalled > $REEVE_SCRATCH/rpms.txt; sort $REEVE_SCRATCH/rpms.txt"#,
+        ] {
+            let a = assess(&PathCtx::for_tests(), cmd);
+            assert_eq!(a.tier, Tier::T0, "{cmd}\n{a:?}");
+        }
+    }
+
+    #[test]
+    fn awk_and_sed_that_only_read_are_observe() {
+        for cmd in [
+            "systemctl --user list-units --all --no-legend --plain 'app-com.getmailspring.Mailspring@*' | awk '{print $1}'",
+            r#"awk 'NR>1 {s[$1]+=$3} END {for (k in s) printf "%s %d\n", k, s[k]}' /proc/swaps"#,
+            r#"ps -eo pid,rss,comm | awk '$3=="mysqld"{c++;r+=$2} END{print c, r/1024 " MiB RSS"}'"#,
+            r#"awk '/^Name:/{n=$2} /^VmSwap:/{if($2+0>1024) printf "%8d kB %s %s\n",$2,n,FILENAME}' /proc/self/status"#,
+            r#"awk '{print > "/dev/stderr"}' /etc/hosts"#,
+            r#"awk -v min=5 '$2 > min {print $1}' /etc/hosts"#,
+            "sed -n '1,20p' /etc/fstab",
+            "sed 's/a/b/g' /etc/hosts",
+            "sed -e 's|/usr|/opt|' -e '/^#/d' /etc/hosts",
+            "sed -ne '/swap/p' /etc/fstab",
+            r"sed 's/\//x/g;y/ab/cd/;$!N' /etc/hosts",
+            "sed --sandbox '1w /tmp/x' /etc/hosts",
+        ] {
+            assert_eq!(tier(cmd), Tier::T0, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn awk_and_sed_that_write_or_run_ask() {
+        for cmd in [
+            r#"awk '{print > "out.txt"}' /etc/hosts"#,
+            r#"awk '{print $1 | "sort"}' /etc/hosts"#,
+            r#"awk 'BEGIN{system("rm -rf ~")}'"#,
+            r#"awk 'BEGIN{"date" | getline d; print d}'"#,
+            "awk -f script.awk /etc/hosts",
+            "sed 's/a/b/w copy.txt' /etc/hosts",
+            "sed '1w copy.txt' /etc/hosts",
+            "sed '1e date' /etc/hosts",
+            "sed -f edit.sed /etc/hosts",
+            "sed -i 's/a/b/' ~/notes.txt",
+        ] {
+            assert!(tier(cmd) >= Tier::T1, "{cmd}");
+        }
+        assert_eq!(tier("gawk -i inplace '{print}' /etc/hosts"), Tier::T2);
+        assert_eq!(tier("sed -i.bak 's/a/b/' /etc/hosts"), Tier::T2);
+        assert_eq!(tier("sed -ni 's/a/b/p' /etc/hosts"), Tier::T2);
+    }
+
+    #[test]
+    fn shell_grammar_is_structure_not_programs() {
+        for cmd in [
+            r#"for f in /proc/[0-9]*/status; do awk '/^VmSwap:/{print $2}' "$f"; done | sort -n | tail -3"#,
+            "if [ -f /etc/fstab ]; then cat /etc/fstab; else echo none; fi",
+            r#"while read -r l; do echo "$l"; done < /etc/hosts"#,
+            r#"case "$(uname -m)" in x86_64) echo 64;; aarch64) echo arm;; esac"#,
+            "f() { ls /etc; }; f",
+            "function g { uname -a; }; g",
+            "cd /var/log && ls -la",
+            "export LC_ALL=C; locale",
+            "[[ -d /etc ]] && echo yes",
+            "x=$((1+2)); echo $x; ((x++))",
+            "(cd /etc && ls) | wc -l",
+            "trap 'echo bye' EXIT; echo hi",
+        ] {
+            let a = assess(&PathCtx::for_tests(), cmd);
+            assert_eq!(a.tier, Tier::T0, "{cmd}\n{a:?}");
+        }
+        // Grammar doesn't hide what a body does, or what a loop reads.
+        assert_eq!(
+            tier(r#"for f in ~/Downloads/*.tmp; do rm "$f"; done"#),
+            Tier::T1
+        );
+        assert_eq!(tier(r#"for k in ~/.ssh/*; do cat "$k"; done"#), Tier::T3);
+        assert_eq!(tier("trap 'rm -rf ~' EXIT"), Tier::T3);
+        assert_eq!(tier("function g { rm -rf ~; }; g"), Tier::T3);
+        assert_eq!(tier("g() { rm -rf ~; }; g"), Tier::T3);
+    }
+
+    #[test]
+    fn what_asks_is_named_by_what_it_does() {
+        let ctx = PathCtx::for_tests();
+        let keys = |cmd: &str| assess(&ctx, cmd).session_keys();
+        assert_eq!(
+            keys("echo hi > ~/notes/a.txt"),
+            Some(vec!["write:~/notes".into()])
+        );
+        assert_eq!(keys("mytool --sync"), Some(vec!["run:mytool".into()]));
+        assert_eq!(
+            keys("rm ~/Downloads/old.iso"),
+            Some(vec!["delete:~/Downloads".into()])
+        );
+        // Something with no name for what it does is allowed as itself only.
+        assert_eq!(keys(r#"awk '{print > "x"}' /etc/hosts"#), None);
+        // Asking a program about itself doesn't run it.
+        assert_eq!(tier("mytool --help"), Tier::T0);
+        assert_eq!(tier("mytool sync --version"), Tier::T0);
+        assert_eq!(tier("mytool --delete --help"), Tier::T1);
+        assert_eq!(tier("dnf --version"), Tier::T0);
+        assert_eq!(tier("systemctl --help"), Tier::T0);
+        // A script by path may ignore the flag; an interpreter runs its script.
+        assert_eq!(tier("./wipe.sh --help"), Tier::T1);
+        assert_eq!(tier("python3 wipe.py --help"), Tier::T1);
+        assert_eq!(tier("sudo rm -rf / --help"), Tier::T3);
+    }
+
+    #[test]
+    fn reeve_reads_about_itself() {
+        for cmd in [
+            "reeve --help",
+            "reeve daemon status",
+            "reeve orders list",
+            "reeve receipts verify",
+            "reeve report --no-open --days 1",
+            "reeve models openrouter",
+        ] {
+            assert_eq!(tier(cmd), Tier::T0, "{cmd}");
+        }
+        assert_eq!(tier("reeve report"), Tier::T1);
+        assert_eq!(tier("abrt-cli list 2>/dev/null | head -30"), Tier::T0);
+        assert_eq!(
+            tier("udevadm info -q property -n /dev/input/event8"),
+            Tier::T0
+        );
+        assert_eq!(tier("udevadm trigger"), Tier::T2);
+        assert_eq!(tier("reeve undo 3"), Tier::T1);
+        assert_eq!(tier("reeve daemon install"), Tier::T2);
+        assert!(
+            assess(&PathCtx::for_tests(), "reeve key set openrouter")
+                .deny
+                .is_some()
+        );
     }
 
     #[test]

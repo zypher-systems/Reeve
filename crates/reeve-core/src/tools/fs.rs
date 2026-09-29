@@ -21,7 +21,7 @@ const MAX_READ: usize = 64 * 1024;
 const MAX_OUTPUT: usize = 48 * 1024;
 const DIFF_ROWS: usize = 400;
 
-type Planned = (Assessment, String, Option<FileDiff>, bool, Option<String>);
+type Planned = (Assessment, String, Option<FileDiff>, bool, Vec<String>);
 
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct PathArg {
@@ -97,9 +97,10 @@ fn show(ctx: &ToolCtx, p: &Path) -> String {
     }
 }
 
-/// A T1 rule key: this tool in this directory.
-fn rule_for(tool: &str, a: &Assessment, p: &Path) -> Option<String> {
-    (a.tier == Tier::T1).then(|| format!("{tool}:{}", p.parent().unwrap_or(p).display()))
+/// What "allow for this session" remembers for a T1 file change: what it
+/// does and where (`write:~/notes`).
+fn session_rules(a: &Assessment) -> Vec<String> {
+    a.session_keys().unwrap_or_default()
 }
 
 fn ok(output: String, summary: String) -> Executed {
@@ -151,7 +152,7 @@ pub(super) fn plan_read(ctx: &ToolCtx, a: &ReadArgs) -> Planned {
         format!("read {}", show(ctx, &p)),
         None,
         false,
-        None,
+        Vec::new(),
     )
 }
 
@@ -162,7 +163,7 @@ pub(super) fn plan_list(ctx: &ToolCtx, a: &ListArgs) -> Planned {
         format!("list {}", show(ctx, &p)),
         None,
         false,
-        None,
+        Vec::new(),
     )
 }
 
@@ -182,7 +183,7 @@ pub(super) fn plan_search(ctx: &ToolCtx, a: &SearchArgs) -> Planned {
     if matches!(ctx.paths.classify(&p), PathClass::Sensitive(_)) {
         asm.tier = Tier::T3;
     }
-    (asm, what, None, false, None)
+    (asm, what, None, false, Vec::new())
 }
 
 pub(super) fn plan_stat(ctx: &ToolCtx, a: &PathArg) -> Planned {
@@ -192,7 +193,13 @@ pub(super) fn plan_stat(ctx: &ToolCtx, a: &PathArg) -> Planned {
     if ctx.paths.classify(&p) == PathClass::ReeveKeys {
         asm.refuse("Reeve's own API keys are never readable by tools");
     }
-    (asm, format!("stat {}", show(ctx, &p)), None, false, None)
+    (
+        asm,
+        format!("stat {}", show(ctx, &p)),
+        None,
+        false,
+        Vec::new(),
+    )
 }
 
 /// You can't write it yourself: it goes through `sudo reeve root`.
@@ -230,7 +237,7 @@ pub(super) fn plan_write(ctx: &ToolCtx, a: &WriteArgs) -> Planned {
     } else {
         "create"
     };
-    let rule = rule_for("fs_write", &asm, &p);
+    let rule = session_rules(&asm);
     (
         asm,
         format!("{verb} {}", show(ctx, &p)),
@@ -244,19 +251,31 @@ pub(super) fn plan_edit(ctx: &ToolCtx, a: &EditArgs) -> Result<Planned, String> 
     let p = ctx.paths.resolve(&a.path);
     let mut asm = policy::write(&ctx.paths, &a.path);
     if asm.deny.is_some() {
-        return Ok((asm, format!("edit {}", show(ctx, &p)), None, false, None));
+        return Ok((
+            asm,
+            format!("edit {}", show(ctx, &p)),
+            None,
+            false,
+            Vec::new(),
+        ));
     }
     let root = as_root(&mut asm, &p);
     let old = match fs::read_to_string(&p) {
         Ok(t) => t,
         // Unreadable as you (0600 root files): the root side checks the edit.
         Err(e) if root && e.kind() == ErrorKind::PermissionDenied => {
-            return Ok((asm, format!("edit {}", show(ctx, &p)), None, true, None));
+            return Ok((
+                asm,
+                format!("edit {}", show(ctx, &p)),
+                None,
+                true,
+                Vec::new(),
+            ));
         }
         Err(e) => return Err(io_msg(&p, &e)),
     };
     let new = apply_edit(&old, a)?;
-    let rule = rule_for("fs_write", &asm, &p);
+    let rule = session_rules(&asm);
     Ok((
         asm,
         format!("edit {}", show(ctx, &p)),
@@ -289,7 +308,7 @@ pub(super) fn plan_move(ctx: &ToolCtx, a: &MoveArgs) -> Planned {
     if from.is_dir() {
         asm.merge(policy::recursive(&ctx.paths, &a.from));
     }
-    let rule = rule_for("fs_move", &asm, &from);
+    let rule = session_rules(&asm);
     (
         asm,
         format!("move {} → {}", show(ctx, &from), show(ctx, &to)),
@@ -315,7 +334,9 @@ pub(super) fn plan_delete(ctx: &ToolCtx, a: &DeleteArgs) -> Planned {
     } else {
         fs::read_to_string(&p).ok().map(|old| diff(&old, "", 60))
     };
-    let rule = rule_for("fs_delete", &asm, &p);
+    // Allowing deletes in a folder is not allowing writes there.
+    asm.rekey("write:", "delete:");
+    let rule = session_rules(&asm);
     let what = if is_dir { "delete folder" } else { "delete" };
     (
         asm,

@@ -22,6 +22,8 @@ pub enum PathClass {
     Sensitive(&'static str),
     /// Scratch space (`/tmp`, `/var/tmp`, `/run/user/<uid>`).
     Temp,
+    /// This session's own scratch folder (`~/.reeve/scratch/<session>`).
+    Scratch,
     /// Under the user's home.
     Home,
     /// Anything else: system files.
@@ -41,6 +43,8 @@ pub struct PathCtx {
     pub uid: u32,
     /// `uname -r`, to recognize the running kernel's packages.
     pub kernel: String,
+    /// This session's scratch folder, where writing never asks.
+    pub scratch: Option<PathBuf>,
 }
 
 const FLOOR_ROOTS: &[&str] = &[
@@ -76,6 +80,7 @@ impl PathCtx {
             kernel: std::fs::read_to_string("/proc/sys/kernel/osrelease")
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default(),
+            scratch: None,
         }
     }
 
@@ -87,6 +92,7 @@ impl PathCtx {
             cwd: "/home/u".into(),
             uid: 1000,
             kernel: "6.17.4-200.fc44.x86_64".into(),
+            scratch: Some("/home/u/.reeve/scratch/test".into()),
         }
     }
 
@@ -104,6 +110,12 @@ impl PathCtx {
             .or_else(|| raw.strip_prefix("${HOME}"))
         {
             format!("{home}{rest}")
+        } else if let (Some(rest), Some(scratch)) = (
+            raw.strip_prefix("$REEVE_SCRATCH")
+                .or_else(|| raw.strip_prefix("${REEVE_SCRATCH}")),
+            &self.scratch,
+        ) {
+            format!("{}{rest}", scratch.display())
         } else {
             raw.to_string()
         };
@@ -149,13 +161,27 @@ impl PathCtx {
         if let Some(what) = self.sensitive(p) {
             return PathClass::Sensitive(what);
         }
-        if self.is_temp(p) {
-            return PathClass::Temp;
+        if self.scratch.as_ref().is_some_and(|s| p.starts_with(s)) {
+            return PathClass::Scratch;
         }
         if p.starts_with(&self.home) {
             return PathClass::Home;
         }
+        if self.is_temp(p) {
+            return PathClass::Temp;
+        }
         PathClass::System
+    }
+
+    /// A resolved path's directory as the owner reads it: `~/notes` under
+    /// home, else absolute.
+    pub fn show_dir(&self, p: &Path) -> String {
+        let dir = p.parent().unwrap_or(p);
+        match dir.strip_prefix(&self.home) {
+            Ok(rel) if rel.as_os_str().is_empty() => "~".into(),
+            Ok(rel) => format!("~/{}", rel.display()),
+            Err(_) => dir.display().to_string(),
+        }
     }
 
     /// `/`, a top-level system directory, the home directory, or one of its
@@ -352,6 +378,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             uid: 1000,
             kernel: String::new(),
+            scratch: None,
         };
         let p = ctx.resolve(&format!("{}/fstab", link.display()));
         assert_eq!(p, PathBuf::from("/etc/fstab"));

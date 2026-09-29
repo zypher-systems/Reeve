@@ -338,6 +338,8 @@ fn asking() -> crate::view::Pending {
             preview: None,
             undoable: true,
             can_allow_session: true,
+            session_scope: Some("writes in ~/.config/Mailspring".into()),
+            can_allow_turn: true,
             command: None,
             paths: vec![],
             txn: Some(reeve_core::txn::TxnBrief {

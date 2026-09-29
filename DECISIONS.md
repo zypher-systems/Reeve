@@ -2,6 +2,25 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-29: Less asking: reads are reads, scratch is free, and a yes can cover more
+- **Decision:**
+  - The shell classifier reads grammar and programs: `if`/`for`/`case`/functions and builtins are structure; awk and sed programs are parsed, and only writing, piping to a command, or running one asks; `tool --help`/`--version` is T0 for installed programs; Reeve's own read-only commands are T0.
+  - Each session has a scratch folder (`~/.reeve/scratch/<session>`, `$REEVE_SCRATCH`) where writes are T0, and creating a new file in /tmp is T0. Both are marked `quiet_write`, so standing orders and the drafter still treat them as writes.
+  - "Allow for this session" (`s`) remembers what an action does (`write:~/notes`, `delete:~/Downloads`, `run:flatpak`), not its exact text. An action with a part that can't be named that way falls back to its exact text.
+  - New: "yes to the rest of this request" (`a`), T1 only, ends when the turn ends.
+  - New setting `[approvals] undoable`, off by default: T1 changes with an undo run without asking.
+- **Chosen vs rejected:**
+  - The owner asked Reeve to gather installed packages into a Markdown file and pressed a key eight times; the receipts show three of the four asks in that session were reads or scratch files. Fixing precision (what counts as a change) came first; broader yeses second.
+  - Rejected making T1 run silently by default: shell changes can't be undone, and the tiers are the product's promise. The undoable setting is opt-in.
+  - Rejected keying session yeses by program name alone for known programs: the effect (a folder, a kind of change) is what the owner is agreeing to.
+  - Rejected treating all of /tmp as scratch: an existing file there may belong to something running; only new files are free.
+- **Why:** A request is one intent; the owner should be asked about the change it makes to their files, not about every read and intermediate file on the way.
+- **Where:** `policy/shell.rs` (`assess_awk`, `awk_effects`, `assess_sed`, `sed_effects`, keywords, builtins, `RUNS_OTHERS`, `assess_reeve`), `policy/mod.rs` (`Assessment::keys`, `session_keys`, `quiet_write`, `describe_key`, `write`), `policy/paths.rs` (`PathClass::Scratch`, `show_dir`), `scratch.rs`, `agent.rs` (`approve`, `Decision::AllowTurn`, `turn_allowed`), `orders.rs` (`quiet_write` isn't a read), TUI keys `a`/`s`
+- **Residual risks:**
+  - The awk and sed readers are conservative parsers, not full grammars: something they can't read asks; a print redirect hidden in an odd construct could pass as a read.
+  - `--help` is trusted for installed programs by name; a program that ignores it would run.
+  - A new /tmp file is judged at planning time; a symlink planted between planning and running isn't seen.
+
 ### 2026-09-29: The TUI is a board of tiles
 - **Decision:**
   - Home is a board of eight tiles, one per F-key: needs you, health, findings, activity, spend, changed, orders, memory.

@@ -38,16 +38,22 @@ pub(super) fn plan(
     String,
     Option<crate::diff::FileDiff>,
     bool,
-    Option<String>,
+    Vec<String>,
 ) {
     let mut paths = ctx.paths.clone();
     if let Some(cwd) = &a.cwd {
         paths.cwd = paths.resolve(cwd);
     }
     let asm = classify::assess(&paths, &a.command);
-    // Allowing "this exact command" for the session is the only rule a
-    // command gets: a program name alone is too broad.
-    let rule = (asm.tier == Tier::T1).then(|| format!("shell:{}", a.command.trim()));
+    // "Allow for this session" remembers what the command does (writes in
+    // ~/notes, runs flatpak); a command whose every part can't be named that
+    // way is allowed as this exact command only.
+    let rule = if asm.tier == Tier::T1 {
+        asm.session_keys()
+            .unwrap_or_else(|| vec![format!("shell:{}", a.command.trim())])
+    } else {
+        Vec::new()
+    };
     (asm, a.command.trim().to_string(), None, false, rule)
 }
 
@@ -133,6 +139,10 @@ pub(crate) async fn run_command(ctx: &ToolCtx, spec: RunSpec<'_>) -> RunOut {
         ("DEBIAN_FRONTEND", "noninteractive"),
     ] {
         cmd.env(k, v);
+    }
+    // The session's scratch folder, where writing never asks.
+    if let Some(dir) = &ctx.paths.scratch {
+        cmd.env("REEVE_SCRATCH", dir);
     }
     let _armed = match (&ctx.askpass, spec.sudo) {
         (Some(ap), true) => {

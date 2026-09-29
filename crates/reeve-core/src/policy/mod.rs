@@ -63,6 +63,17 @@ pub struct Assessment {
     pub deny: Option<String>,
     /// The action asks for root (`sudo`).
     pub sudo: bool,
+    /// What its T1 parts do, as keys "allow for this session" can remember
+    /// (`write:~/Documents`, `delete:/tmp`, `run:flatpak`).
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// A T1 part has no key: it can only be allowed as this exact action.
+    #[serde(default)]
+    pub unkeyed: bool,
+    /// It writes, but only where writing needs no yes (the session's
+    /// scratch folder, a new file in /tmp). Unattended runs still count it.
+    #[serde(default)]
+    pub quiet_write: bool,
 }
 
 impl Assessment {
@@ -73,18 +84,57 @@ impl Assessment {
             reasons: Vec::new(),
             deny: None,
             sudo: false,
+            keys: Vec::new(),
+            unkeyed: false,
+            quiet_write: false,
         }
     }
 
-    /// Raise to at least `tier`, noting why.
+    /// Raise to at least `tier`, noting why. A T1 raise this way has no
+    /// key, so the action can't be allowed for the session by what it does.
     pub fn raise(&mut self, tier: Tier, why: impl Into<String>) {
-        let why = why.into();
+        if tier == Tier::T1 {
+            self.unkeyed = true;
+        }
+        self.lift(tier, why.into());
+    }
+
+    /// Raise to at least `tier`, noting why, with the key a T1 yes for the
+    /// session is remembered by.
+    pub fn raise_keyed(&mut self, tier: Tier, why: impl Into<String>, key: impl Into<String>) {
+        if tier == Tier::T1 {
+            let key = key.into();
+            if !self.keys.contains(&key) {
+                self.keys.push(key);
+            }
+        }
+        self.lift(tier, why.into());
+    }
+
+    fn lift(&mut self, tier: Tier, why: String) {
         if tier > self.tier {
             self.tier = tier;
         }
         if tier > Tier::T0 && !why.is_empty() && !self.reasons.contains(&why) {
             self.reasons.push(why);
         }
+    }
+
+    /// Rename keys starting `from` to start `to` instead (`write:` →
+    /// `delete:` for a removal).
+    pub fn rekey(&mut self, from: &str, to: &str) {
+        for k in &mut self.keys {
+            if let Some(rest) = k.strip_prefix(from) {
+                *k = format!("{to}{rest}");
+            }
+        }
+    }
+
+    /// What "allow for this session" remembers for this action: its keys,
+    /// when it's T1 and every part of it has one.
+    pub fn session_keys(&self) -> Option<Vec<String>> {
+        (self.tier == Tier::T1 && !self.unkeyed && !self.keys.is_empty() && self.deny.is_none())
+            .then(|| self.keys.clone())
     }
 
     /// Refuse, keeping the first reason given.
@@ -101,6 +151,13 @@ impl Assessment {
                 self.reasons.push(r);
             }
         }
+        for k in other.keys {
+            if !self.keys.contains(&k) {
+                self.keys.push(k);
+            }
+        }
+        self.unkeyed |= other.unkeyed;
+        self.quiet_write |= other.quiet_write;
         self.tier = self.tier.max(other.tier);
         self.sudo |= other.sudo;
         if self.deny.is_none() {
@@ -126,10 +183,11 @@ pub fn read(ctx: &PathCtx, path: &str) -> Assessment {
 
 /// Assess a write, move target, or delete of `path`.
 pub fn write(ctx: &PathCtx, path: &str) -> Assessment {
-    let mut a = Assessment::new(Tier::T1);
+    let mut a = Assessment::new(Tier::T0);
     let p = ctx.resolve(path);
     match ctx.classify(&p) {
         PathClass::ReeveKeys | PathClass::ReeveAudit => {
+            a.raise(Tier::T1, "");
             a.refuse("Reeve's keys, receipts, and undo store can't be changed by tools");
         }
         PathClass::FloorFile(what) => a.raise(
@@ -138,13 +196,33 @@ pub fn write(ctx: &PathCtx, path: &str) -> Assessment {
         ),
         PathClass::FloorDir(what) => a.raise(Tier::T3, format!("targets {what} itself")),
         PathClass::Sensitive(what) => a.raise(Tier::T2, format!("changes {what}")),
-        PathClass::Home | PathClass::Temp => a.raise(Tier::T1, "changes your files"),
+        // Reeve's own scratch folder for the session: nothing of yours is there.
+        PathClass::Scratch => a.quiet_write = true,
+        // A file in /tmp that doesn't exist yet can't clobber anything.
+        PathClass::Temp if !p.exists() => a.quiet_write = true,
+        PathClass::Home | PathClass::Temp => a.raise_keyed(
+            Tier::T1,
+            "changes your files",
+            format!("write:{}", ctx.show_dir(&p)),
+        ),
         PathClass::System => a.raise(
             Tier::T2,
             format!("changes system files ({})", short_dir(&p)),
         ),
     }
     a
+}
+
+/// What a session key means, for the approval card: `writes in ~/notes`.
+pub fn describe_key(key: &str) -> String {
+    match key.split_once(':') {
+        Some(("write", dir)) => format!("writes in {dir}"),
+        Some(("delete", dir)) => format!("deletes in {dir}"),
+        Some(("perms", dir)) => format!("permission changes in {dir}"),
+        Some(("run", prog)) => format!("runs `{prog}`"),
+        Some(("shell", _)) => "this exact command".into(),
+        _ => key.to_string(),
+    }
 }
 
 /// Assess a recursive delete (or recursive chmod/chown) rooted at `path`.
@@ -193,7 +271,12 @@ mod tests {
         assert_eq!(read(&ctx, "~/.ssh/id_ed25519.pub").tier, Tier::T0);
         assert!(read(&ctx, "/home/u/.reeve/keys/openrouter").deny.is_some());
         assert_eq!(write(&ctx, "~/.bashrc").tier, Tier::T1);
-        assert_eq!(write(&ctx, "/tmp/x").tier, Tier::T1);
+        assert_eq!(write(&ctx, "~/.bashrc").keys, vec!["write:~"]);
+        // A new file in /tmp can't clobber anything; an existing one can.
+        assert_eq!(
+            write(&ctx, "/tmp/reeve-test-surely-not-there-3f9a").tier,
+            Tier::T0
+        );
         assert_eq!(write(&ctx, "/etc/hosts").tier, Tier::T2);
         assert_eq!(write(&ctx, "/etc/fstab").tier, Tier::T3);
         assert!(
@@ -204,5 +287,37 @@ mod tests {
         assert_eq!(recursive(&ctx, "~").tier, Tier::T3);
         assert_eq!(recursive(&ctx, "/usr").tier, Tier::T3);
         assert_eq!(recursive(&ctx, "~/Downloads/old").tier, Tier::T1);
+    }
+
+    #[test]
+    fn the_session_scratch_folder_never_asks() {
+        let ctx = PathCtx::for_tests();
+        for p in [
+            "/home/u/.reeve/scratch/test/list.tsv",
+            "$REEVE_SCRATCH/list.tsv",
+            "${REEVE_SCRATCH}/out/a.md",
+        ] {
+            assert_eq!(write(&ctx, p).tier, Tier::T0, "{p}");
+        }
+        assert_eq!(recursive(&ctx, "$REEVE_SCRATCH/out").tier, Tier::T0);
+        // Other sessions' scratch, and Reeve's own files, are not scratch.
+        assert_eq!(write(&ctx, "~/.reeve/scratch/other/x").tier, Tier::T1);
+    }
+
+    #[test]
+    fn keys_merge_and_say_what_they_allow() {
+        let mut a = Assessment::new(Tier::T0);
+        a.raise_keyed(Tier::T1, "changes your files", "write:~/notes");
+        let mut b = Assessment::new(Tier::T0);
+        b.raise_keyed(Tier::T1, "runs flatpak", "run:flatpak");
+        a.merge(b);
+        assert_eq!(
+            a.session_keys(),
+            Some(vec!["write:~/notes".to_string(), "run:flatpak".to_string()])
+        );
+        a.raise(Tier::T1, "something with no key");
+        assert_eq!(a.session_keys(), None);
+        assert_eq!(describe_key("write:~/notes"), "writes in ~/notes");
+        assert_eq!(describe_key("run:flatpak"), "runs `flatpak`");
     }
 }

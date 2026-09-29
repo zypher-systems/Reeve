@@ -186,6 +186,7 @@ pub fn run(cfg: Config, home: PathBuf) -> io::Result<()> {
     let mut view = View::new(host.clone());
     view.animate = cfg.ui.animate;
     view.yolo = cfg.approvals.yolo;
+    view.auto_undo = cfg.approvals.undoable;
     view.caps = Caps {
         session: cfg.spend.session_usd,
         daily: cfg.spend.daily_usd,
@@ -1965,7 +1966,8 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char('y') => Some(Decision::Approve),
             KeyCode::Char('a') if p.req.txn.is_some() => Some(Decision::AllowChange),
-            KeyCode::Char('a') if p.req.can_allow_session => Some(Decision::AllowSession),
+            KeyCode::Char('a') if p.req.can_allow_turn => Some(Decision::AllowTurn),
+            KeyCode::Char('s') if p.req.can_allow_session => Some(Decision::AllowSession),
             KeyCode::Char('n') => Some(Decision::Deny(None)),
             _ => None,
         };

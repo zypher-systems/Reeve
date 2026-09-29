@@ -48,6 +48,11 @@ pub struct ApprovalRequest {
     pub undoable: bool,
     /// "Allow for this session" may be offered (T1 only).
     pub can_allow_session: bool,
+    /// What "allow for this session" would remember, in words
+    /// (`writes in ~/notes · runs flatpak`).
+    pub session_scope: Option<String>,
+    /// "Yes to the rest of this request" may be offered (T1 only).
+    pub can_allow_turn: bool,
     /// The exact command, for shell and system tools.
     pub command: Option<String>,
     /// Resolved paths it changes, for file tools.
@@ -61,8 +66,12 @@ pub struct ApprovalRequest {
 pub enum Decision {
     /// Yes, this once.
     Approve,
-    /// Yes, and the same action again this session (T1 only).
+    /// Yes, and anything that does the same this session (T1 only): the
+    /// same kind of change in the same folder, the same program.
     AllowSession,
+    /// Yes, and every other user-level change (T1) until Reeve finishes
+    /// answering this request.
+    AllowTurn,
     /// Yes, and every other step of the verified change in progress (not
     /// T3): its checks and rollback still guard the whole change.
     AllowChange,
@@ -175,6 +184,8 @@ pub struct Agent {
     receipts: ReceiptBook,
     approver: Arc<dyn Approver>,
     allowed: HashSet<String>,
+    /// The owner said yes to the rest of this request (T1 only).
+    turn_allowed: bool,
     role: Option<String>,
     txn: Option<crate::txn::Txn>,
     /// The owner said yes to the rest of the open change.
@@ -243,6 +254,7 @@ impl Agent {
         machine_profile: &str,
     ) -> Result<Self> {
         let session = Session::create(&home, &connection, &model)?;
+        crate::scratch::prune(&home);
         let local = cfg
             .connections
             .get(&connection)
@@ -275,6 +287,7 @@ impl Agent {
             tally: Tally::default(),
             approver: Arc::new(DenyAll),
             allowed: HashSet::new(),
+            turn_allowed: false,
             role: None,
             txn: None,
             change_allowed: false,
@@ -365,6 +378,7 @@ impl Agent {
         self.transcript.clear();
         self.tally = Tally::default();
         self.allowed.clear();
+        self.turn_allowed = false;
         // Its changes keep their receipts; the commit receipt never comes.
         self.txn = None;
         Ok(())
@@ -395,7 +409,10 @@ impl Agent {
     /// Run one user turn, reporting through `emit`.
     pub async fn turn(&mut self, user: String, emit: &(dyn Fn(AgentEvent) + Send + Sync)) {
         emit(AgentEvent::TurnStarted);
+        // "Yes to the rest of this request" lasts one request.
+        self.turn_allowed = false;
         let result = self.turn_inner(user, emit).await;
+        self.turn_allowed = false;
         // Kept current after every turn, so it survives a crash.
         let _ = self.write_report();
         match result {
@@ -512,6 +529,7 @@ impl Agent {
         // Preferences the owner confirmed since the last turn apply now.
         self.tools.rules = self.memory.rules(&self.tools.paths.home);
         self.tools.session.clone_from(&self.session.meta.id);
+        self.tools.paths.scratch = crate::scratch::ensure(&self.home, &self.session.meta.id).ok();
         let msg = Message::new("user", user);
         self.session.append(&msg)?;
         self.transcript.push(msg);
@@ -527,8 +545,16 @@ impl Agent {
                 model: self.model.clone(),
                 // What reeved is reporting, read fresh each round.
                 system: Some(format!(
-                    "{}\n\n{}{}",
+                    "{}{}\n\n{}{}",
                     system_prompt(&self.machine_profile, &self.memory.profile(3500)),
+                    self.tools
+                        .paths
+                        .scratch
+                        .as_ref()
+                        .map_or(String::new(), |p| format!(
+                            "\n\nYour scratch folder this session ($REEVE_SCRATCH): {}",
+                            p.display()
+                        )),
                     crate::tools::obs::brief(&self.home),
                     if self.privacy().level == Level::Off {
                         ""
@@ -656,11 +682,19 @@ impl Agent {
             "change_commit" => return self.commit(&call.id, emit).await,
             _ => {}
         }
-        let plan = match tools::prepare(&self.tools, &call.name, &call.arguments) {
+        let mut plan = match tools::prepare(&self.tools, &call.name, &call.arguments) {
             Ok(p) => p,
             // Nothing happened, so there's nothing to receipt.
             Err(msg) => return Ok(call_error(call, &msg, emit)),
         };
+        // Unattended runs (the drafter, standing orders) write nothing on
+        // their own, not even where writing otherwise needs no yes.
+        if self.role.is_some() && plan.assessment.quiet_write {
+            plan.assessment.raise(
+                Tier::T1,
+                "writes a file, which an unattended run doesn't do on its own",
+            );
+        }
         let a = &plan.assessment;
         emit(AgentEvent::ToolStarted {
             id: call.id.clone(),
@@ -701,7 +735,10 @@ impl Agent {
                 Ok(by) => {
                     draft.approved_by = by;
                     executed = true;
-                    if a.tier >= Tier::T1 {
+                    // Changes join the open verified change, including ones
+                    // that didn't need a yes (a new file in scratch), so a
+                    // rollback takes them back too.
+                    if a.tier >= Tier::T1 || plan.undoable {
                         draft.txn = self.txn.as_ref().map(|t| t.id.clone());
                     }
                     // Root changes get a snapper pair when snapper covers `/`.
@@ -759,14 +796,24 @@ impl Agent {
         Ok(format!("{output}{tag}"))
     }
 
-    /// Who says yes: `policy` for T0, a session rule, YOLO (never T3), or the person.
+    /// Who says yes: `policy` for T0; for T1 a session rule, the rest of
+    /// this request, or the undoable setting; YOLO (never T3); or the person.
     async fn approve(&mut self, plan: &Plan) -> std::result::Result<String, Option<String>> {
         let tier = plan.assessment.tier;
         if tier == Tier::T0 {
             return Ok("policy".into());
         }
-        if tier == Tier::T1 && plan.rule.as_ref().is_some_and(|r| self.allowed.contains(r)) {
+        if tier == Tier::T1
+            && !plan.rules.is_empty()
+            && plan.rules.iter().all(|r| self.allowed.contains(r))
+        {
             return Ok("session-rule".into());
+        }
+        if tier == Tier::T1 && self.turn_allowed {
+            return Ok("request-rule".into());
+        }
+        if tier == Tier::T1 && plan.undoable && self.cfg.approvals.undoable {
+            return Ok("undoable-rule".into());
         }
         if tier <= Tier::T2 && self.approver.yolo() {
             return Ok("yolo".into());
@@ -783,7 +830,15 @@ impl Agent {
             why: plan.why.clone(),
             preview: plan.preview.clone(),
             undoable: plan.undoable,
-            can_allow_session: tier == Tier::T1 && plan.rule.is_some(),
+            can_allow_session: tier == Tier::T1 && !plan.rules.is_empty(),
+            session_scope: (tier == Tier::T1 && !plan.rules.is_empty()).then(|| {
+                plan.rules
+                    .iter()
+                    .map(|r| crate::policy::describe_key(r))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            }),
+            can_allow_turn: tier == Tier::T1,
             command: plan.command(),
             paths: plan.paths(&self.tools),
             txn: self.txn.as_ref().map(crate::txn::Txn::brief),
@@ -791,8 +846,14 @@ impl Agent {
         match self.approver.decide(req).await {
             Decision::Approve => Ok(self.approver.label()),
             Decision::AllowSession => {
-                if let (Tier::T1, Some(r)) = (tier, &plan.rule) {
-                    self.allowed.insert(r.clone());
+                if tier == Tier::T1 {
+                    self.allowed.extend(plan.rules.iter().cloned());
+                }
+                Ok(self.approver.label())
+            }
+            Decision::AllowTurn => {
+                if tier == Tier::T1 {
+                    self.turn_allowed = true;
                 }
                 Ok(self.approver.label())
             }
@@ -1193,6 +1254,11 @@ Every action is classified: T0 observe (runs at once), T1 user change, T2 system
 T3 floor (could destroy the system or leak secrets). T1–T3 wait for the owner's yes, so \
 investigate with T0 actions first and batch what you ask for. Give every call a short \
 `reason`: the owner reads it on the approval card and in the receipt.\n\
+Reading never asks: pipelines of reads (grep, awk and sed that only print, sort, cut) run \
+at once. Put intermediate files in your scratch folder, $REEVE_SCRATCH (its path is in \
+every shell command's environment): writing there never asks. Write the owner's own files \
+only for the result they asked for, with fs_write or fs_edit, so each is one approval with \
+an undo.\n\
 If the owner declines, don't retry the same thing; ask or propose another way. If \
 Reeve's policy refuses something, don't work around it.\n\
 Prefer the structured tools: sys_info for an overview; pkg_* for packages (their \
@@ -1268,7 +1334,15 @@ mod tests {
 
     /// An agent in a scratch home whose tools also treat that scratch dir as `~`.
     fn agent(turns: Vec<Vec<StreamDelta>>, approver: Arc<Fixed>) -> (tempfile::TempDir, Agent) {
-        let home = tempfile::tempdir().unwrap();
+        agent_at(tempfile::tempdir().unwrap(), turns, approver)
+    }
+
+    /// The same, in a home the test already made (to put files in it).
+    fn agent_at(
+        home: tempfile::TempDir,
+        turns: Vec<Vec<StreamDelta>>,
+        approver: Arc<Fixed>,
+    ) -> (tempfile::TempDir, Agent) {
         let reeve = home.path().join(".reeve");
         let mut a = Agent::new(
             Box::new(ReplayProvider::scripted(turns)),
@@ -1411,7 +1485,11 @@ mod tests {
         std::fs::create_dir_all(home.path().join(".reeve/keys")).unwrap();
         std::fs::write(home.path().join(".reeve/keys/openrouter"), "sk-secret").unwrap();
         run(&mut a).await;
-        assert!(approver.asked.lock().unwrap().is_empty());
+        assert!(
+            approver.asked.lock().unwrap().is_empty(),
+            "{:?}",
+            approver.asked.lock().unwrap()
+        );
         let rs = ReceiptBook::new(&a.home).all();
         assert_eq!(rs[0].approved_by, "policy");
         assert_eq!(rs[1].outcome.status, Status::Refused);
@@ -1420,12 +1498,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_for_session_covers_the_same_action_only() {
+    async fn allow_for_session_covers_the_same_kind_of_change_only() {
         let approver = fixed(Decision::AllowSession, false);
         let (_home, mut a) = agent(
             vec![
                 call("shell", serde_json::json!({"command": "touch ~/a"})),
+                // Another write in the same folder: covered.
+                call("shell", serde_json::json!({"command": "touch ~/b"})),
+                // A write in another folder, and a delete: each asks.
+                call("shell", serde_json::json!({"command": "touch ~/d/c"})),
+                call("shell", serde_json::json!({"command": "rm ~/a"})),
+                done("ok"),
+            ],
+            approver.clone(),
+        );
+        run(&mut a).await;
+        let asked = approver.asked.lock().unwrap();
+        assert_eq!(asked.len(), 3, "{asked:?}");
+        assert_eq!(asked[0].session_scope.as_deref(), Some("writes in ~"));
+        assert_eq!(asked[1].session_scope.as_deref(), Some("writes in ~/d"));
+        assert_eq!(asked[2].session_scope.as_deref(), Some("deletes in ~"));
+    }
+
+    #[tokio::test]
+    async fn yes_to_the_rest_of_the_request_lasts_one_request() {
+        let approver = fixed(Decision::AllowTurn, false);
+        let (_home, mut a) = agent(
+            vec![
                 call("shell", serde_json::json!({"command": "touch ~/a"})),
+                call(
+                    "fs_write",
+                    serde_json::json!({"path": "~/notes/n.md", "content": "hi"}),
+                ),
+                call("shell", serde_json::json!({"command": "mytool --sync"})),
+                done("ok"),
                 call("shell", serde_json::json!({"command": "touch ~/b"})),
                 done("ok"),
             ],
@@ -1434,9 +1540,80 @@ mod tests {
         run(&mut a).await;
         assert_eq!(
             approver.asked.lock().unwrap().len(),
-            2,
-            "the repeat was covered, the new command asked"
+            1,
+            "one yes covered the request"
         );
+        assert!(approver.asked.lock().unwrap()[0].can_allow_turn);
+        run(&mut a).await;
+        assert_eq!(
+            approver.asked.lock().unwrap().len(),
+            2,
+            "a new request asks again"
+        );
+        let by: Vec<String> = ReceiptBook::new(&a.home)
+            .all()
+            .iter()
+            .map(|r| r.approved_by.clone())
+            .collect();
+        assert_eq!(by, ["user", "request-rule", "request-rule", "user"]);
+    }
+
+    #[tokio::test]
+    async fn the_undoable_setting_runs_what_can_be_undone() {
+        let approver = fixed(Decision::Approve, false);
+        let (_home, mut a) = agent(
+            vec![
+                call(
+                    "fs_write",
+                    serde_json::json!({"path": "~/n.md", "content": "hi"}),
+                ),
+                // A shell change has no undo: it still asks.
+                call("shell", serde_json::json!({"command": "touch ~/a"})),
+                done("ok"),
+            ],
+            approver.clone(),
+        );
+        a.cfg.approvals.undoable = true;
+        run(&mut a).await;
+        assert_eq!(approver.asked.lock().unwrap().len(), 1);
+        let rs = ReceiptBook::new(&a.home).all();
+        assert_eq!(rs[0].approved_by, "undoable-rule");
+        assert!(rs[0].undo.is_some());
+    }
+
+    #[tokio::test]
+    async fn scratch_writes_never_ask_but_unattended_runs_still_count_them() {
+        let approver = fixed(Decision::Deny(None), false);
+        let cmd = "dnf --version >/dev/null; echo hi > $REEVE_SCRATCH/list.txt; cat $REEVE_SCRATCH/list.txt";
+        let (_home, mut a) = agent(
+            vec![
+                call("shell", serde_json::json!({"command": cmd})),
+                done("ok"),
+            ],
+            approver.clone(),
+        );
+        run(&mut a).await;
+        assert!(
+            approver.asked.lock().unwrap().is_empty(),
+            "{:?}",
+            approver.asked.lock().unwrap()
+        );
+        let scratch = a.tools.paths.scratch.clone().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("list.txt")).unwrap(),
+            "hi\n"
+        );
+        // The drafter (or a standing order) doesn't write on its own.
+        let (_home, mut d) = agent(
+            vec![
+                call("shell", serde_json::json!({"command": cmd})),
+                done("ok"),
+            ],
+            approver.clone(),
+        );
+        d.set_role("drafter");
+        run(&mut d).await;
+        assert_eq!(approver.asked.lock().unwrap().len(), 1);
     }
 
     fn calls(list: Vec<(&str, serde_json::Value)>) -> Vec<StreamDelta> {
@@ -1462,10 +1639,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_verified_change_that_passes_is_kept() {
-        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in(home.path()).unwrap();
         let note = tmp.path().canonicalize().unwrap().join("note.txt");
         let n = note.to_string_lossy().to_string();
-        let (_home, mut a) = agent(
+        let (_home, mut a) = agent_at(
+            home,
             vec![
                 calls(vec![
                     begin(&format!("grep -q bye {n}")),
@@ -1491,12 +1670,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_check_rolls_everything_back() {
-        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in(home.path()).unwrap();
         let dir = tmp.path().canonicalize().unwrap();
         let (note, other) = (dir.join("note.txt"), dir.join("other.txt"));
         std::fs::write(&other, "old\n").unwrap();
         let approver = fixed(Decision::Approve, false);
-        let (_home, mut a) = agent(
+        let (_home, mut a) = agent_at(
+            home,
             vec![
                 calls(vec![
                     begin(&format!("grep -q bye {}", note.display())),
@@ -1557,11 +1738,13 @@ mod tests {
 
     #[tokio::test]
     async fn yes_to_the_rest_of_a_change_covers_only_that_change() {
-        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in(home.path()).unwrap();
         let dir = tmp.path().canonicalize().unwrap();
         let file = |n: &str| dir.join(n).to_string_lossy().to_string();
         let approver = fixed(Decision::AllowChange, false);
-        let (_home, mut a) = agent(
+        let (_home, mut a) = agent_at(
+            home,
             vec![
                 calls(vec![
                     begin("true"),
@@ -1600,9 +1783,11 @@ mod tests {
 
     #[tokio::test]
     async fn an_open_change_is_checked_when_the_turn_ends() {
-        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in(home.path()).unwrap();
         let note = tmp.path().canonicalize().unwrap().join("note.txt");
-        let (_home, mut a) = agent(
+        let (_home, mut a) = agent_at(
+            home,
             vec![
                 calls(vec![
                     begin(&format!("grep -q bye {}", note.display())),
@@ -1635,7 +1820,7 @@ mod tests {
         let (_home, mut a) = agent(
             vec![
                 calls(vec![
-                    begin("rm -rf /tmp/whatever"),
+                    begin("rm -rf ~/whatever"),
                     ("change_commit", serde_json::json!({})),
                 ]),
                 done("ok"),

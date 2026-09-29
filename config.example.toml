@@ -40,6 +40,7 @@ warn_usd = 1.00
 
 [approvals]
 yolo = false                            # ^y toggles per session; the safeguard floor always asks
+undoable = false                        # changes Reeve can undo (file writes, edits, moves) run without asking
 
 [snapshots]
 enabled = true                          # snapper pre/post around root actions, when snapper covers /

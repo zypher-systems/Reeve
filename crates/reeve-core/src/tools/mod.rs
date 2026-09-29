@@ -85,8 +85,9 @@ pub struct Plan {
     pub why: Option<String>,
     /// Whether the receipt will carry an undo.
     pub undoable: bool,
-    /// Key for "allow for this session" (T1 only).
-    pub rule: Option<String>,
+    /// What "allow for this session" remembers (T1 only): every one must
+    /// already be allowed for the action to run without asking.
+    pub rules: Vec<String>,
     call: Call,
 }
 
@@ -189,7 +190,7 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
             other => return Err(format!("there is no tool named {other}")),
         }
     };
-    let (assessment, summary, preview, undoable, rule) = match &call {
+    let (assessment, summary, preview, undoable, rules) = match &call {
         Call::Read(a) => fs::plan_read(ctx, a),
         Call::List(a) => fs::plan_list(ctx, a),
         Call::Search(a) => fs::plan_search(ctx, a),
@@ -205,28 +206,28 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
             format!("search memory for {}", a.query()),
             None,
             false,
-            None,
+            Vec::new(),
         ),
         Call::MemRead(a) => (
             Assessment::new(crate::policy::Tier::T0),
             format!("read memory {}", a.id()),
             None,
             false,
-            None,
+            Vec::new(),
         ),
         Call::MemWrite(a) => (
             Assessment::new(crate::policy::Tier::T0),
             a.summary(),
             None,
             false,
-            None,
+            Vec::new(),
         ),
         Call::Findings(a) => (
             Assessment::new(crate::policy::Tier::T0),
             a.summary(),
             None,
             false,
-            None,
+            Vec::new(),
         ),
     };
     let mut assessment = assessment;
@@ -239,7 +240,7 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
         preview,
         why,
         undoable,
-        rule,
+        rules,
         call,
     })
 }

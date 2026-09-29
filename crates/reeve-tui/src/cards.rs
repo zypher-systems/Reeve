@@ -263,12 +263,26 @@ pub(crate) fn card_lines(p: &Pending, width: usize, t: &Theme) -> Vec<Line<'stat
         if r.txn.is_some() {
             spans.push(key("a"));
             spans.push(label("yes to the rest of this change"));
-        } else if r.can_allow_session {
+        } else if r.can_allow_turn {
             spans.push(key("a"));
-            spans.push(label("allow for this session"));
+            spans.push(label("yes to the rest of this request"));
+        }
+        if r.can_allow_session {
+            spans.push(key("s"));
+            spans.push(label("this session"));
         }
         spans.push(key("n"));
         spans.push(label("deny"));
+        // What `s` would allow, just above the keys.
+        if let (true, Some(scope)) = (r.can_allow_session, &r.session_scope) {
+            let blank = out.pop();
+            out.push(Line::from(vec![
+                Span::styled("s ", Style::default().fg(t.brass)),
+                Span::styled("allows for the rest of this session: ", t.ghost()),
+                Span::styled(truncate(scope, width.saturating_sub(38)), t.muted()),
+            ]));
+            out.extend(blank);
+        }
         out.push(Line::from(spans));
     }
     out
@@ -466,6 +480,8 @@ mod tests {
             preview: Some(diff("a\nb\n", "a\nc\n", 20)),
             undoable: true,
             can_allow_session: tier == Tier::T1,
+            session_scope: (tier == Tier::T1).then(|| "writes in ~".to_string()),
+            can_allow_turn: tier == Tier::T1,
             txn: None,
             command: None,
             paths: vec!["/home/u/.bashrc".into()],
@@ -489,7 +505,9 @@ mod tests {
             "add an alias",
             "+ c",
             "− b",
-            "allow for this session",
+            "yes to the rest of this request",
+            "this session",
+            "allows for the rest of this session: writes in ~",
             "a copy is kept",
         ] {
             assert!(s.contains(needle), "missing {needle:?}\n{s}");
