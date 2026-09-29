@@ -10,7 +10,7 @@
 %global __brp_mangle_shebangs_exclude_from ^/usr/src/debug/.*$
 
 Name:           reeve
-Version:        0.3.1
+Version:        0.3.2
 Release:        1%{?dist}
 Summary:        An operator agent that manages this computer, with receipts
 
@@ -77,6 +77,9 @@ install -Dpm 0644 packaging/systemd/reeved.service %{buildroot}%{_userunitdir}/r
 %{_userunitdir}/reeved.service
 
 %changelog
+* Tue Sep 29 2026 Zypher Systems <zypher@zyphersystems.com> - 0.3.2-1
+- 0.3.1's changes, published; a verified change's checks refuse writes that don't need a yes.
+
 * Tue Sep 29 2026 Zypher Systems <zypher@zyphersystems.com> - 0.3.1-1
 - Asks less: reads (awk and sed that print, shell loops, builtins, --help) run at once; a scratch folder never asks.
 - On an approval, a is yes to the rest of the request and s allows that kind of change for the session.
