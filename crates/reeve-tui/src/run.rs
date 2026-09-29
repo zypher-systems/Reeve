@@ -47,7 +47,7 @@ use crate::overlay::{
     Action, KeyEntry, ModelPicker, Overlay, ProviderRow, Providers, ReceiptsPanel, palette,
 };
 use crate::theme::{ColorMode, Theme};
-use crate::view::{Caps, Pending, RAIL_RECEIPTS, Speaker, Tab, View};
+use crate::view::{Caps, Pending, RAIL_RECEIPTS, Screen, Speaker, Tile, View};
 
 /// What the UI asks of the worker.
 enum Work {
@@ -61,7 +61,7 @@ enum Work {
     Reflect,
     /// Draw the state-of-the-machine page and open it.
     Report,
-    /// Gather the system tab's data for this many days.
+    /// Gather health and what changed for this many days.
     SystemReport(u32),
     /// Undo a receipt (may need sudo, so it runs on the worker).
     Undo {
@@ -96,7 +96,7 @@ enum UiMsg {
         result: Result<String, String>,
     },
     SessionReset(String),
-    /// The system tab's data.
+    /// Health and what changed, gathered.
     SystemReport(u32, Box<reeve_observer::report::Report>),
     /// The agent needs a yes or no.
     Approval(Box<ApprovalRequest>, tokio::sync::oneshot::Sender<Decision>),
@@ -167,10 +167,14 @@ struct App {
     /// The approved action a password request belongs to.
     last_action: String,
     memory: Memory,
-    /// When the TUI started: findings and drafts newer than this go on the ledger.
+    /// When the TUI started: findings and drafts newer than this go in the chat.
     started: chrono::DateTime<chrono::Utc>,
-    /// Findings and drafts already on the ledger.
+    /// Findings and drafts already in the chat.
     announced: std::collections::HashSet<String>,
+    /// When the board's numbers were last read from disk.
+    board_at: Option<Instant>,
+    /// When the board's day report was last asked for.
+    report_at: Option<Instant>,
 }
 
 /// Run the TUI until the user quits.
@@ -228,9 +232,12 @@ pub fn run(cfg: Config, home: PathBuf) -> io::Result<()> {
         memory: Memory::new(&home_for_memory),
         started: chrono::Utc::now(),
         announced: std::collections::HashSet::new(),
+        board_at: None,
+        report_at: None,
     };
     view.memory = app.memory.counts();
     app.poll_observer(&mut view);
+    app.refresh_board(&mut view);
     app.connect_quietly(&mut view);
 
     let mouse = app.cfg.ui.mouse;
@@ -296,6 +303,7 @@ fn event_loop(
             last_sample = Instant::now();
             // A few small files: cheap enough every second.
             app.poll_observer(view);
+            app.refresh_board(view);
         }
         if std::mem::take(&mut view.redraw) {
             term.clear()?;
@@ -315,22 +323,20 @@ fn event_loop(
                             None => view.insert(&s),
                         }
                     }
-                    Event::Mouse(m)
-                        if view.overlays.is_empty()
-                            || (view.overlays.len() == 1 && view.overlays[0].tab().is_some()) =>
-                    {
+                    Event::Mouse(m) if view.overlays.iter().all(|o| o.tile().is_some()) => {
+                        let chat = view.screen() == Screen::Chat;
                         match m.kind {
-                            MouseEventKind::Down(event::MouseButton::Left)
-                                if m.row == 0 && view.approval.is_none() =>
-                            {
-                                if let Some(tab) = crate::draw::tab_at(view, m.column) {
-                                    app.open_tab(view, tab);
+                            MouseEventKind::Down(event::MouseButton::Left) => {
+                                let size = term.size()?;
+                                let area =
+                                    ratatui::layout::Rect::new(0, 0, size.width, size.height);
+                                if let Some(tile) = crate::draw::click(area, view, m.column, m.row)
+                                {
+                                    app.open_tile(view, tile);
                                 }
                             }
-                            MouseEventKind::ScrollUp if view.overlays.is_empty() => {
-                                view.scroll += 3
-                            }
-                            MouseEventKind::ScrollDown if view.overlays.is_empty() => {
+                            MouseEventKind::ScrollUp if chat => view.scroll += 3,
+                            MouseEventKind::ScrollDown if chat => {
                                 view.scroll = view.scroll.saturating_sub(3);
                             }
                             _ => {}
@@ -414,12 +420,26 @@ impl App {
             UiMsg::Undone { seq, result } => self.undone(view, seq, result),
             UiMsg::Approval(req, reply) => {
                 self.last_action.clone_from(&req.summary);
-                // Menus give way to a question that needs an answer.
-                view.overlays.clear();
                 view.approval = Some(Pending {
                     req: *req,
                     typed: String::new(),
                 });
+                view.composing = false;
+                let alone = view.overlays.len() == 1;
+                match view.overlays.first_mut() {
+                    // F1 is where approvals live: stay, on it.
+                    Some(Overlay::Needs(p)) if alone => {
+                        p.asking = true;
+                        p.sel = 0;
+                    }
+                    // The board shows it in its needs-you tile.
+                    None if !view.chat => {}
+                    // Anything else gives way to the chat, where it's asked.
+                    _ => {
+                        view.overlays.clear();
+                        view.chat = true;
+                    }
+                }
                 view.scroll = 0;
                 self.reply = Some(reply);
             }
@@ -483,9 +503,17 @@ impl App {
             UiMsg::SystemReport(days, report) => {
                 if let Some(Overlay::System(p)) = view.overlays.first_mut() {
                     if p.days == days {
-                        p.report = Some(report);
+                        p.report = Some(report.clone());
                         p.loading = false;
                     }
+                }
+                if let Some(Overlay::Needs(p)) = view.overlays.first_mut() {
+                    if days == 1 {
+                        p.reboot.clone_from(&report.drift.reboot_for);
+                    }
+                }
+                if days == 1 {
+                    view.board.report = Some(report);
                 }
             }
             UiMsg::SessionReset(session) => {
@@ -503,6 +531,7 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && k.code == KeyCode::Char('c') && !view.overlays.is_empty() {
             view.overlays.clear();
+            view.composing = false;
             if let Some(r) = self.pw_reply.take() {
                 let _ = r.send(None);
             }
@@ -525,8 +554,9 @@ impl App {
             if ctrl && matches!(k.code, KeyCode::Char('k' | 'K')) {
                 if matches!(view.overlays.last(), Some(Overlay::Everything(_))) {
                     view.overlays.pop();
-                } else if view.approval.is_none() {
+                } else if view.approval.is_none() || view.screen() != Screen::Chat {
                     let items = self.everything(view);
+                    view.composing = false;
                     view.overlays
                         .push(Overlay::Everything(crate::overlay::EverythingPanel {
                             query: String::new(),
@@ -536,41 +566,93 @@ impl App {
                 }
                 return;
             }
-            let on_tab = view.overlays.len() == 1 && view.overlays[0].tab().is_some();
-            let on_screen = on_tab || view.overlays.is_empty();
-            if on_screen && view.approval.is_none() {
-                // Tab / Shift+Tab cycle the screens (on the ledger, unless
-                // the slash palette wants Tab to complete).
-                let completing = view.overlays.is_empty() && !palette(&view.input).is_empty();
+            let floating = view.overlays.iter().any(|o| o.tile().is_none());
+            if !floating {
+                // F1–F8 open a tile from anywhere; Tab and Shift+Tab walk
+                // the board and each tile (unless the slash palette wants
+                // Tab to complete).
+                let on_tile = matches!(view.screen(), Screen::Tile(_));
+                let completing = !on_tile && !palette(&view.input).is_empty();
                 match k.code {
-                    KeyCode::Tab if !completing => {
-                        let next = view.tab().next();
-                        self.open_tab(view, next);
-                        return;
-                    }
-                    KeyCode::BackTab => {
-                        let prev = view.tab().prev();
-                        self.open_tab(view, prev);
-                        return;
-                    }
-                    KeyCode::F(n @ 1..=6) => {
-                        if let Some(tab) = Tab::ALL.get(usize::from(n) - 1) {
-                            self.open_tab(view, *tab);
+                    KeyCode::F(n @ 1..=8) => {
+                        if let Some(tile) = Tile::ALL.get(usize::from(n) - 1) {
+                            self.open_tile(view, *tile);
                         }
+                        return;
+                    }
+                    KeyCode::Tab if !completing && !view.composing => {
+                        let next = view.screen().next();
+                        self.go(view, next);
+                        return;
+                    }
+                    KeyCode::BackTab if !view.composing => {
+                        let prev = view.screen().prev();
+                        self.go(view, prev);
                         return;
                     }
                     _ => {}
                 }
-            }
-            // alt+1…6 anywhere; plain digits when a tab (not a panel over it) has the keys.
-            if let KeyCode::Char(c) = k.code {
-                if (alt || (on_tab && !ctrl)) && view.approval.is_none() {
-                    if let Some(tab) = Tab::from_key(c) {
-                        self.open_tab(view, tab);
-                        return;
+                if let KeyCode::Char(c) = k.code {
+                    if !ctrl && on_tile && !view.composing {
+                        // On a tile: digits switch tiles, ? asks about
+                        // what's selected, / starts a command.
+                        if let Some(tile) = Tile::from_key(c) {
+                            self.open_tile(view, tile);
+                            return;
+                        }
+                        if c == '?' {
+                            view.composing = true;
+                            return;
+                        }
+                        if c == '/' {
+                            view.overlays.clear();
+                            view.input = "/".into();
+                            view.cursor = 1;
+                            return;
+                        }
+                    }
+                    if alt {
+                        if let Some(tile) = Tile::from_key(c) {
+                            self.open_tile(view, tile);
+                            return;
+                        }
                     }
                 }
             }
+        }
+        // A question about the tile on screen.
+        if view.composing {
+            match k.code {
+                KeyCode::Esc => {
+                    view.composing = false;
+                    view.input.clear();
+                    view.cursor = 0;
+                }
+                KeyCode::Enter if !alt && !k.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.ask_about(view);
+                }
+                _ => self.composer_key(view, k),
+            }
+            return;
+        }
+        // On F1, the approval's own row answers it.
+        let on_approval =
+            matches!(view.overlays.last(), Some(Overlay::Needs(p)) if p.on_approval());
+        if on_approval
+            && view.approval.is_some()
+            && !matches!(
+                k.code,
+                KeyCode::Esc | KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+            )
+        {
+            self.approval_key(view, k);
+            if view.approval.is_none() {
+                if let Some(Overlay::Needs(p)) = view.overlays.first_mut() {
+                    p.asking = false;
+                    p.sel = 0;
+                }
+            }
+            return;
         }
         if let Some(top) = view.overlays.last_mut() {
             let action = top.on_key(k);
@@ -581,10 +663,27 @@ impl App {
             self.approval_key(view, k);
             return;
         }
-        // `$` on an empty composer folds the ledger into its statement.
+        // `$` on an empty composer: the spend statement.
         if k.code == KeyCode::Char('$') && view.input.is_empty() {
-            self.open_tab(view, Tab::Spend);
+            self.open_tile(view, Tile::Spend);
             return;
+        }
+        // ↑ on the board's empty composer opens the chat; esc on the
+        // chat's empty composer goes home.
+        if view.input.is_empty() && !view.busy {
+            match (view.screen(), k.code) {
+                (Screen::Board, KeyCode::Up) => {
+                    view.chat = true;
+                    view.scroll = 0;
+                    return;
+                }
+                (Screen::Chat, KeyCode::Esc) => {
+                    view.chat = false;
+                    view.scroll = 0;
+                    return;
+                }
+                _ => {}
+            }
         }
         // The slash palette steals arrows, tab, and enter while it's open.
         let hits = palette(&view.input);
@@ -617,6 +716,36 @@ impl App {
             }
         }
         self.composer_key(view, k);
+    }
+
+    /// Go to a screen: the board, the chat, or a tile.
+    fn go(&mut self, view: &mut View, to: Screen) {
+        view.composing = false;
+        match to {
+            Screen::Board => {
+                view.overlays.clear();
+                view.chat = false;
+            }
+            Screen::Chat => {
+                view.overlays.clear();
+                view.chat = true;
+            }
+            Screen::Tile(tile) => self.open_tile(view, tile),
+        }
+    }
+
+    /// Send what was typed on a tile's screen, with what it's about.
+    fn ask_about(&mut self, view: &mut View) {
+        let Some(text) = view.take_input() else {
+            view.composing = false;
+            return;
+        };
+        let text = match crate::board::context(view) {
+            Some(about) => format!("About {about}: {text}"),
+            None => text,
+        };
+        view.composing = false;
+        self.perform(view, Action::Ask(text));
     }
 
     fn composer_key(&mut self, view: &mut View, k: KeyEvent) {
@@ -663,6 +792,7 @@ impl App {
                 if let Some(text) = view.take_input() {
                     view.push(Speaker::User, text.clone());
                     view.busy = true;
+                    view.chat = true;
                     let _ = self.work.send(Work::Send(text));
                 }
             }
@@ -711,30 +841,20 @@ impl App {
                 }
             }
             "/yolo" => self.toggle_yolo(view),
-            "/receipts" => {
-                let book = ReceiptBook::new(&self.home);
-                let items = book.recent(500);
-                let undone = items.iter().filter_map(|r| r.undoes).collect();
-                view.overlays.push(Overlay::Receipts(ReceiptsPanel {
-                    items,
-                    undone,
-                    sel: 0,
-                    note: None,
-                }));
-            }
+            "/receipts" => self.open_tile(view, Tile::Activity),
             "/help" => view.overlays.push(Overlay::Help),
-            "/findings" => self.open_tab(view, Tab::Findings),
-            "/spend" => self.open_tab(view, Tab::Spend),
-            "/system" => self.open_tab(view, Tab::System),
-            "/ledger" => self.open_tab(view, Tab::Ledger),
+            "/findings" => self.open_tile(view, Tile::Findings),
+            "/spend" => self.open_tile(view, Tile::Spend),
+            "/system" => self.open_tile(view, Tile::Health),
+            "/ledger" => self.go(view, Screen::Chat),
             "/observer" => self.open_observer(view),
             "/privacy" => self.open_privacy(view),
             "/report" => {
                 view.push_transient("Drawing the state of the machine (last 7 days)…");
                 let _ = self.work.send(Work::Report);
             }
-            "/orders" => self.open_tab(view, Tab::Orders),
-            "/memory" => self.open_tab(view, Tab::Memory),
+            "/orders" => self.open_tile(view, Tile::Orders),
+            "/memory" => self.open_tile(view, Tile::Memory),
             "/reflect" => {
                 if view.busy {
                     view.push(Speaker::System, "Stop the running turn first (esc).");
@@ -750,9 +870,10 @@ impl App {
     fn perform(&mut self, view: &mut View, action: Action) {
         match action {
             Action::None => {}
-            Action::Tab(tab) => self.open_tab(view, tab),
-            Action::TabSelect(tab, id) => {
-                self.open_tab(view, tab);
+            Action::Chat => self.go(view, Screen::Chat),
+            Action::Open(tile) => self.open_tile(view, tile),
+            Action::OpenSelect(tile, id) => {
+                self.open_tile(view, tile);
                 match view.overlays.first_mut() {
                     Some(Overlay::Findings(p)) => {
                         if let Some(i) = p.items.iter().position(|f| f.id == id) {
@@ -770,6 +891,7 @@ impl App {
             }
             Action::Ask(text) => {
                 view.overlays.clear();
+                view.chat = true;
                 if view.busy {
                     view.push(
                         Speaker::System,
@@ -788,8 +910,7 @@ impl App {
                 self.command(view, name);
             }
             Action::ShowReceipt(seq) => {
-                view.overlays.retain(|o| o.tab().is_some());
-                self.command(view, "/receipts");
+                self.open_tile(view, Tile::Activity);
                 if let Some(Overlay::Receipts(p)) = view.overlays.last_mut() {
                     if let Some(i) = p.items.iter().position(|r| r.seq == seq) {
                         p.sel = i;
@@ -811,7 +932,7 @@ impl App {
             Action::ExportSpend => {
                 let note = match view.overlays.first() {
                     Some(Overlay::Spend(p)) => export_spend(&self.home, p),
-                    _ => Err("open the spend tab first".into()),
+                    _ => Err("open spend (F5) first".into()),
                 };
                 if let Some(Overlay::Spend(p)) = view.overlays.first_mut() {
                     p.note = Some(note);
@@ -978,8 +1099,13 @@ impl App {
             Action::FindingStatus(id, st) => {
                 let store = FindingStore::new(&self.home);
                 let _ = store.set_status(&id, st);
-                if let Some(Overlay::Findings(p)) = view.overlays.last_mut() {
-                    p.refresh(store.list());
+                match view.overlays.last_mut() {
+                    Some(Overlay::Findings(p)) => p.refresh(store.list()),
+                    Some(Overlay::Needs(p)) => {
+                        p.fixes = live_fixes(&store);
+                        p.sel = p.sel.min(p.rows().len().saturating_sub(1));
+                    }
+                    _ => {}
                 }
                 self.poll_observer(view);
             }
@@ -1457,6 +1583,11 @@ impl App {
         for o in &mut view.overlays {
             match o {
                 Overlay::Findings(p) => p.refresh(FindingStore::new(&self.home).list()),
+                Overlay::Needs(p) => {
+                    p.fixes = live_fixes(&FindingStore::new(&self.home));
+                    p.asking = view.approval.is_some();
+                    p.sel = p.sel.min(p.rows().len().saturating_sub(1));
+                }
                 Overlay::Observer(p) => {
                     p.status.clone_from(&status);
                 }
@@ -1465,9 +1596,9 @@ impl App {
         }
     }
 
-    /// Go to a tab. Its screen is rebuilt from disk each time; the spend
-    /// tab keeps its range and the system tab its window.
-    fn open_tab(&mut self, view: &mut View, tab: Tab) {
+    /// Open a tile. Its screen is rebuilt from disk each time; spend keeps
+    /// its range, and health and what changed their window.
+    fn open_tile(&mut self, view: &mut View, tile: Tile) {
         let keep_range = match view.overlays.first() {
             Some(Overlay::Spend(p)) => Some((p.range, p.sel)),
             _ => None,
@@ -1477,15 +1608,41 @@ impl App {
             _ => None,
         };
         view.overlays.clear();
-        match tab {
-            Tab::Ledger => {}
-            Tab::Findings => {
+        view.composing = false;
+        match tile {
+            Tile::Needs => {
+                self.poll_observer(view);
+                view.overlays
+                    .push(Overlay::Needs(crate::overlay::NeedsPanel {
+                        asking: view.approval.is_some(),
+                        fixes: live_fixes(&FindingStore::new(&self.home)),
+                        reboot: view
+                            .board
+                            .report
+                            .as_ref()
+                            .and_then(|r| r.drift.reboot_for.clone()),
+                        sel: 0,
+                        scroll: 0,
+                    }));
+            }
+            Tile::Findings => {
                 self.poll_observer(view);
                 let mut p = crate::overlay::FindingsPanel::default();
                 p.refresh(FindingStore::new(&self.home).list());
                 view.overlays.push(Overlay::Findings(p));
             }
-            Tab::Orders => {
+            Tile::Activity => {
+                let book = ReceiptBook::new(&self.home);
+                let items = book.recent(500);
+                let undone = items.iter().filter_map(|r| r.undoes).collect();
+                view.overlays.push(Overlay::Receipts(ReceiptsPanel {
+                    items,
+                    undone,
+                    sel: 0,
+                    note: None,
+                }));
+            }
+            Tile::Orders => {
                 let orders = reeve_core::orders::Orders::new(&self.home);
                 let seeded = orders.seed_examples().unwrap_or(0);
                 let mut p = crate::overlay::OrdersPanel::load(&orders);
@@ -1496,12 +1653,12 @@ impl App {
                 }
                 view.overlays.push(Overlay::Orders(p));
             }
-            Tab::Memory => view
+            Tile::Memory => view
                 .overlays
                 .push(Overlay::Memory(crate::overlay::MemoryPanel::load(
                     &self.memory,
                 ))),
-            Tab::Spend => {
+            Tile::Spend => {
                 let (range, sel) =
                     keep_range.unwrap_or((crate::overlay::SpendRange::Day, usize::MAX));
                 let records = ledger::since(&self.home, range.since());
@@ -1529,17 +1686,46 @@ impl App {
                         note: None,
                     }));
             }
-            Tab::System => {
+            Tile::Health | Tile::Changed => {
                 let days = keep_days.unwrap_or(1);
+                // The board already holds the last day's report.
+                let report = (days == 1).then(|| view.board.report.clone()).flatten();
+                let loading = report.is_none();
                 view.overlays
                     .push(Overlay::System(crate::overlay::SystemPanel {
+                        changed: tile == Tile::Changed,
                         days,
-                        report: None,
-                        loading: true,
+                        report,
+                        loading,
                     }));
-                let _ = self.work.send(Work::SystemReport(days));
+                if loading {
+                    let _ = self.work.send(Work::SystemReport(days));
+                }
             }
         }
+    }
+
+    /// Re-read what the board shows from disk: spend by role and hour,
+    /// orders, and memory, every ten seconds; the day's report every
+    /// fifteen minutes.
+    fn refresh_board(&mut self, view: &mut View) {
+        if self
+            .report_at
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(15 * 60))
+        {
+            self.report_at = Some(Instant::now());
+            let _ = self.work.send(Work::SystemReport(1));
+        }
+        if self
+            .board_at
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+        {
+            return;
+        }
+        self.board_at = Some(Instant::now());
+        let report = view.board.report.take();
+        view.board = crate::board::read(&self.home, &self.memory);
+        view.board.report = report;
     }
 
     /// Everything ⌃K can find, freshly read.
@@ -1552,8 +1738,8 @@ impl App {
                 hits.push(Hit {
                     group: "FIX",
                     title: format!("Run the drafted fix: {}", f.title),
-                    detail: "verified, in the ledger".into(),
-                    place: "F2 findings".into(),
+                    detail: "verified, in the chat".into(),
+                    place: "F1 needs you".into(),
                     action: Action::UseProposal(f.id.clone()),
                 });
             }
@@ -1561,8 +1747,8 @@ impl App {
                 group: "SEE",
                 title: f.title.clone(),
                 detail: format!("{} · {}×", f.severity.as_str(), f.count),
-                place: "F2 findings".into(),
-                action: Action::TabSelect(Tab::Findings, f.id.clone()),
+                place: "F3 findings".into(),
+                action: Action::OpenSelect(Tile::Findings, f.id.clone()),
             });
         }
         for o in reeve_core::orders::Orders::new(&self.home).load().0 {
@@ -1570,8 +1756,8 @@ impl App {
                 group: "KEEP",
                 title: format!("Standing order: {}", o.name),
                 detail: if o.enabled { "on".into() } else { "off".into() },
-                place: "F3 orders".into(),
-                action: Action::TabSelect(Tab::Orders, o.id.clone()),
+                place: "F7 orders".into(),
+                action: Action::OpenSelect(Tile::Orders, o.id.clone()),
             });
         }
         for n in self.memory.all() {
@@ -1582,8 +1768,8 @@ impl App {
                 group: "KNOW",
                 title: n.title.clone(),
                 detail: n.layer.dir().trim_end_matches('s').to_string(),
-                place: "F5 memory".into(),
-                action: Action::TabSelect(Tab::Memory, n.id.clone()),
+                place: "F8 memory".into(),
+                action: Action::OpenSelect(Tile::Memory, n.id.clone()),
             });
         }
         for r in view.receipts.iter().take(40) {
@@ -1591,17 +1777,17 @@ impl App {
                 group: "GO",
                 title: format!("#{} {} {}", r.seq, r.tool, r.target()),
                 detail: r.outcome.summary.clone(),
-                place: "receipts".into(),
+                place: "F4 activity".into(),
                 action: Action::ShowReceipt(r.seq),
             });
         }
-        for tab in Tab::ALL {
+        for tile in Tile::ALL {
             hits.push(Hit {
                 group: "GO",
-                title: format!("{} tab", tab.label()),
+                title: tile.label().to_string(),
                 detail: String::new(),
-                place: format!("{} {}", tab.fkey(), tab.label()),
-                action: Action::Tab(tab),
+                place: format!("{} {}", tile.fkey(), tile.label()),
+                action: Action::Open(tile),
             });
         }
         for c in crate::overlay::COMMANDS {
@@ -1616,7 +1802,7 @@ impl App {
         hits
     }
 
-    /// Put findings and drafts that turned up while Reeve is open on the ledger.
+    /// Put findings and drafts that turned up while Reeve is open in the chat.
     fn announce(&mut self, view: &mut View, findings: &[reeve_core::findings::Finding]) {
         for f in findings {
             if f.first_seen > self.started && self.announced.insert(format!("f:{}", f.id)) {
@@ -1700,6 +1886,7 @@ impl App {
         }
         let _ = FindingStore::new(&self.home).set_status(id, FindingStatus::Acknowledged);
         view.overlays.clear();
+        view.chat = true;
         view.push(Speaker::User, text.clone());
         view.busy = true;
         let _ = self.work.send(Work::Send(text));
@@ -1789,6 +1976,17 @@ impl App {
             view.approval = None;
         }
     }
+}
+
+/// Live findings with a drafted fix, worst first.
+fn live_fixes(store: &FindingStore) -> Vec<reeve_core::findings::Finding> {
+    let mut out: Vec<_> = store
+        .list()
+        .into_iter()
+        .filter(|f| f.status == FindingStatus::Open && f.is_live() && f.proposal.is_some())
+        .collect();
+    out.sort_by(|a, b| b.severity.cmp(&a.severity).then(b.count.cmp(&a.count)));
+    out
 }
 
 fn toggle_yolo(view: &mut View) {
@@ -2226,7 +2424,7 @@ runs_per_day = 2
 cooldown_hours = 12
 "#;
 
-/// Write the spend tab's statement to `~/.reeve/reports/spend-<range>-<date>.csv`.
+/// Write the spend statement to `~/.reeve/reports/spend-<range>-<date>.csv`.
 fn export_spend(home: &std::path::Path, p: &crate::overlay::SpendPanel) -> Result<String, String> {
     let dir = home.join("reports");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;

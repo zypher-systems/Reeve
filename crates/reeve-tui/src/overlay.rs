@@ -177,17 +177,19 @@ pub enum Action {
     SavePrivacy(reeve_core::config::PrivacyConfig),
     /// Reflect on this session now.
     Reflect,
-    /// Go to a tab.
-    Tab(crate::view::Tab),
-    /// Go to a tab and select this item there (finding, order, or memory id).
-    TabSelect(crate::view::Tab, String),
-    /// Send this to Reeve, in the ledger.
+    /// Open the conversation.
+    Chat,
+    /// Open a tile.
+    Open(crate::view::Tile),
+    /// Open a tile and select this item there (finding, order, or memory id).
+    OpenSelect(crate::view::Tile, String),
+    /// Send this to Reeve, in the chat.
     Ask(String),
     /// Run a slash command.
     Command(&'static str),
     /// Open the receipts panel on this receipt.
     ShowReceipt(u64),
-    /// Draw the system tab's data for this many days.
+    /// Gather health and what changed for this many days.
     SystemReport(u32),
     /// Open the full report page in the browser.
     OpenReport,
@@ -231,6 +233,8 @@ pub enum Overlay {
     System(SystemPanel),
     /// ⌃K: search everything.
     Everything(EverythingPanel),
+    /// F1: what's waiting on you.
+    Needs(NeedsPanel),
     /// `/privacy`.
     Privacy(PrivacyPanel),
     /// `/help`.
@@ -257,20 +261,24 @@ impl Overlay {
             Self::Spend(s) => s.on_key(k),
             Self::System(s) => s.on_key(k),
             Self::Everything(e) => e.on_key(k),
+            Self::Needs(n) => n.on_key(k),
             Self::Privacy(p) => p.on_key(k),
             Self::Help => Action::Close,
         }
     }
 
-    /// The tab this panel is, when it's one of the screens along the top.
-    pub fn tab(&self) -> Option<crate::view::Tab> {
-        use crate::view::Tab;
+    /// The tile this panel is, when it's one of the board's screens.
+    pub fn tile(&self) -> Option<crate::view::Tile> {
+        use crate::view::Tile;
         match self {
-            Self::Findings(_) => Some(Tab::Findings),
-            Self::Orders(_) => Some(Tab::Orders),
-            Self::Spend(_) => Some(Tab::Spend),
-            Self::Memory(_) => Some(Tab::Memory),
-            Self::System(_) => Some(Tab::System),
+            Self::Needs(_) => Some(Tile::Needs),
+            Self::System(p) if p.changed => Some(Tile::Changed),
+            Self::System(_) => Some(Tile::Health),
+            Self::Findings(_) => Some(Tile::Findings),
+            Self::Receipts(_) => Some(Tile::Activity),
+            Self::Spend(_) => Some(Tile::Spend),
+            Self::Orders(_) => Some(Tile::Orders),
+            Self::Memory(_) => Some(Tile::Memory),
             _ => None,
         }
     }
@@ -392,7 +400,7 @@ impl Providers {
 
 // ── /receipts ───────────────────────────────────────────────────────────────
 
-/// The receipt browser: newest first.
+/// Everything Reeve did (F4): the receipts, newest first.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ReceiptsPanel {
     /// Receipts, newest first.
@@ -1257,6 +1265,79 @@ mod tests {
         }
     }
 
+    fn finding(id: &str, fix: bool) -> reeve_core::findings::Finding {
+        let now = chrono::Utc::now();
+        reeve_core::findings::Finding {
+            id: id.into(),
+            severity: reeve_core::findings::Severity::Warning,
+            title: format!("{id} keeps crashing"),
+            detail: String::new(),
+            evidence: vec![],
+            first_seen: now,
+            last_seen: now,
+            count: 3,
+            status: reeve_core::findings::FindingStatus::Open,
+            resolved_at: None,
+            notified_at: None,
+            notified_severity: None,
+            proposal: fix.then(|| reeve_core::findings::Proposal {
+                text: "restart it".into(),
+                drafted_at: now,
+                model: "m".into(),
+                usd: Some(0.01),
+            }),
+            draft_note: None,
+        }
+    }
+
+    #[test]
+    fn needs_you_is_one_queue_approval_first() {
+        let mut p = NeedsPanel {
+            asking: true,
+            fixes: vec![finding("mailsync", true), finding("kwin", true)],
+            reboot: Some("7.2.7".into()),
+            sel: 0,
+            scroll: 0,
+        };
+        assert_eq!(
+            p.rows(),
+            vec![Need::Approval, Need::Fix(0), Need::Fix(1), Need::Reboot]
+        );
+        assert!(p.on_approval());
+        let mut o = Overlay::Needs(p.clone());
+        assert_eq!(o.on_key(key(KeyCode::Down)), Action::None);
+        assert_eq!(
+            o.on_key(key(KeyCode::Enter)),
+            Action::UseProposal("mailsync".into())
+        );
+        assert_eq!(o.tile(), Some(crate::view::Tile::Needs));
+        // Without an approval, the fixes lead; the reboot is last.
+        p.asking = false;
+        p.sel = 2;
+        let mut o = Overlay::Needs(p);
+        assert!(matches!(o.on_key(key(KeyCode::Enter)), Action::Ask(q) if q.contains("7.2.7")));
+    }
+
+    #[test]
+    fn each_tile_panel_says_which_tile_it_is() {
+        use crate::view::Tile;
+        let sys = |changed| {
+            Overlay::System(SystemPanel {
+                changed,
+                days: 1,
+                report: None,
+                loading: true,
+            })
+        };
+        assert_eq!(sys(false).tile(), Some(Tile::Health));
+        assert_eq!(sys(true).tile(), Some(Tile::Changed));
+        assert_eq!(
+            Overlay::Receipts(ReceiptsPanel::default()).tile(),
+            Some(Tile::Activity)
+        );
+        assert_eq!(Overlay::Help.tile(), None);
+    }
+
     #[test]
     fn palette_matches_prefixes_only_for_a_bare_word() {
         assert_eq!(palette("/p")[0].name, "/providers");
@@ -1496,7 +1577,7 @@ impl SpendPanel {
                 let lines = self.lines();
                 if let Some(l) = lines.get(self.sel) {
                     if l.session == self.current {
-                        return Action::Tab(crate::view::Tab::Ledger);
+                        return Action::Chat;
                     }
                     self.note = Some(Ok(format!(
                         "an earlier session: its report is in ~/.reeve/sessions/{}/report.md",
@@ -1513,7 +1594,7 @@ impl SpendPanel {
         if r != self.range {
             self.range = r;
             self.sel = usize::MAX;
-            return Action::Tab(crate::view::Tab::Spend);
+            return Action::Open(crate::view::Tile::Spend);
         }
         Action::None
     }
@@ -1521,9 +1602,11 @@ impl SpendPanel {
 
 // ── system ──────────────────────────────────────────────────────────────────
 
-/// The system tab: vitals over time, disks, and what changed.
+/// Health (F2) and what changed (F6): both drawn from one report.
 #[derive(Debug, Clone, Default)]
 pub struct SystemPanel {
+    /// Showing what changed, not health.
+    pub changed: bool,
     /// Window, in days.
     pub days: u32,
     /// The gathered page data (it takes a second or two).
@@ -1535,6 +1618,7 @@ pub struct SystemPanel {
 impl PartialEq for SystemPanel {
     fn eq(&self, other: &Self) -> bool {
         self.days == other.days
+            && self.changed == other.changed
             && self.loading == other.loading
             && self.report.is_some() == other.report.is_some()
     }
@@ -1548,6 +1632,100 @@ impl SystemPanel {
             KeyCode::Left if i > 0 => Action::SystemReport(steps[i - 1]),
             KeyCode::Right if i + 1 < steps.len() => Action::SystemReport(steps[i + 1]),
             KeyCode::Char('r') => Action::OpenReport,
+            _ => Action::None,
+        }
+    }
+}
+
+// ── needs you ───────────────────────────────────────────────────────────────
+
+/// One row of F1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Need {
+    /// The approval that's asking now (it lives in the view).
+    Approval,
+    /// A finding with a drafted fix, by index into `fixes`.
+    Fix(usize),
+    /// A kernel installed and waiting for a reboot.
+    Reboot,
+}
+
+/// F1: what's waiting on you, in one queue. The approval asking now comes
+/// first, then the drafted fixes, then suggestions.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NeedsPanel {
+    /// An approval is asking.
+    pub asking: bool,
+    /// Live findings with a drafted fix.
+    pub fixes: Vec<reeve_core::findings::Finding>,
+    /// A kernel installed and waiting for a reboot.
+    pub reboot: Option<String>,
+    /// Selected row.
+    pub sel: usize,
+    /// Detail scroll.
+    pub scroll: usize,
+}
+
+impl NeedsPanel {
+    /// The rows, in order.
+    pub fn rows(&self) -> Vec<Need> {
+        let mut out = Vec::new();
+        if self.asking {
+            out.push(Need::Approval);
+        }
+        out.extend((0..self.fixes.len()).map(Need::Fix));
+        if self.reboot.is_some() {
+            out.push(Need::Reboot);
+        }
+        out
+    }
+
+    /// The selected row.
+    pub fn selected(&self) -> Option<Need> {
+        let rows = self.rows();
+        rows.get(self.sel.min(rows.len().saturating_sub(1)))
+            .copied()
+    }
+
+    /// The approval row is selected: its keys answer it.
+    pub fn on_approval(&self) -> bool {
+        self.selected() == Some(Need::Approval)
+    }
+
+    fn on_key(&mut self, k: KeyEvent) -> Action {
+        let n = self.rows().len();
+        match k.code {
+            KeyCode::Up => {
+                self.sel = self.sel.saturating_sub(1);
+                self.scroll = 0;
+            }
+            KeyCode::Down => {
+                self.sel = (self.sel + 1).min(n.saturating_sub(1));
+                self.scroll = 0;
+            }
+            KeyCode::PageDown => self.scroll += 5,
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(5),
+            _ => {}
+        }
+        use reeve_core::findings::FindingStatus as S;
+        match (self.selected(), k.code) {
+            (Some(Need::Fix(i)), code) => {
+                let Some(f) = self.fixes.get(i) else {
+                    return Action::None;
+                };
+                let id = f.id.clone();
+                match code {
+                    KeyCode::Enter => Action::UseProposal(id),
+                    KeyCode::Char('d') => Action::Diagnose(id),
+                    KeyCode::Char('a') => Action::FindingStatus(id, S::Acknowledged),
+                    KeyCode::Char('x') => Action::FindingStatus(id, S::Dismissed),
+                    _ => Action::None,
+                }
+            }
+            (Some(Need::Reboot), KeyCode::Enter) => Action::Ask(format!(
+                "Kernel {} is installed and waiting for a reboot. What would a reboot interrupt right now, and when is a good time?",
+                self.reboot.clone().unwrap_or_default()
+            )),
             _ => Action::None,
         }
     }
@@ -1592,7 +1770,7 @@ impl EverythingPanel {
                 group: "ASK",
                 title: q.to_string(),
                 detail: String::new(),
-                place: "to the ledger".into(),
+                place: "to the chat".into(),
                 action: Action::Ask(q.to_string()),
             });
         }

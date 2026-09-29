@@ -1,19 +1,17 @@
-//! The frame: tabs along the top, the tab's screen, and a status line.
-//! The ledger (the conversation and everything Reeve did, as one
-//! timeline) is home; findings, orders, spend, memory, and system are the
-//! other tabs. Floating panels (providers, receipts, ⌃K) draw over them.
+//! The frame: a top line, the board (or the chat, or an open tile under a
+//! strip of the others), and the composer. Floating panels (providers,
+//! the model picker, ⌃K) draw over everything.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::{Position, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use reeve_core::findings::Severity;
-
+use crate::board;
 use crate::theme::Theme;
-use crate::view::{Tab, View};
+use crate::view::{Screen, Tile, View};
 
 pub(crate) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -21,335 +19,65 @@ pub(crate) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"
 pub fn draw(f: &mut Frame, v: &View, t: &Theme) {
     let area = f.area();
     f.render_widget(Block::default().style(Style::default().bg(t.bg)), area);
-    let [tabs, body, status] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Min(3),
-        Constraint::Length(1),
-    ])
-    .areas(area);
-    draw_tabs(f, tabs, v, t);
-    draw_status(f, status, v, t);
-    let body = Rect {
-        x: body.x + 2,
-        width: body.width.saturating_sub(4),
-        y: body.y + 1,
-        height: body.height.saturating_sub(1),
-    };
-    match v.tab() {
-        Tab::Ledger => crate::ledger::draw(f, body, v, t),
-        tab => crate::screens::draw(f, body, v, t, tab),
+    let a = board::areas(area, v);
+    board::top_bar(f, a.top, v, t);
+    if a.strip.height > 0 {
+        board::strip(f, a.strip, v, t);
+    }
+    let screen = v.screen();
+    match screen {
+        Screen::Board => board::board(f, a.main, v, t),
+        Screen::Chat => {
+            let inner = board::surface(f, a.main, t.panel, t.bg, t);
+            crate::ledger::draw(f, inner, v, t);
+        }
+        Screen::Tile(tile) => {
+            let inner = board::surface(f, a.main, t.panel, t.bg, t);
+            crate::screens::draw(f, inner, v, t, tile);
+        }
+    }
+    match (&v.approval, screen) {
+        (Some(p), Screen::Chat) => crate::cards::draw_approval(f, a.composer, v, p, t),
+        _ => {
+            board::composer(f, a.composer, v, t);
+            crate::panels::draw_palette(f, a.composer, v, t);
+        }
     }
     crate::panels::draw_overlay(f, v, t);
 }
 
-// ── tabs & status ───────────────────────────────────────────────────────────
-
-fn width(spans: &[Span]) -> usize {
-    spans.iter().map(|s| s.content.width()).sum()
-}
-
-/// The live-findings badge on the findings tab.
-fn findings_badge(v: &View) -> Option<String> {
-    (!v.findings.is_empty()).then(|| format!(" {}", v.findings.len()))
-}
-
-/// Where each tab's label sits on the tab row: (tab, first column, past the last).
-pub(crate) fn tab_positions(v: &View) -> Vec<(Tab, u16, u16)> {
-    let mut x = " reeve   ".width();
-    let mut out = Vec::new();
-    for tab in Tab::ALL {
-        let mut w = format!("{} {}", tab.fkey(), tab.label()).width();
-        if tab == Tab::Findings {
-            w += findings_badge(v).map_or(0, |b| b.width());
-        }
-        out.push((tab, x as u16, (x + w) as u16));
-        x += w + 3;
-    }
-    out
-}
-
-/// The tab under a click on the tab row, if any.
-pub fn tab_at(v: &View, column: u16) -> Option<Tab> {
-    tab_positions(v)
+/// The tile a click at (`column`, `row`) lands on: a board tile, or a mini
+/// tile in the strip.
+pub fn click(area: Rect, v: &View, column: u16, row: u16) -> Option<Tile> {
+    let a = board::areas(area, v);
+    let at = Position::new(column, row);
+    let rects = if v.screen() == Screen::Board {
+        board::tile_rects(a.main)
+    } else {
+        board::strip_rects(a.strip)
+    };
+    rects
         .into_iter()
-        .find(|(_, a, b)| column + 1 >= *a && column < *b + 1)
-        .map(|(tab, _, _)| tab)
-}
-
-fn draw_tabs(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
-    let active = v.tab();
-    let mut left = vec![
-        Span::raw(" "),
-        Span::styled(
-            "reeve",
-            Style::default().fg(t.fg).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("   "),
-    ];
-    let mut mark = (0, 0);
-    for tab in Tab::ALL {
-        let on = tab == active;
-        let start = width(&left);
-        left.push(Span::styled(
-            format!("{} ", tab.fkey()),
-            Style::default().fg(t.faint),
-        ));
-        left.push(Span::styled(
-            tab.label(),
-            if on {
-                Style::default().fg(t.fg).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(t.dim)
-            },
-        ));
-        if tab == Tab::Findings {
-            if let Some(badge) = findings_badge(v) {
-                let worst = v.findings.iter().map(|f| f.severity).max();
-                let c = if worst == Some(Severity::Critical) {
-                    t.bad
-                } else {
-                    t.warn
-                };
-                left.push(Span::styled(badge, Style::default().fg(c)));
-            }
-        }
-        if on {
-            mark = (start, width(&left) - start);
-        }
-        left.push(Span::raw("   "));
-    }
-    let right = status_sentence(v, t);
-    let row = Rect { height: 1, ..area };
-    put_split(f, row, left, right, t.bg);
-    if area.height > 1 {
-        let w = area.width as usize;
-        let mut rule = vec![Span::styled(
-            "─".repeat(mark.0.min(w)),
-            Style::default().fg(t.border),
-        )];
-        rule.push(Span::styled(
-            "━".repeat(mark.1.min(w.saturating_sub(mark.0))),
-            Style::default().fg(t.brass),
-        ));
-        rule.push(Span::styled(
-            "─".repeat(w.saturating_sub(mark.0 + mark.1)),
-            Style::default().fg(t.border),
-        ));
-        f.render_widget(
-            Paragraph::new(Line::from(rule)),
-            Rect {
-                y: area.y + 1,
-                height: 1,
-                ..area
-            },
-        );
-    }
-}
-
-/// `nexus · all quiet, except swap 99%`: the one line that says how the
-/// machine is.
-pub(crate) fn status_sentence(v: &View, t: &Theme) -> Vec<Span<'static>> {
-    let s = &v.snap;
-    let crit = v
-        .findings
-        .iter()
-        .filter(|f| f.severity == Severity::Critical)
-        .count();
-    let warn = v
-        .findings
-        .iter()
-        .filter(|f| f.severity == Severity::Warning)
-        .count();
-    let mut issues: Vec<(String, Color)> = Vec::new();
-    if crit > 0 {
-        issues.push((
-            format!("{crit} need{} you", if crit == 1 { "s" } else { "" }),
-            t.bad,
-        ));
-    }
-    if s.swap_total > 0 && s.swap_used as f64 / s.swap_total as f64 >= 0.9 {
-        issues.push((
-            format!(
-                "swap {:.0}%",
-                s.swap_used as f64 / s.swap_total as f64 * 100.0
-            ),
-            t.bad,
-        ));
-    }
-    for d in s.disks.iter().filter(|d| d.ratio() >= 0.9) {
-        issues.push((format!("{} {:.0}%", d.mount, d.ratio() * 100.0), t.bad));
-    }
-    if crit == 0 && warn > 0 {
-        issues.push((
-            format!("{warn} finding{}", if warn == 1 { "" } else { "s" }),
-            t.warn,
-        ));
-    }
-    let mut out = Vec::new();
-    if !v.host.hostname.is_empty() {
-        out.push(Span::styled(
-            v.host.hostname.to_lowercase(),
-            Style::default().fg(t.dim),
-        ));
-        out.push(Span::styled(" · ", Style::default().fg(t.faint)));
-    }
-    if issues.is_empty() {
-        out.push(Span::styled("all quiet", Style::default().fg(t.dim)));
-    } else {
-        if crit == 0 {
-            out.push(Span::styled(
-                "all quiet, except ",
-                Style::default().fg(t.dim),
-            ));
-        }
-        for (i, (text, c)) in issues.into_iter().enumerate() {
-            if i > 0 {
-                out.push(Span::styled(", ", Style::default().fg(t.dim)));
-            }
-            out.push(Span::styled(text, Style::default().fg(c)));
-        }
-    }
-    out.push(Span::raw(" "));
-    out
-}
-
-fn draw_status(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
-    let tab = v.tab();
-    let mode = tab.label().to_uppercase();
-    let mut left = vec![
-        Span::raw(" "),
-        Span::styled(
-            mode,
-            Style::default().fg(t.brass).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-    ];
-    let dim = |s: String| Span::styled(s, Style::default().fg(t.dim));
-    if v.busy {
-        let spin = SPINNER[(v.frame / 2) as usize % SPINNER.len()];
-        left.push(Span::styled(
-            format!("{spin} working  "),
-            Style::default().fg(t.amber),
-        ));
-    }
-    match tab {
-        Tab::Ledger => {
-            left.push(dim(format!("session {}", v.session.label())));
-            left.push(dim(format!(" · today {}", v.totals.today.label())));
-        }
-        Tab::Findings => {
-            let drafted = v.findings.iter().filter(|f| f.proposal.is_some()).count();
-            left.push(dim(format!("{} open", v.findings.len())));
-            if drafted > 0 {
-                left.push(dim(format!(
-                    " · {drafted} fix{} drafted",
-                    if drafted == 1 { "" } else { "es" }
-                )));
-            }
-        }
-        Tab::Spend => left.push(dim(format!(
-            "today {} · month {}",
-            v.totals.today.label(),
-            v.totals.month.label()
-        ))),
-        Tab::Memory => left.push(dim(format!("{} in use · {} new", v.memory.0, v.memory.1))),
-        Tab::System => {
-            let mut facts = vec![v.host.hostname.clone(), v.host.os_short.clone()];
-            if v.snap.uptime_secs > 0 {
-                facts.push(format!("up {}", uptime(v.snap.uptime_secs)));
-            }
-            facts.retain(|f| !f.is_empty());
-            left.push(dim(facts.join(" · ")));
-        }
-        Tab::Orders => left.push(dim("what Reeve may do unattended".into())),
-    }
-    let mut right = Vec::new();
-    if !v.model.is_empty() {
-        right.push(dim(short_model(&v.model)));
-        right.push(Span::styled(" · ", Style::default().fg(t.faint)));
-    }
-    if let Some(p) = &v.privacy {
-        if p.level != reeve_core::privacy::Level::Off {
-            right.push(dim(format!("▣ {} masked", p.entries.len())));
-            right.push(Span::styled(" · ", Style::default().fg(t.faint)));
-        }
-    }
-    right.push(dim("reeved ".into()));
-    right.push(if v.observer_alive {
-        Span::styled("●", Style::default().fg(t.good))
-    } else {
-        Span::styled("○", Style::default().fg(t.faint))
-    });
-    right.push(Span::raw("  "));
-    if v.yolo {
-        // The badge breathes so nobody forgets that nothing is being asked.
-        let pulse = if v.animate {
-            ((v.frame as f32 / 8.0).sin() + 1.0) / 2.0
-        } else {
-            1.0
-        };
-        right.push(Span::styled(
-            " YOLO ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(t.mix(t.copper, t.bad, pulse))
-                .add_modifier(Modifier::BOLD),
-        ));
-    } else {
-        right.push(Span::styled("TIERED", Style::default().fg(t.dim)));
-    }
-    right.push(Span::raw("   "));
-    right.push(Span::styled(
-        "tab",
-        Style::default().fg(t.brass).add_modifier(Modifier::BOLD),
-    ));
-    right.push(Span::styled(" screens  ", Style::default().fg(t.dim)));
-    right.push(Span::styled(
-        "ctrl+k",
-        Style::default().fg(t.brass).add_modifier(Modifier::BOLD),
-    ));
-    right.push(Span::styled(" everything ", Style::default().fg(t.dim)));
-    // The mode badge must always show: context, then the model, give way.
-    let avail = area.width as usize;
-    while left.len() > 3 && width(&left) + width(&right) > avail {
-        left.pop();
-    }
-    while right.len() > 6 && width(&left) + width(&right) > avail {
-        right.remove(0);
-    }
-    put_split(f, area, left, right, t.bg);
-}
-
-/// Left spans, right spans flush right, on one row.
-pub(crate) fn put_split(f: &mut Frame, area: Rect, left: Vec<Span>, right: Vec<Span>, bg: Color) {
-    let rw: usize = right.iter().map(|s| s.content.width()).sum();
-    let lw: usize = left.iter().map(|s| s.content.width()).sum();
-    let mut spans = left;
-    let gap = (area.width as usize).saturating_sub(lw + rw);
-    if gap > 0 {
-        spans.push(Span::raw(" ".repeat(gap)));
-        spans.extend(right);
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)),
-        area,
-    );
+        .find(|(_, r)| r.contains(at))
+        .map(|(tile, _)| tile)
 }
 
 // ── floating panels ─────────────────────────────────────────────────────────
 
 pub(crate) fn panel<'a>(title: &'a str, t: &Theme, hot: bool) -> Block<'a> {
+    let edge = if hot {
+        t.mix(t.border, t.brass, 0.45)
+    } else {
+        t.border
+    };
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if hot { t.border_hot } else { t.border }))
-        .title(Line::from(vec![
-            Span::styled(
-                " ◇ ",
-                Style::default().fg(if hot { t.brass } else { t.faint }),
-            ),
-            Span::styled(format!("{title} "), t.muted()),
-        ]))
+        .border_style(Style::default().fg(edge).bg(t.panel))
+        .title(Line::from(vec![Span::styled(
+            format!(" {title} "),
+            Style::default().fg(t.fg).add_modifier(Modifier::BOLD),
+        )]))
         .style(Style::default().bg(t.panel))
 }
 
@@ -390,7 +118,7 @@ pub(crate) fn system_lines(v: &View, t: &Theme, w: usize) -> Vec<Line<'static>> 
     if s.mem_total > 0 {
         let r = s.mem_used as f64 / s.mem_total as f64;
         let mut spans = vec![lbl("mem")];
-        spans.extend(bar(r, bar_w, t));
+        spans.extend(board::meter(r, bar_w, board::level(r, t), t));
         spans.push(Span::styled(
             format!(" {}/{}", gib(s.mem_used), gib(s.mem_total)),
             t.muted(),
@@ -400,7 +128,7 @@ pub(crate) fn system_lines(v: &View, t: &Theme, w: usize) -> Vec<Line<'static>> 
     if s.swap_total > 0 {
         let r = s.swap_used as f64 / s.swap_total as f64;
         let mut spans = vec![lbl("swap")];
-        spans.extend(bar(r, bar_w, t));
+        spans.extend(board::meter(r, bar_w, board::level(r, t), t));
         spans.push(Span::styled(
             format!(" {}/{}", gib(s.swap_used), gib(s.swap_total)),
             t.ghost(),
@@ -410,7 +138,7 @@ pub(crate) fn system_lines(v: &View, t: &Theme, w: usize) -> Vec<Line<'static>> 
     for d in &s.disks {
         let r = d.ratio();
         let mut spans = vec![lbl(&truncate(&d.mount, label_w))];
-        spans.extend(bar(r, bar_w, t));
+        spans.extend(board::meter(r, bar_w, board::level(r, t), t));
         spans.push(Span::styled(
             format!(" {:>3.0}%", r * 100.0),
             Style::default().fg(t.level(r)),
@@ -468,30 +196,8 @@ pub(crate) fn system_lines(v: &View, t: &Theme, w: usize) -> Vec<Line<'static>> 
 
 // ── little instruments ──────────────────────────────────────────────────────
 
-/// A smooth bar in eighths, colored along teal → amber → red by position.
-pub(crate) fn bar(ratio: f64, width: usize, t: &Theme) -> Vec<Span<'static>> {
-    const PART: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
-    let ratio = ratio.clamp(0.0, 1.0);
-    let eighths = (ratio * width as f64 * 8.0).round() as usize;
-    let full = eighths / 8;
-    let rem = eighths % 8;
-    let mut out = Vec::with_capacity(width);
-    for i in 0..width {
-        let pos = i as f32 / width.max(1) as f32;
-        let c = t.gradient(&[t.teal, t.teal, t.amber, t.bad], pos);
-        if i < full {
-            out.push(Span::styled("█", Style::default().fg(c)));
-        } else if i == full && rem > 0 {
-            out.push(Span::styled(PART[rem], Style::default().fg(c).bg(t.input)));
-        } else {
-            out.push(Span::styled(" ", Style::default().bg(t.input)));
-        }
-    }
-    out
-}
-
 /// A braille area chart: 2 samples per cell, 4 levels per row. Newest at
-/// the right; rows shade from teal (bottom) to amber (top).
+/// the right; rows shade from the accent (bottom) to violet (top).
 pub(crate) fn braille(
     data: &[f32],
     max: f32,
@@ -516,7 +222,10 @@ pub(crate) fn braille(
     };
     (0..height)
         .map(|row| {
-            let c = t.gradient(&[t.amber, t.teal], row as f32 / (height.max(2) - 1) as f32);
+            let c = t.gradient(
+                &[t.violet, t.brass],
+                row as f32 / (height.max(2) - 1) as f32,
+            );
             (0..width)
                 .map(|col| {
                     let (a, b) = (level(col * 2), level(col * 2 + 1));
@@ -919,30 +628,44 @@ mod tests {
     }
 
     #[test]
-    fn the_frame_is_tabs_a_ledger_and_a_status_line() {
+    fn home_is_the_board_with_every_tile() {
         let s = render(&busy_view(), 160, 44);
         for needle in [
-            "reeve",
-            "F1 ledger",
-            "F2 findings",
-            "F4 spend",
-            "F6 system",
-            "nexus · all quiet, except /boot 93%",
-            "━━━━━━━━",
-            "● you",
             "◆ reeve",
-            "• remove",
-            "LEDGER",
-            "TIERED",
-            "ctrl+k everything",
+            "nexus",
+            "F1",
+            "needs you",
+            "health",
+            "findings",
+            "activity",
+            "spend",
+            "changed",
+            "orders",
+            "memory",
+            "/boot 93%",
+            "✗ 1 failed",
+            "tiered",
+            "ask Reeve anything",
+            "the chat",
         ] {
             assert!(s.contains(needle), "missing {needle:?}\n{s}");
         }
     }
 
     #[test]
-    fn narrow_screens_keep_the_ledger_without_money_columns() {
+    fn the_chat_sits_under_the_strip() {
         let mut v = busy_view();
+        v.chat = true;
+        let s = render(&v, 160, 44);
+        for needle in ["● you", "◆ reeve", "• remove", "needs you", "F8", "esc"] {
+            assert!(s.contains(needle), "missing {needle:?}\n{s}");
+        }
+    }
+
+    #[test]
+    fn narrow_screens_keep_the_chat_without_money_columns() {
+        let mut v = busy_view();
+        v.chat = true;
         v.entries[1].cost = Some(crate::view::RoundCost {
             usd: Some(0.0123),
             usage: Default::default(),
@@ -962,20 +685,20 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_tab_label_picks_that_tab() {
-        let v = busy_view();
-        let s = render(&v, 160, 44);
-        let row0 = s.lines().next().unwrap();
-        for tab in Tab::ALL {
-            let label = format!("{} {}", tab.fkey(), tab.label());
-            let col = row0.find(&label).unwrap();
-            // Byte offset equals column here: the row before the labels is ASCII.
-            assert_eq!(tab_at(&v, col as u16 + 2), Some(tab), "{label}");
+    fn clicking_a_tile_opens_it() {
+        let mut v = busy_view();
+        let area = Rect::new(0, 0, 160, 44);
+        let a = board::areas(area, &v);
+        for (tile, r) in board::tile_rects(a.main) {
+            assert_eq!(click(area, &v, r.x + 3, r.y + 1), Some(tile), "{tile:?}");
         }
-        assert_eq!(tab_at(&v, 1), None);
-        assert_eq!(Tab::System.next(), Tab::Ledger);
-        assert_eq!(Tab::Ledger.prev(), Tab::System);
-        assert!(s.lines().last().unwrap().contains("tab screens"));
+        assert_eq!(click(area, &v, 0, 0), None);
+        // Under the strip, a mini tile opens its tile too.
+        v.chat = true;
+        let a = board::areas(area, &v);
+        for (tile, r) in board::strip_rects(a.strip) {
+            assert_eq!(click(area, &v, r.x + 2, r.y + 1), Some(tile), "{tile:?}");
+        }
     }
 
     #[test]
@@ -983,17 +706,32 @@ mod tests {
         let mut v = busy_view();
         v.yolo = true;
         let s = render(&v, 160, 44);
-        assert!(s.contains("YOLO") && !s.contains("TIERED"));
+        assert!(s.contains("YOLO") && !s.contains("tiered"));
         let narrow = render(&v, 60, 20);
-        assert!(narrow.lines().last().unwrap().contains("YOLO"), "{narrow}");
+        assert!(narrow.lines().next().unwrap().contains("YOLO"), "{narrow}");
     }
 
     #[test]
     fn tiny_terminals_do_not_panic() {
-        let v = busy_view();
-        for (w, h) in [(20, 5), (40, 10), (1, 1), (110, 12)] {
-            render(&v, w, h);
+        let mut v = busy_view();
+        for chat in [false, true] {
+            v.chat = chat;
+            for (w, h) in [(20, 5), (40, 10), (1, 1), (110, 12), (70, 22), (100, 30)] {
+                render(&v, w, h);
+            }
         }
+    }
+
+    #[test]
+    fn sixteen_colors_get_borders_not_fills() {
+        let mut term = Terminal::new(TestBackend::new(160, 44)).unwrap();
+        let t = Theme::slate().degrade(crate::theme::ColorMode::Ansi16);
+        term.draw(|f| draw(f, &busy_view(), &t)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let s: String = (0..44)
+            .map(|y| (0..160).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect();
+        assert!(s.contains('╭') && !s.contains('▄'), "{s}");
     }
 
     #[test]

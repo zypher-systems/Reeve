@@ -2,9 +2,9 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use reeve_core::diff::{DiffKind, FileDiff};
@@ -149,7 +149,7 @@ pub fn diff_lines(d: &FileDiff, width: usize, max: usize, t: &Theme) -> Vec<Line
 }
 
 /// The card's rows (so its height is known before drawing).
-fn card_lines(p: &Pending, width: usize, t: &Theme) -> Vec<Line<'static>> {
+pub(crate) fn card_lines(p: &Pending, width: usize, t: &Theme) -> Vec<Line<'static>> {
     let r = &p.req;
     let mut out = Vec::new();
     let code = Style::default().fg(t.code).bg(t.code_bg);
@@ -242,13 +242,8 @@ fn card_lines(p: &Pending, width: usize, t: &Theme) -> Vec<Line<'static>> {
         ]
     }));
     out.push(Line::raw(""));
-    let key = |k: &str| {
-        Span::styled(
-            k.to_string(),
-            Style::default().fg(t.brass).add_modifier(Modifier::BOLD),
-        )
-    };
-    let label = |l: &str| Span::styled(format!(" {l}    "), t.muted());
+    let key = |k: &str| crate::board::key(k, t);
+    let label = |l: &str| Span::styled(format!(" {l}   "), t.muted());
     if r.tier == Tier::T3 {
         out.push(Line::from(vec![
             Span::styled("type ", t.muted()),
@@ -281,10 +276,11 @@ fn card_lines(p: &Pending, width: usize, t: &Theme) -> Vec<Line<'static>> {
 
 /// Rows the card needs at `width`.
 pub fn approval_height(p: &Pending, width: u16) -> u16 {
-    card_lines(p, width.saturating_sub(4) as usize, &Theme::brass()).len() as u16 + 2
+    card_lines(p, width.saturating_sub(4) as usize, &Theme::brass()).len() as u16 + 3
 }
 
-/// The approval card, in place of the composer.
+/// The approval card, in place of the composer: a raised surface, its
+/// question breathing so it's hard to miss. T3 is washed in red.
 pub fn draw_approval(f: &mut Frame, area: Rect, v: &View, p: &Pending, t: &Theme) {
     let tier_c = t.tier(p.req.tier);
     let pulse = if v.animate {
@@ -292,34 +288,33 @@ pub fn draw_approval(f: &mut Frame, area: Rect, v: &View, p: &Pending, t: &Theme
     } else {
         1.0
     };
-    let edge: Color = t.mix(t.border, tier_c, 0.45 + 0.55 * pulse);
+    let fill = if p.req.tier == Tier::T3 {
+        t.mix(t.input, t.bad, 0.14)
+    } else {
+        t.input
+    };
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Style::default().bg(t.bg)), area);
+    let inner = crate::board::surface(f, area, fill, t.bg, t);
+    if inner.height == 0 {
+        return;
+    }
+    let ask = t.mix(t.warn, t.fg, 0.35 * pulse);
     let title = Line::from(vec![
         Span::styled(
-            " ◆ approve? ",
-            Style::default().fg(tier_c).add_modifier(Modifier::BOLD),
+            "◐ approve?  ",
+            Style::default().fg(ask).add_modifier(Modifier::BOLD),
         ),
-        badge(p.req.tier, t),
+        crate::board::tier_pill(p.req.tier, t),
         Span::styled(
-            format!(" {} ", p.req.tier.name()),
+            format!("  {}", p.req.tier.name()),
             Style::default().fg(tier_c),
         ),
     ]);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(if p.req.tier == Tier::T3 {
-            BorderType::Double
-        } else {
-            BorderType::Rounded
-        })
-        .border_style(Style::default().fg(edge))
-        .title(title)
-        .style(Style::default().bg(t.panel));
-    let inner = block.inner(area);
-    f.render_widget(Clear, area);
-    f.render_widget(block, area);
+    f.render_widget(Paragraph::new(title), Rect { height: 1, ..inner });
     let body = Rect {
-        x: inner.x + 1,
-        width: inner.width.saturating_sub(2),
+        y: inner.y + 1,
+        height: inner.height.saturating_sub(1),
         ..inner
     };
     let lines = card_lines(p, body.width as usize, t);
@@ -480,6 +475,7 @@ mod tests {
     #[test]
     fn the_card_replaces_the_composer_and_shows_the_change() {
         let mut v = View::new(HostInfo::default());
+        v.chat = true;
         v.push(Speaker::User, "add an alias");
         v.approval = Some(Pending {
             req: req(Tier::T1),
@@ -504,6 +500,7 @@ mod tests {
     #[test]
     fn a_verified_change_says_so_on_the_card() {
         let mut v = View::new(HostInfo::default());
+        v.chat = true;
         v.push(Speaker::User, "fix bluetooth");
         let mut r = req(Tier::T2);
         r.txn = Some(reeve_core::txn::TxnBrief {
@@ -540,6 +537,7 @@ mod tests {
             entries: m.entries().to_vec(),
         };
         let mut v = View::new(HostInfo::default());
+        v.chat = true;
         v.apply(AgentEvent::Privacy(Box::new(state.clone())));
         v.overlays.push(crate::overlay::Overlay::Privacy(
             crate::overlay::PrivacyPanel {
@@ -569,6 +567,7 @@ mod tests {
     #[test]
     fn the_floor_asks_for_a_typed_yes() {
         let mut v = View::new(HostInfo::default());
+        v.chat = true;
         v.push(Speaker::User, "x");
         let mut r = req(Tier::T3);
         r.summary = "rm -rf ~".into();
@@ -586,6 +585,7 @@ mod tests {
     #[test]
     fn tool_rows_show_status_tier_and_receipt() {
         let mut v = View::new(HostInfo::default());
+        v.chat = true;
         v.push(Speaker::User, "check");
         v.apply(AgentEvent::TurnStarted);
         v.apply(AgentEvent::ToolStarted {

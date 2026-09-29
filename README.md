@@ -180,44 +180,56 @@ It's pattern matching, not a guarantee: a secret in a format Reeve doesn't recog
 
 ## The TUI
 
-Home is the **ledger**: the conversation and everything Reeve did, on one timeline. Each row has a time,
-a node on the spine, and what happened:
-- **Tool calls** branch off Reeve's replies, with their result and receipt number.
-- **A verified change** is a bracket around its steps (┏ … ┗), closing on "verified · kept" or "failed ·
-  rolled back", with each undo inside it.
-- **Background activity:** what reeved found and what the drafter drafted while you were here show up in
-  the ledger too.
-- **Money:** on a wide screen, two columns show each model round's cost and the session's running total.
-  Tool calls and checks cost nothing, and a drafter's draft is marked as its own budget.
-- **Approvals:** whatever needs you sits at the bottom, where you type.
+Home is the **board**: every tile at a glance, each on its own function key.
 
-The other tabs are full screens: **F2 findings** (list, detail, evidence, drafted fix), **F3 orders**,
-**F4 spend** (a statement by day, week, or month; by role and model; export to CSV), **F5 memory**, and **F6
-system** (vitals over 24 h, 7 d, or 30 d, disks, what changed, headlines). The line above the tabs says how
-the machine is: "nexus · all quiet, except swap 99%".
+| tile | shows |
+| --- | --- |
+| **F1 needs you** | the approval asking now, with its keys, then the fixes the drafter wrote while you were away |
+| **F2 health** | CPU over the last day, memory, swap, temperature, network, and disks |
+| **F3 findings** | what reeved noticed, worst first |
+| **F4 activity** | every receipt: what Reeve did, and which of it can be undone |
+| **F5 spend** | today by role and by hour, and the month |
+| **F6 changed** | packages, kernels, `/etc`, and services over the last day |
+| **F7 orders** | standing orders and when they run |
+| **F8 memory** | what Reeve has learned, newest first |
+
+Press a tile's key (or click it) to open it. It takes the main area: a list and, beside it, the selected
+item in detail. The other seven fold into a **strip** along the top that keeps their numbers live, so
+nothing useful is ever a screen away. `esc` goes back.
+
+The **chat** opens when you send something, or with `↑` from the board. It's the conversation and
+everything Reeve did in it, on one timeline: tool calls branch off Reeve's replies, a verified change is a
+bracket around its steps, and on a wide screen each model round shows its cost and the session's running
+total. An approval that arrives while you're in the chat asks there; on the board, it waits in F1.
+
+The composer is always at the bottom. On an open tile it knows what's selected: `?` asks Reeve about it.
 
 | key | does |
 | --- | --- |
 | `⏎` / `alt+⏎` | send / newline |
-| `ctrl+k` | search everything: drafted fixes, findings, orders, memory, receipts, tabs, commands. `tab` asks Reeve instead |
-| `F1`…`F6` | the screens along the top, as labelled. Also `tab` / `shift+tab`, a click on the tab, or plain `1`…`6` on a tab. `esc` goes back to the ledger |
+| `F1`…`F8` | open a tile, from anywhere. Also `tab` / `shift+tab`, a click, or plain `1`…`8` on a tile |
+| `↑` | the chat, from the board (empty composer) |
+| `esc` | stop the running turn · back to where you were · the board |
+| `?` | on a tile: ask Reeve about what's selected |
+| `ctrl+k` | search everything: drafted fixes, findings, orders, memory, receipts, tiles, commands. `tab` asks Reeve instead |
 | `$` | the spend statement (from an empty composer) |
 | `/` | commands: `/providers`, `/model`, `/findings`, `/orders`, `/spend`, `/system`, `/memory`, `/report`, `/privacy`, `/observer`, `/reflect`, `/receipts`, `/new`, `/yolo`, `/help`, `/quit` |
-| `^p` / `^r` | `/providers` / `/receipts` (`u` undo, `v` verify) |
+| `^p` / `^r` | `/providers` / activity (`u` undo, `v` verify) |
 | `⏎` `a` `n` | on an approval: approve, allow for the session (in a verified change: yes to the rest of the change), deny |
-| `esc` | stop the running turn, or clear the composer |
 | `^y` | YOLO: auto-approve T0–T2 actions. The safeguard floor still asks. |
-| `pgup` / `pgdn`, mouse wheel | scroll |
+| `pgup` / `pgdn`, mouse wheel | scroll the chat |
 | `^c` | stop, clear, then quit |
 | `ctrl+l` | redraw the screen (if the terminal cleared it: Konsole's ctrl+shift+k does) |
 
-The default theme is **ink** (warm charcoal). `[ui] theme = "brass"` brings back the original navy and brass.
+The default theme is **slate** (cool near-black, filled tiles). `[ui] theme = "ink"` is the warm charcoal
+of 0.2.0, and `"brass"` the original navy and brass. With 16 colors or none, tiles get borders instead of
+fills.
 
 ## Layout
 
 ```
 crates/reeve-core      config, keys, providers, pricing, ledger, agent, policy (tiers), tools, receipts, undo
 crates/reeve-observer  sampler, journal follower, baselines, detectors, notifications, drafter, the reeved loop
-crates/reeve-tui       mission-control UI
+crates/reeve-tui       the board, the chat, and the tiles
 crates/reeve-cli       the `reeve` binary
 ```

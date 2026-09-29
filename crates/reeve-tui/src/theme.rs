@@ -1,6 +1,7 @@
-//! Colors. The default is **Ink**: a warm charcoal ground with ink-colored
-//! text, ochre for what needs you, moss for what's verified, and vermilion
-//! for what failed. **Brass** (deep navy, brass and amber) is the original.
+//! Colors. The default is **Slate**: a cool near-black ground, filled tiles,
+//! sky for Reeve and the keys, violet for the drafter, and green, amber and
+//! red for what's verified, what needs you, and what failed. **Ink** (warm
+//! charcoal, the ledger's) and **Brass** (deep navy, the original) remain.
 //! Everything degrades to 256, 16, or no color.
 
 use ratatui::style::{Color, Modifier, Style};
@@ -52,10 +53,12 @@ pub struct Theme {
     pub mode: ColorMode,
     /// Screen ground.
     pub bg: Color,
-    /// Panel ground (slightly lifted).
+    /// Tile ground (lifted off the screen).
     pub panel: Color,
-    /// Composer ground.
+    /// Raised ground: the composer, a selected row, an approval.
     pub input: Color,
+    /// Sunken ground: a detail card inside a tile.
+    pub inset: Color,
     /// Resting borders.
     pub border: Color,
     /// The focused panel's border.
@@ -74,6 +77,8 @@ pub struct Theme {
     pub copper: Color,
     /// Cool secondary.
     pub teal: Color,
+    /// The drafter's color; the top of a chart's gradient.
+    pub violet: Color,
     /// The user's speaker color.
     pub user: Color,
     /// Healthy / success.
@@ -100,6 +105,7 @@ impl Theme {
             bg: rgb(0x0e1320),
             panel: rgb(0x121929),
             input: rgb(0x172033),
+            inset: rgb(0x0b101b),
             border: rgb(0x263149),
             border_hot: rgb(0xc9a14e),
             fg: rgb(0xdce1ea),
@@ -109,6 +115,7 @@ impl Theme {
             amber: rgb(0xf2b94b),
             copper: rgb(0xdd7a50),
             teal: rgb(0x4cc3b1),
+            violet: rgb(0xb49be0),
             user: rgb(0x8db8ff),
             good: rgb(0x7fd18b),
             warn: rgb(0xf0a04b),
@@ -120,6 +127,35 @@ impl Theme {
         }
     }
 
+    /// Slate, at full color: the board's palette.
+    pub fn slate() -> Self {
+        Self {
+            mode: ColorMode::TrueColor,
+            bg: rgb(0x0b0e12),
+            panel: rgb(0x131820),
+            input: rgb(0x1a212b),
+            inset: rgb(0x0f141a),
+            border: rgb(0x222a35),
+            border_hot: rgb(0x38bdf8),
+            fg: rgb(0xe2e8f0),
+            dim: rgb(0x8b98a9),
+            faint: rgb(0x566273),
+            brass: rgb(0x38bdf8),
+            amber: rgb(0xfbbf24),
+            copper: rgb(0xfb923c),
+            teal: rgb(0x2dd4bf),
+            violet: rgb(0xa78bfa),
+            user: rgb(0xe2e8f0),
+            good: rgb(0x4ade80),
+            warn: rgb(0xfbbf24),
+            bad: rgb(0xf87171),
+            code: rgb(0x7dd3fc),
+            code_bg: rgb(0x0f141a),
+            add_bg: rgb(0x0f2a1a),
+            del_bg: rgb(0x351a1a),
+        }
+    }
+
     /// Ink, at full color: the ledger's palette.
     pub fn ink() -> Self {
         Self {
@@ -127,6 +163,7 @@ impl Theme {
             bg: rgb(0x151412),
             panel: rgb(0x1b1916),
             input: rgb(0x221f1a),
+            inset: rgb(0x11100e),
             border: rgb(0x2d2a25),
             border_hot: rgb(0x4a3d22),
             fg: rgb(0xe9e4d8),
@@ -136,6 +173,7 @@ impl Theme {
             amber: rgb(0xe6b457),
             copper: rgb(0xd98a5c),
             teal: rgb(0x7fc4b8),
+            violet: rgb(0xb7a2cf),
             user: rgb(0x8fa7c4),
             good: rgb(0xa3ba7c),
             warn: rgb(0xd9a441),
@@ -154,6 +192,7 @@ impl Theme {
             bg: Color::Reset,
             panel: Color::Reset,
             input: Color::Reset,
+            inset: Color::Reset,
             border: Color::DarkGray,
             border_hot: Color::Yellow,
             fg: Color::Reset,
@@ -163,6 +202,7 @@ impl Theme {
             amber: Color::LightYellow,
             copper: Color::LightRed,
             teal: Color::Cyan,
+            violet: Color::Magenta,
             user: Color::LightBlue,
             good: Color::Green,
             warn: Color::Yellow,
@@ -179,7 +219,8 @@ impl Theme {
         // Custom themes from ~/.reeve/themes/ arrive with M6's theme import.
         match name {
             "brass" => Self::brass(),
-            _ => Self::ink(),
+            "ink" => Self::ink(),
+            _ => Self::slate(),
         }
         .degrade(mode)
     }
@@ -206,6 +247,7 @@ impl Theme {
             bg: f(self.bg),
             panel: f(self.panel),
             input: f(self.input),
+            inset: f(self.inset),
             border: f(self.border),
             border_hot: f(self.border_hot),
             fg: f(self.fg),
@@ -215,6 +257,7 @@ impl Theme {
             amber: f(self.amber),
             copper: f(self.copper),
             teal: f(self.teal),
+            violet: f(self.violet),
             user: f(self.user),
             good: f(self.good),
             warn: f(self.warn),
@@ -262,6 +305,30 @@ impl Theme {
         } else {
             self.teal
         }
+    }
+
+    /// A faint wash of `c` over the ground: a pill's or a highlight's
+    /// background. Without truecolor, the ground itself.
+    pub fn tint(&self, c: Color) -> Color {
+        match self.mode {
+            ColorMode::TrueColor => self.mix(self.bg, c, 0.16),
+            _ => self.bg,
+        }
+    }
+
+    /// `c` on its own tint: a pill.
+    pub fn pill(&self, c: Color) -> Style {
+        Style::default().fg(c).bg(self.tint(c))
+    }
+
+    /// A key, as the hints show it: accent on its tint, bold.
+    pub fn key(&self) -> Style {
+        self.pill(self.brass).add_modifier(Modifier::BOLD)
+    }
+
+    /// Whether tiles can be drawn as filled surfaces (else they get borders).
+    pub fn filled(&self) -> bool {
+        matches!(self.mode, ColorMode::TrueColor | ColorMode::Ansi256) && self.panel != self.bg
     }
 
     /// A risk tier's color: slate, teal, amber, red.
@@ -359,9 +426,21 @@ mod tests {
     #[test]
     fn degraded_themes_hold_no_rgb() {
         for mode in [ColorMode::Ansi256, ColorMode::Ansi16, ColorMode::Mono] {
-            let t = Theme::brass().degrade(mode);
-            assert!(!matches!(t.brass, Color::Rgb(..)), "{mode:?}");
+            for t in [Theme::slate(), Theme::ink(), Theme::brass()] {
+                let t = t.degrade(mode);
+                assert!(!matches!(t.brass, Color::Rgb(..)), "{mode:?}");
+                assert!(!matches!(t.tint(t.bad), Color::Rgb(..)), "{mode:?}");
+            }
         }
+    }
+
+    #[test]
+    fn slate_is_the_default_and_tiles_fill_only_with_color() {
+        assert_eq!(Theme::named("", ColorMode::TrueColor), Theme::slate());
+        assert_eq!(Theme::named("ink", ColorMode::TrueColor), Theme::ink());
+        assert!(Theme::slate().filled());
+        assert!(!Theme::slate().degrade(ColorMode::Ansi16).filled());
+        assert!(!Theme::slate().degrade(ColorMode::Mono).filled());
     }
 
     #[test]

@@ -34,73 +34,131 @@ pub enum Speaker {
     Drafter,
 }
 
-/// The screens along the top.
+/// The eight tiles on the board, in F-key order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tab {
-    /// The conversation and everything Reeve did, as one timeline.
-    Ledger,
+pub enum Tile {
+    /// Approvals and drafted fixes waiting on the person.
+    Needs,
+    /// Vitals, disks, services.
+    Health,
     /// What reeved noticed.
     Findings,
-    /// Standing orders.
-    Orders,
+    /// Everything Reeve did: the receipts.
+    Activity,
     /// What it cost.
     Spend,
+    /// What changed on the machine.
+    Changed,
+    /// Standing orders.
+    Orders,
     /// What Reeve knows.
     Memory,
-    /// Vitals, disks, and what changed.
-    System,
 }
 
-impl Tab {
-    /// In tab-bar order.
-    pub const ALL: [Tab; 6] = [
-        Tab::Ledger,
-        Tab::Findings,
-        Tab::Orders,
-        Tab::Spend,
-        Tab::Memory,
-        Tab::System,
+impl Tile {
+    /// In F-key order.
+    pub const ALL: [Tile; 8] = [
+        Tile::Needs,
+        Tile::Health,
+        Tile::Findings,
+        Tile::Activity,
+        Tile::Spend,
+        Tile::Changed,
+        Tile::Orders,
+        Tile::Memory,
     ];
 
     /// Lowercase name.
     pub fn label(self) -> &'static str {
         match self {
-            Tab::Ledger => "ledger",
-            Tab::Findings => "findings",
-            Tab::Orders => "orders",
-            Tab::Spend => "spend",
-            Tab::Memory => "memory",
-            Tab::System => "system",
+            Tile::Needs => "needs you",
+            Tile::Health => "health",
+            Tile::Findings => "findings",
+            Tile::Activity => "activity",
+            Tile::Spend => "spend",
+            Tile::Changed => "changed",
+            Tile::Orders => "orders",
+            Tile::Memory => "memory",
         }
     }
 
-    /// Its number key, 1–6.
+    /// Its number, 1–8.
     pub fn key(self) -> char {
-        char::from(b'1' + Tab::ALL.iter().position(|t| *t == self).unwrap_or(0) as u8)
+        char::from(b'1' + Tile::ALL.iter().position(|t| *t == self).unwrap_or(0) as u8)
     }
 
-    /// The next tab, wrapping (Tab).
-    pub fn next(self) -> Tab {
-        let i = Tab::ALL.iter().position(|t| *t == self).unwrap_or(0);
-        Tab::ALL[(i + 1) % Tab::ALL.len()]
-    }
-
-    /// The previous tab, wrapping (Shift+Tab).
-    pub fn prev(self) -> Tab {
-        let i = Tab::ALL.iter().position(|t| *t == self).unwrap_or(0);
-        Tab::ALL[(i + Tab::ALL.len() - 1) % Tab::ALL.len()]
-    }
-
-    /// Its function key, as the tab bar shows it: `F1`–`F6`.
+    /// Its function key: `F1`–`F8`.
     pub fn fkey(self) -> String {
         format!("F{}", self.key())
     }
 
     /// From a number key.
-    pub fn from_key(c: char) -> Option<Tab> {
+    pub fn from_key(c: char) -> Option<Tile> {
         let i = c.to_digit(10)? as usize;
-        Tab::ALL.get(i.checked_sub(1)?).copied()
+        Tile::ALL.get(i.checked_sub(1)?).copied()
     }
+}
+
+/// What fills the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    /// Home: every tile at a glance.
+    Board,
+    /// The conversation and everything Reeve did in it.
+    Chat,
+    /// One tile, opened.
+    Tile(Tile),
+}
+
+impl Screen {
+    /// The cycle Tab walks: the board, then each tile.
+    const CYCLE: [Screen; 9] = [
+        Screen::Board,
+        Screen::Tile(Tile::Needs),
+        Screen::Tile(Tile::Health),
+        Screen::Tile(Tile::Findings),
+        Screen::Tile(Tile::Activity),
+        Screen::Tile(Tile::Spend),
+        Screen::Tile(Tile::Changed),
+        Screen::Tile(Tile::Orders),
+        Screen::Tile(Tile::Memory),
+    ];
+
+    fn at(self) -> usize {
+        Self::CYCLE.iter().position(|s| *s == self).unwrap_or(0)
+    }
+
+    /// The next screen, wrapping (Tab). The chat counts as the board.
+    pub fn next(self) -> Screen {
+        Self::CYCLE[(self.at() + 1) % Self::CYCLE.len()]
+    }
+
+    /// The previous screen, wrapping (Shift+Tab).
+    pub fn prev(self) -> Screen {
+        Self::CYCLE[(self.at() + Self::CYCLE.len() - 1) % Self::CYCLE.len()]
+    }
+}
+
+/// What the board shows that isn't already in the view, refreshed every
+/// few seconds from disk.
+#[derive(Debug, Clone, Default)]
+pub struct Board {
+    /// Today's spend by role: (role, USD, calls), largest first.
+    pub roles: Vec<(String, f64, u64)>,
+    /// Today's spend per hour, 0–23.
+    pub hours: Vec<f64>,
+    /// This month: USD and calls.
+    pub month: (f64, u64),
+    /// Share of this month's input tokens served from cache.
+    pub cached: Option<f64>,
+    /// Standing orders: (name, on, when it runs).
+    pub orders: Vec<(String, bool, String)>,
+    /// Memory notes, newest first: (title, new).
+    pub notes: Vec<(String, bool)>,
+    /// Notes by layer: facts, runbooks, preferences, baselines.
+    pub layers: [usize; 4],
+    /// The last day's report: what changed, disk trends, headlines.
+    pub report: Option<Box<reeve_observer::report::Report>>,
 }
 
 /// What one model round cost, shown in the ledger's money column.
@@ -259,6 +317,12 @@ pub struct View {
     pub session_id: String,
     /// Repaint the whole screen on the next frame (ctrl+l).
     pub redraw: bool,
+    /// The conversation is open (else the board is home).
+    pub chat: bool,
+    /// Typing a question on a tile's screen (`?`).
+    pub composing: bool,
+    /// What the board shows.
+    pub board: Board,
 }
 
 /// Spending caps, USD; 0 is off.
@@ -315,6 +379,9 @@ impl View {
             privacy: None,
             session_id: String::new(),
             redraw: false,
+            chat: false,
+            composing: false,
+            board: Board::default(),
         }
     }
 
@@ -353,12 +420,18 @@ impl View {
         self.scroll = 0;
     }
 
-    /// The screen showing: the tab whose panel is at the bottom of the stack.
-    pub fn tab(&self) -> Tab {
-        self.overlays
+    /// The screen showing: the tile whose panel is at the bottom of the
+    /// stack, else the chat or the board.
+    pub fn screen(&self) -> Screen {
+        match self
+            .overlays
             .first()
-            .and_then(crate::overlay::Overlay::tab)
-            .unwrap_or(Tab::Ledger)
+            .and_then(crate::overlay::Overlay::tile)
+        {
+            Some(t) => Screen::Tile(t),
+            None if self.chat => Screen::Chat,
+            None => Screen::Board,
+        }
     }
 
     /// A setup note, dropped by [`View::drop_transient`].
@@ -695,6 +768,20 @@ mod tests {
         assert_eq!(v.input, "héllo ");
         assert_eq!(v.take_input().as_deref(), Some("héllo"));
         assert_eq!(v.take_input(), None);
+    }
+
+    #[test]
+    fn tab_walks_the_board_then_each_tile() {
+        assert_eq!(Screen::Board.next(), Screen::Tile(Tile::Needs));
+        assert_eq!(Screen::Tile(Tile::Memory).next(), Screen::Board);
+        assert_eq!(Screen::Board.prev(), Screen::Tile(Tile::Memory));
+        assert_eq!(Screen::Chat.next(), Screen::Tile(Tile::Needs));
+        assert_eq!(Tile::from_key('8'), Some(Tile::Memory));
+        assert_eq!(Tile::Spend.fkey(), "F5");
+        let mut v = View::new(HostInfo::default());
+        assert_eq!(v.screen(), Screen::Board);
+        v.chat = true;
+        assert_eq!(v.screen(), Screen::Chat);
     }
 
     #[test]

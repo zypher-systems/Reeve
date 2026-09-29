@@ -2,6 +2,23 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-29: The TUI is a board of tiles
+- **Decision:**
+  - Home is a board of eight tiles, one per F-key: needs you, health, findings, activity, spend, changed, orders, memory.
+  - Opening a tile (or the chat) gives it the main area; the other tiles fold into a strip of live numbers along the top.
+  - The composer is on every screen; on a tile, `?` asks about what's selected, and the question says what it's about.
+  - Tiles are filled surfaces with half-block edges; the default theme is slate.
+- **Chosen vs rejected:**
+  - The owner found the ledger-and-tabs UI hard to navigate ("you have to swap tabs constantly to see useful information") and still dated. From four new directions (tiled, inspector, blocks, bento; see the round-two canvas), they chose bento.
+  - F-keys over the mockups' letters: letters would fight typing in the composer, and the owner asked for F-key labels before.
+  - Rejected keeping tabs with more on each: the complaint was the switching, not the content.
+  - Kept the ledger as the chat: its timeline, brackets, and money columns were the part that worked.
+- **Why:** The numbers that matter (an approval waiting, swap full, today's spend) should be visible whatever you're doing. The strip keeps them in view on every screen, and the board shows everything at once.
+- **Where:** `reeve-tui/src/board.rs` (board, strip, surfaces, composer), `screens.rs` (each tile opened), `view.rs` (`Tile`, `Screen`, `Board`), `overlay.rs` (`NeedsPanel`, `tile()`), `run.rs` (keys, `open_tile`, `refresh_board`), `theme.rs` (`slate`)
+- **Residual risks:**
+  - Half blocks depend on the terminal drawing block elements edge to edge; Konsole, kitty, and foot do. With 16 colors or none the tiles get borders.
+  - The board reads today's spend, orders, and memory every ten seconds and asks for the day's report every fifteen minutes.
+
 ### 2026-09-28: The TUI is a ledger with tabs
 - **Decision:**
   - The conversation is drawn as a ledger: one timeline where tool calls branch off, verified changes are brackets, reeved's and the drafter's activity appear as rows, and each model round carries its cost and the session's running total.

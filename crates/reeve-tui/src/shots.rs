@@ -5,8 +5,8 @@
 //! REEVE_SHOTS=/tmp/shots REEVE_SHOTS_HOME=~/.reeve cargo test -p reeve-tui shots -- --ignored
 //! ```
 //!
-//! With `REEVE_SHOTS_HOME`, the findings, spend, and system screens read that
-//! Reeve home (read-only); the ledger is a made-up conversation.
+//! With `REEVE_SHOTS_HOME`, the board and the tiles read that Reeve home
+//! (read-only); the chat is a made-up conversation.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -38,14 +38,19 @@ fn hex(c: Color, fallback: &str) -> String {
 
 /// One frame as HTML: a `<pre>` of colored cells.
 fn html(v: &View, t: &Theme, title: &str) -> String {
-    let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
+    html_at(v, t, title, W, H)
+}
+
+/// One frame of `w`×`h` cells as HTML.
+fn html_at(v: &View, t: &Theme, title: &str, w: u16, h: u16) -> String {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| crate::draw::draw(f, v, t)).unwrap();
     let buf = term.backend().buffer().clone();
     let bg = hex(t.bg, "#151412");
     let fg = hex(t.fg, "#e9e4d8");
     let mut body = String::new();
-    for y in 0..H {
-        for x in 0..W {
+    for y in 0..h {
+        for x in 0..w {
             let c = &buf[(x, y)];
             let mut style = format!("color:{};background:{}", hex(c.fg, &fg), hex(c.bg, &bg));
             if c.modifier.contains(Modifier::BOLD) {
@@ -60,6 +65,43 @@ fn html(v: &View, t: &Theme, title: &str) -> String {
             if c.modifier.contains(Modifier::CROSSED_OUT) {
                 style.push_str(";text-decoration:line-through");
             }
+            // Block elements fill the cell in a terminal; a font's glyphs
+            // don't fill an 18px line, so draw them as backgrounds.
+            let (f, b) = (hex(c.fg, &fg), hex(c.bg, &bg));
+            let block = |layer: &str| format!("background:{layer},{b};color:transparent");
+            let part =
+                |pos: &str, size: &str| format!("linear-gradient({f},{f}) no-repeat {pos}/{size}");
+            let fill = match c.symbol() {
+                "█" => Some(block(&part("0 0", "100% 100%"))),
+                "▀" => Some(block(&part("0 0", "100% 50%"))),
+                "▄" => Some(block(&part("0 100%", "100% 50%"))),
+                "▖" => Some(block(&part("0 100%", "50% 50%"))),
+                "▗" => Some(block(&part("100% 100%", "50% 50%"))),
+                "▘" => Some(block(&part("0 0", "50% 50%"))),
+                "▝" => Some(block(&part("100% 0", "50% 50%"))),
+                s => {
+                    let lower = ["▁", "▂", "▃", "▅", "▆", "▇"].iter().position(|x| *x == s);
+                    let left = ["▏", "▎", "▍", "▌", "▋", "▊", "▉"]
+                        .iter()
+                        .position(|x| *x == s);
+                    match (lower, left) {
+                        (Some(i), _) => {
+                            let eighths = [1, 2, 3, 5, 6, 7][i];
+                            Some(block(&part(
+                                "0 100%",
+                                &format!("100% {}%", eighths * 100 / 8),
+                            )))
+                        }
+                        (_, Some(i)) => {
+                            Some(block(&part("0 0", &format!("{}% 100%", (i + 1) * 100 / 8))))
+                        }
+                        _ => None,
+                    }
+                }
+            };
+            if let Some(fill) = fill {
+                style = fill;
+            }
             let sym = match c.symbol() {
                 "&" => "&amp;".to_string(),
                 "<" => "&lt;".to_string(),
@@ -71,7 +113,7 @@ fn html(v: &View, t: &Theme, title: &str) -> String {
         body.push('\n');
     }
     format!(
-        "<!doctype html><meta charset=utf-8><title>{title}</title><style>body{{margin:0;background:{bg}}}pre{{margin:0;padding:10px;font:13px/18px 'DejaVu Sans Mono',monospace}}pre span{{display:inline-block;width:8px;overflow:visible}}</style><pre>{body}</pre>"
+        "<!doctype html><meta charset=utf-8><title>{title}</title><style>body{{margin:0;background:{bg}}}pre{{margin:0;padding:10px;font:13px/18px 'DejaVu Sans Mono',monospace}}pre span{{display:inline-block;width:8px;height:18px;vertical-align:top;overflow:visible}}</style><pre>{body}</pre>"
     )
 }
 
@@ -283,19 +325,9 @@ fn write(dir: &Path, name: &str, page: String) {
     let _ = std::fs::write(dir.join(format!("{name}.html")), page);
 }
 
-#[test]
-#[ignore = "writes HTML for looking at; needs REEVE_SHOTS"]
-fn shots() {
-    let Some(dir) = std::env::var_os("REEVE_SHOTS").map(PathBuf::from) else {
-        return;
-    };
-    std::fs::create_dir_all(&dir).unwrap();
-    let home = std::env::var_os("REEVE_SHOTS_HOME").map(PathBuf::from);
-    let t = Theme::ink();
-
-    // 1 · ledger, mid-change, with the approval asking.
-    let mut v = ledger();
-    v.approval = Some(crate::view::Pending {
+/// The approval the mailsync story is waiting on.
+fn asking() -> crate::view::Pending {
+    crate::view::Pending {
         req: reeve_core::agent::ApprovalRequest {
             tool: "fs_move".into(),
             summary: "move ~/.config/Mailspring/cache → cache.bak".into(),
@@ -314,11 +346,53 @@ fn shots() {
             }),
         },
         typed: String::new(),
-    });
-    write(&dir, "1-ledger", html(&v, &t, "ledger"));
+    }
+}
 
-    // 1b · the ledger after the change was checked.
+/// The board's data from a real home, when there is one.
+fn fill(v: &mut View, home: Option<&Path>) {
+    let Some(home) = home else { return };
+    let items = reeve_core::findings::FindingStore::new(home).list();
+    v.findings = items
+        .into_iter()
+        .filter(|f| f.status == reeve_core::findings::FindingStatus::Open)
+        .collect();
+    v.board = crate::board::read(home, &reeve_core::memory::Memory::new(home));
+    v.board.report = Some(Box::new(reeve_observer::report::gather(home, 1)));
+    v.totals = reeve_core::ledger::totals(home, chrono::Local::now());
+    v.drafter = Some((0.13, 0.25));
+    let mut r = reeve_core::receipts::ReceiptBook::new(home).recent(40);
+    r.truncate(40);
+    if !r.is_empty() {
+        v.receipts = r;
+    }
+}
+
+#[test]
+#[ignore = "writes HTML for looking at; needs REEVE_SHOTS"]
+fn shots() {
+    let Some(dir) = std::env::var_os("REEVE_SHOTS").map(PathBuf::from) else {
+        return;
+    };
+    std::fs::create_dir_all(&dir).unwrap();
+    let home = std::env::var_os("REEVE_SHOTS_HOME").map(PathBuf::from);
+    let home = home.as_deref();
+    let t = Theme::slate();
+
+    // Home: the board, with an approval asking.
     let mut v = ledger();
+    fill(&mut v, home);
+    v.approval = Some(asking());
+    write(&dir, "0-board", html(&v, &t, "board"));
+
+    // The chat, the approval asking there.
+    v.chat = true;
+    write(&dir, "1-chat", html(&v, &t, "chat"));
+
+    // The chat after the change was checked.
+    let mut v = ledger();
+    fill(&mut v, home);
+    v.chat = true;
     let mut r = Receipt::draft("s7", "fs_move", Default::default(), Tier::T1);
     r.seq = 86;
     r.approved_by = "user".into();
@@ -356,44 +430,45 @@ fn shots() {
     ));
     v.apply(spend(0.0082, 0.0262, 10946, 357));
     v.apply(AgentEvent::TurnDone { truncated: false });
-    write(&dir, "1b-ledger-done", html(&v, &t, "ledger"));
+    write(&dir, "1b-chat-done", html(&v, &t, "chat"));
 
-    // ⌃K over the ledger.
+    // ⌃K over the board.
     let mut v = ledger();
+    fill(&mut v, home);
     let hits = vec![
         crate::overlay::Hit {
             group: "FIX",
             title: "Run the drafted fix: mailsync keeps crashing".into(),
-            detail: "verified, in the ledger".into(),
-            place: "F2 findings".into(),
+            detail: "verified, in the chat".into(),
+            place: "F1 needs you".into(),
             action: crate::overlay::Action::None,
         },
         crate::overlay::Hit {
             group: "SEE",
             title: "mailsync keeps crashing".into(),
             detail: "warning · 103×".into(),
-            place: "F2 findings".into(),
+            place: "F3 findings".into(),
             action: crate::overlay::Action::None,
         },
         crate::overlay::Hit {
             group: "GO",
             title: "#81 logs_query coredumpctl list mailsync".into(),
             detail: "102 dumps".into(),
-            place: "receipts".into(),
+            place: "F4 activity".into(),
             action: crate::overlay::Action::None,
         },
         crate::overlay::Hit {
             group: "KNOW",
             title: "Mailspring crash loop".into(),
             detail: "runbook".into(),
-            place: "F5 memory".into(),
+            place: "F8 memory".into(),
             action: crate::overlay::Action::None,
         },
         crate::overlay::Hit {
             group: "KEEP",
             title: "Standing order: restart mailsync when it loops".into(),
             detail: "off".into(),
-            place: "F3 orders".into(),
+            place: "F7 orders".into(),
             action: crate::overlay::Action::None,
         },
     ];
@@ -403,57 +478,122 @@ fn shots() {
             items: hits,
             sel: 0,
         }));
-    write(&dir, "2-everything", html(&v, &t, "everything"));
+    write(&dir, "2-search", html(&v, &t, "search"));
+
+    // A board in a smaller terminal.
+    let mut v = ledger();
+    fill(&mut v, home);
+    v.approval = Some(asking());
+    write(&dir, "0b-board-100x32", html_at(&v, &t, "board", 100, 32));
 
     let Some(home) = home else { return };
-    // Findings, from that home.
+    let store = reeve_core::findings::FindingStore::new(home);
+
+    // F1 · needs you.
+    let mut v = ledger();
+    fill(&mut v, Some(home));
+    v.approval = Some(asking());
+    let mut fixes: Vec<_> = store
+        .list()
+        .into_iter()
+        .filter(|f| f.status == reeve_core::findings::FindingStatus::Open && f.proposal.is_some())
+        .collect();
+    fixes.sort_by(|a, b| b.severity.cmp(&a.severity));
+    v.overlays.push(Overlay::Needs(crate::overlay::NeedsPanel {
+        asking: true,
+        fixes: fixes.clone(),
+        reboot: v
+            .board
+            .report
+            .as_ref()
+            .and_then(|r| r.drift.reboot_for.clone()),
+        sel: 0,
+        scroll: 0,
+    }));
+    write(&dir, "f1-needs", html(&v, &t, "needs you"));
+    if let Some(Overlay::Needs(p)) = v.overlays.first_mut() {
+        p.sel = 1;
+    }
+    write(&dir, "f1b-needs-fix", html(&v, &t, "needs you"));
+
+    // F2 · health, and F6 · what changed.
     let mut v = base();
-    let items = reeve_core::findings::FindingStore::new(&home).list();
-    v.findings = items.iter().filter(|f| f.is_live()).cloned().collect();
+    fill(&mut v, Some(home));
+    let report = v.board.report.clone();
+    v.overlays
+        .push(Overlay::System(crate::overlay::SystemPanel {
+            changed: false,
+            days: 1,
+            report: report.clone(),
+            loading: false,
+        }));
+    write(&dir, "f2-health", html(&v, &t, "health"));
+    v.overlays.clear();
+    v.overlays
+        .push(Overlay::System(crate::overlay::SystemPanel {
+            changed: true,
+            days: 1,
+            report,
+            loading: false,
+        }));
+    write(&dir, "f6-changed", html(&v, &t, "changed"));
+
+    // F3 · findings.
+    let mut v = base();
+    fill(&mut v, Some(home));
     let mut p = crate::overlay::FindingsPanel::default();
-    p.refresh(items);
+    p.refresh(store.list());
     if let Some(i) = p.items.iter().position(|f| f.id.contains("mailsync")) {
         p.sel = i;
     }
     v.overlays.push(Overlay::Findings(p));
-    write(&dir, "3-findings", html(&v, &t, "findings"));
+    write(&dir, "f3-findings", html(&v, &t, "findings"));
 
-    // Spend.
+    // F4 · activity.
     let mut v = base();
-    v.findings.clear();
-    let records = reeve_core::ledger::since(&home, crate::overlay::SpendRange::Day.since());
+    fill(&mut v, Some(home));
+    let items = reeve_core::receipts::ReceiptBook::new(home).recent(500);
+    let undone = items.iter().filter_map(|r| r.undoes).collect();
+    v.overlays
+        .push(Overlay::Receipts(crate::overlay::ReceiptsPanel {
+            items,
+            undone,
+            sel: 0,
+            note: None,
+        }));
+    write(&dir, "f4-activity", html(&v, &t, "activity"));
+
+    // F5 · spend.
+    let mut v = base();
+    fill(&mut v, Some(home));
+    let records = reeve_core::ledger::since(home, crate::overlay::SpendRange::Day.since());
     let n = reeve_core::ledger::statement(&records).len();
-    v.drafter = Some((0.13, 0.25));
     v.overlays.push(Overlay::Spend(crate::overlay::SpendPanel {
         range: crate::overlay::SpendRange::Day,
         records,
-        month: reeve_core::ledger::since(&home, crate::overlay::SpendRange::Month.since()),
+        month: reeve_core::ledger::since(home, crate::overlay::SpendRange::Month.since()),
         sel: n.saturating_sub(1),
         current: String::new(),
         caps: (0.0, 0.0, 0.0, 1.0),
         drafter_cap: Some(0.25),
         note: None,
     }));
-    write(&dir, "4-spend", html(&v, &t, "spend"));
+    write(&dir, "f5-spend", html(&v, &t, "spend"));
 
-    // System.
+    // F7 · orders, and F8 · memory.
     let mut v = base();
-    let r = reeve_observer::report::gather(&home, 1);
+    fill(&mut v, Some(home));
     v.overlays
-        .push(Overlay::System(crate::overlay::SystemPanel {
-            days: 1,
-            report: Some(Box::new(r)),
-            loading: false,
-        }));
-    write(&dir, "6-system", html(&v, &t, "system"));
-
-    // Memory and orders, as they are.
-    let mut v = base();
+        .push(Overlay::Orders(crate::overlay::OrdersPanel::load(
+            &reeve_core::orders::Orders::new(home),
+        )));
+    write(&dir, "f7-orders", html(&v, &t, "orders"));
+    v.overlays.clear();
     v.overlays
         .push(Overlay::Memory(crate::overlay::MemoryPanel::load(
-            &reeve_core::memory::Memory::new(&home),
+            &reeve_core::memory::Memory::new(home),
         )));
-    write(&dir, "5-memory", html(&v, &t, "memory"));
+    write(&dir, "f8-memory", html(&v, &t, "memory"));
 }
 
 #[test]
@@ -472,7 +612,7 @@ fn everything_with_a_real_home() {
             group: "SEE",
             title: f.title.clone(),
             detail: f.severity.as_str().into(),
-            place: "F2 findings".into(),
+            place: "F3 findings".into(),
             action: crate::overlay::Action::None,
         });
     }

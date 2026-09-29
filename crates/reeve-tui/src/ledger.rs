@@ -7,7 +7,7 @@
 //! same spine. Whatever needs you is at the bottom, where you type.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -17,7 +17,7 @@ use reeve_core::policy::Tier;
 use reeve_core::receipts::Status;
 use reeve_core::spend::{format_tokens, format_usd};
 
-use crate::draw::{SPINNER, char_wrap, cursor_pos, markdown, pad, plain_wrap, truncate};
+use crate::draw::{SPINNER, markdown, pad, plain_wrap, truncate};
 use crate::theme::Theme;
 use crate::view::{Entry, Speaker, ToolView, View};
 
@@ -31,18 +31,9 @@ const BAL_W: usize = 11;
 /// Below this width the money columns fold into the rows.
 const MONEY_MIN: u16 = 96;
 
-/// Draw the ledger tab.
+/// Draw the conversation (the composer and any approval are the frame's).
 pub fn draw(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
-    let text_w = area.width.saturating_sub(4).max(10) as usize;
-    let composer_lines = char_wrap(&v.input, text_w).len().clamp(1, 6) as u16;
-    let bottom_h = match &v.approval {
-        Some(p) => {
-            crate::cards::approval_height(p, area.width).min(area.height.saturating_sub(3).max(6))
-        }
-        None => composer_lines + 1,
-    };
-    let [log, bottom] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_h)]).areas(area);
+    let log = area;
     let money = area.width >= MONEY_MIN;
     let talking = v
         .entries
@@ -94,77 +85,6 @@ pub fn draw(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
                 1,
             ),
         );
-    }
-    match &v.approval {
-        Some(p) => crate::cards::draw_approval(f, bottom, v, p, t),
-        None => {
-            draw_composer(f, bottom, v, t, text_w);
-            crate::panels::draw_palette(f, bottom, v, t);
-        }
-    }
-}
-
-fn draw_composer(f: &mut Frame, area: Rect, v: &View, t: &Theme, text_w: usize) {
-    let edge = if v.busy {
-        t.border
-    } else {
-        t.mix(t.border, t.brass, 0.35)
-    };
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            "─".repeat(area.width as usize),
-            Style::default().fg(edge),
-        )),
-        Rect { height: 1, ..area },
-    );
-    let body = Rect {
-        y: area.y + 1,
-        height: area.height.saturating_sub(1),
-        ..area
-    };
-    let prompt = Span::styled(
-        "› ",
-        Style::default()
-            .fg(if v.busy { t.faint } else { t.brass })
-            .add_modifier(Modifier::BOLD),
-    );
-    let rows = char_wrap(&v.input, text_w);
-    let mut lines = Vec::new();
-    if v.input.is_empty() {
-        let hint = if v.busy {
-            "Reeve is working…  esc to stop"
-        } else if v.ready {
-            "Ask Reeve about this machine · / commands · tab screens · ctrl+k everything"
-        } else {
-            "Type /providers to add an API key and pick a model."
-        };
-        lines.push(Line::from(vec![
-            prompt,
-            Span::styled(hint, Style::default().fg(t.faint)),
-        ]));
-    } else {
-        for (i, row) in rows.iter().enumerate() {
-            let lead = if i == 0 {
-                prompt.clone()
-            } else {
-                Span::raw("  ")
-            };
-            lines.push(Line::from(vec![lead, Span::styled(row.clone(), t.text())]));
-        }
-    }
-    let visible = body.height as usize;
-    let skip = lines.len().saturating_sub(visible);
-    f.render_widget(
-        Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>()),
-        body,
-    );
-    if !v.busy && v.overlays.is_empty() {
-        let (row, col) = cursor_pos(&v.input[..v.cursor], text_w);
-        let row = row.saturating_sub(skip);
-        f.set_cursor_position(Position::new(
-            body.x + 2 + col as u16,
-            body.y + row.min(visible.saturating_sub(1)) as u16,
-        ));
     }
 }
 
@@ -277,12 +197,15 @@ pub fn lines(v: &View, t: &Theme, width: usize, money: bool) -> Vec<Line<'static
             Speaker::Reeve => {
                 let mut head = vec![Span::styled(
                     "reeve",
-                    Style::default().fg(t.fg).add_modifier(Modifier::BOLD),
+                    Style::default().fg(t.brass).add_modifier(Modifier::BOLD),
                 )];
                 let (cost, bal) = money_cols(e, t, money, &mut head);
                 rows.push(Row {
                     time: time.clone(),
-                    node: Span::styled("◆", Style::default().fg(t.fg).add_modifier(Modifier::BOLD)),
+                    node: Span::styled(
+                        "◆",
+                        Style::default().fg(t.brass).add_modifier(Modifier::BOLD),
+                    ),
                     content: head,
                     cost,
                     bal,
@@ -422,7 +345,7 @@ pub fn lines(v: &View, t: &Theme, width: usize, money: bool) -> Vec<Line<'static
                 let (name, c) = if e.who == Speaker::Reeved {
                     ("reeved", t.warn)
                 } else {
-                    ("drafter", t.teal)
+                    ("drafter", t.violet)
                 };
                 let mut content = vec![
                     Span::styled(name, Style::default().fg(c)),
@@ -436,7 +359,7 @@ pub fn lines(v: &View, t: &Theme, width: usize, money: bool) -> Vec<Line<'static
                     Some(usd) if money => (
                         Some(Span::styled(
                             format!("({})", format_usd(Some(usd))),
-                            Style::default().fg(t.teal),
+                            Style::default().fg(t.violet),
                         )),
                         Some(Span::styled("own budget", Style::default().fg(t.faint))),
                     ),
@@ -542,13 +465,7 @@ fn money_cols(
 }
 
 fn tier_pill(tier: Tier, t: &Theme) -> Span<'static> {
-    Span::styled(
-        format!(" {} ", tier.label()),
-        Style::default()
-            .fg(t.tier(tier))
-            .bg(t.input)
-            .add_modifier(Modifier::BOLD),
-    )
+    crate::board::tier_pill(tier, t)
 }
 
 /// A tool call: status, tier, what, what came of it, its receipt; then
@@ -610,13 +527,10 @@ fn tool_rows(
     let mut second = None;
     let sw = tv.summary.width();
     if !note.is_empty() && sw + 4 + note.width() <= room {
-        // Summary, a leader, and the result on one row.
-        let dots = room.saturating_sub(sw + 2 + note.width()).min(24);
+        // Summary on the left, the result flush right, on one row.
+        let gap = room.saturating_sub(sw + 2 + note.width());
         content.push(Span::styled(tv.summary.clone(), summary_style));
-        content.push(Span::styled(
-            format!(" {} ", "·".repeat(dots)),
-            Style::default().fg(t.border),
-        ));
+        content.push(Span::raw(format!(" {} ", " ".repeat(gap))));
         content.push(Span::styled(note, Style::default().fg(note_c)));
     } else {
         content.push(Span::styled(truncate(&tv.summary, room), summary_style));

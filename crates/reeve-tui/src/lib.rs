@@ -1,7 +1,8 @@
-//! Reeve's TUI: the ledger, and tabs for everything else.
+//! Reeve's TUI: a board of tiles, the chat, and each tile opened.
 
 #![forbid(unsafe_code)]
 
+pub mod board;
 pub mod cards;
 pub mod draw;
 pub mod ledger;
