@@ -10,7 +10,7 @@
 %global __brp_mangle_shebangs_exclude_from ^/usr/src/debug/.*$
 
 Name:           reeve
-Version:        0.3.0
+Version:        0.3.1
 Release:        1%{?dist}
 Summary:        An operator agent that manages this computer, with receipts
 
@@ -77,6 +77,11 @@ install -Dpm 0644 packaging/systemd/reeved.service %{buildroot}%{_userunitdir}/r
 %{_userunitdir}/reeved.service
 
 %changelog
+* Tue Sep 29 2026 Zypher Systems <zypher@zyphersystems.com> - 0.3.1-1
+- Asks less: reads (awk and sed that print, shell loops, builtins, --help) run at once; a scratch folder never asks.
+- On an approval, a is yes to the rest of the request and s allows that kind of change for the session.
+- [approvals] undoable (off by default) runs changes Reeve can undo without asking.
+
 * Tue Sep 29 2026 Zypher Systems <zypher@zyphersystems.com> - 0.3.0-1
 - A new TUI: a board of eight tiles (F1-F8); an open tile keeps the others live in a strip along the top.
 - New screens: needs you, activity, and what changed. The default theme is slate.
