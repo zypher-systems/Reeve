@@ -4,6 +4,7 @@
 mod fs;
 mod mem;
 pub mod obs;
+pub mod order;
 mod shell;
 mod sys;
 
@@ -88,6 +89,9 @@ pub struct Plan {
     /// What "allow for this session" remembers (T1 only): every one must
     /// already be allowed for the action to run without asking.
     pub rules: Vec<String>,
+    /// What it means, in plain words, for the approval card (standing
+    /// orders: when it runs, what it may do, what it spends).
+    pub details: Vec<String>,
     call: Call,
 }
 
@@ -149,6 +153,7 @@ enum Call {
     MemRead(mem::ReadArgs),
     MemWrite(mem::WriteArgs),
     Findings(obs::Args),
+    Order(Box<order::Planned>),
 }
 
 #[derive(Deserialize)]
@@ -187,6 +192,14 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
             "memory_read" => Call::MemRead(serde_json::from_value(args.clone()).map_err(parse)?),
             "memory_write" => Call::MemWrite(serde_json::from_value(args.clone()).map_err(parse)?),
             "findings" => Call::Findings(serde_json::from_value(args.clone()).map_err(parse)?),
+            "order_save" => Call::Order(Box::new(order::prepare_save(
+                ctx,
+                &serde_json::from_value(args.clone()).map_err(parse)?,
+            )?)),
+            "order_delete" => Call::Order(Box::new(order::prepare_delete(
+                ctx,
+                &serde_json::from_value(args.clone()).map_err(parse)?,
+            )?)),
             other => return Err(format!("there is no tool named {other}")),
         }
     };
@@ -229,6 +242,11 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
             false,
             Vec::new(),
         ),
+        Call::Order(p) => order::plan(p),
+    };
+    let details = match &call {
+        Call::Order(p) => order::details(p),
+        _ => Vec::new(),
     };
     let mut assessment = assessment;
     apply_rules(ctx, &call, &args, &mut assessment);
@@ -241,6 +259,7 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
         why,
         undoable,
         rules,
+        details,
         call,
     })
 }
@@ -262,6 +281,7 @@ pub async fn execute(ctx: &ToolCtx, plan: &Plan) -> Executed {
         Call::MemRead(a) => mem::read(ctx, a),
         Call::MemWrite(a) => mem::write(ctx, a),
         Call::Findings(a) => obs::run(ctx, a),
+        Call::Order(p) => order::run(ctx, p),
     }
 }
 
@@ -536,6 +556,48 @@ pub fn specs() -> Vec<ToolSpec> {
             "What reeved, the background observer, has noticed: open findings (crashes, full disks, failed units, journal spikes, pending updates), or one finding's details and evidence by id.",
             json!({"id": {"type": "string"}, "include_closed": {"type": "boolean", "description": "Include resolved and dismissed ones"}}),
             &[],
+        ),
+        spec(
+            "order_save",
+            &format!(
+                "Make a standing order, or change one (give its id): work reeved, the background \
+observer, does on its own from now on, on a schedule and/or when it finds something. Use it when the \
+owner wants something done regularly or whenever something happens. The owner approves it once, \
+seeing it in plain words; after that it runs unattended within exactly what the order allows. \
+Write the task for yourself running with nobody there: what to check first, what to change, what \
+to report, and when to do nothing. Scope it narrowly: the commands it may run (`*` is one word; \
+reads never need listing) and the files it may change. Leave the limits out and they fit the \
+schedule. See existing orders with `reeve orders list` / `reeve orders show <id>`. Finding kinds: {}.",
+                crate::orders::FINDING_KINDS
+                    .iter()
+                    .map(|(k, what)| format!("{k} ({what})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            json!({
+                "id": {"type": "string", "description": "An existing order's id, to change it; leave out for a new one"},
+                "name": {"type": "string", "description": "Short, for the list: \"Clear the thumbnail cache\""},
+                "task": {"type": "string", "description": "What to do, in plain words, for yourself running unattended"},
+                "schedule": {"type": "string", "description": "hourly, every 30m (at least 5m), every 6h, daily 03:00, or weekly sun 03:00 (local time); \"none\" removes it"},
+                "findings": {"type": "array", "items": {"type": "string"}, "description": "Finding ids that start a run; * matches anything: disk-full:*, unit-failed:bluetooth*"},
+                "min_severity": {"type": "string", "enum": ["info", "warning", "critical"]},
+                "max_tier": {"type": "string", "enum": ["T0", "T1", "T2"], "description": "The most it may do: T0 look and report, T1 your files and user services, T2 the system (sudo). Default: what its commands need"},
+                "tools": {"type": "array", "items": {"type": "string", "enum": order::CHANGE_TOOLS}, "description": "Tools it may change things with; empty: any, still limited by commands and paths"},
+                "commands": {"type": "array", "items": {"type": "string"}, "description": "Commands it may run to change things, as globs: \"sudo journalctl --vacuum-size=*\""},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "Files it may change, as globs: \"~/.cache/thumbnails/**\""},
+                "per_run_usd": {"type": "number", "description": "Most one run may spend (default 0.05)"},
+                "runs_per_day": {"type": "integer"},
+                "cooldown_hours": {"type": "number"},
+                "notify": {"type": "string", "enum": ["never", "after", "before"], "description": "never: a popup only when it needs the owner (default); after: after every run; before: at the start too"},
+                "enabled": {"type": "boolean", "description": "Default true for a new order"}
+            }),
+            &[],
+        ),
+        spec(
+            "order_delete",
+            "Delete a standing order the owner no longer wants (asks them; it can be undone). To pause one instead, order_save it with enabled false.",
+            json!({"id": {"type": "string"}}),
+            &["id"],
         ),
         spec(
             "change_begin",

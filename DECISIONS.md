@@ -2,6 +2,53 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-29: The model writes standing orders, asking the owner each time
+- **Decision:**
+  - New tools `order_save` (make, or change by id; fields the model leaves out keep their values) and `order_delete`. The model is told to make an order whenever the owner wants something done regularly or whenever something happens.
+  - They're T2 with a new `Assessment::owner_only`: the owner is asked every time, and nothing answers for them (YOLO, session and request rules, "yes to the rest of this change", the undoable setting). A broad answer to the card counts only for that card. Unattended runs (orders, the drafter) are refused outright, so an order can't make an order.
+  - The card shows the order in plain words (`Order::describe`, `ApprovalRequest::details`) in place of the file's diff: when it runs, what it does, the exact commands and files, the most it spends a run and a day, and notes (sudoers needed, limits that slow the schedule).
+  - A new order from the model starts on: approving it is the owner's consent. Its tier defaults to what its commands need (none: T0; sudo: T2; else T1), and its limits to the schedule (`limits_for`: every 30m is 48 a day, 0.45 h apart). Limits the model sets that would slow the schedule are sent back.
+  - Saves go through `Orders::write_file` with `update` (edits keep comments) and `Expect` (nothing is overwritten); the receipt carries the undo like any file change.
+  - Answer to "reeved or cron?": reeved. It checks due orders every 10 s. Rejected per-order cron jobs or systemd timers: state (runs today, cooldowns, handled findings, budgets) would be split across units, and findings triggers need the observer anyway.
+- **Chosen vs rejected:**
+  - Reverses "order files are floor files, so the model can't give itself unattended powers" (2026-09-27): the owner wants orders to be a flagship ("people will use it more if you can just tell it to do something every so often"). The owner still decides each one; what changed is that it's one `⏎` on a card that reads in plain words, not a typed yes on a TOML file.
+  - Rejected T3 (typed yes): the floor is for what could destroy the system or leak secrets; an order is reviewed, bounded, and undoable, and one keypress on a plain description is the right weight.
+  - Rejected T1 or T2 without `owner_only`: YOLO or "yes to the rest" would let a prompt-injected model create persistent automation without the owner ever seeing it.
+  - Raw file writes to orders stay T3, and so does `reeve undo` of an order change, so the structured tool is the only easy path and always shows the card.
+- **Why:** An order is how Reeve acts like a bot: told once, it keeps doing it. The owner must still see exactly what they're agreeing to.
+- **Where:** `reeve-core/src/tools/order.rs`, `tools/mod.rs` (specs, `Plan::details`), `policy/mod.rs` (`owner_only`), `agent.rs` (`approve`, `ask`, unattended refusal, the prompt's "Standing orders"), `orders.rs` (`describe`, `pace_warning`, `limits_for`, `Schedule::words`, `finding_words`, `slug`, `Orders::write_file`/`free_id`), `reeve-tui/src/cards.rs` (details on the card)
+- **Residual risks:**
+  - A prompt-injected conversation can still propose an order; the defense is the owner reading the card. The card shows commands and paths exactly, and root needs a sudoers rule the owner adds by hand.
+  - reeved is a user service without linger: logged out, nothing runs until the next login.
+  - An order that watches findings has no schedule to fit limits to; it gets two runs a day, 12 hours apart, unless set.
+
+### 2026-09-29: Standing orders are written in a form
+- **Decision:**
+  - `n` in F7 orders opens a form instead of a template in `$EDITOR`; `e` edits an order in the same form, and `E` opens the file.
+  - The form has five sections (what, when, what it may do, limits, after), a line of help under every field, and a live "What it will do" in plain words, with what's missing, sudoers, and whether reeved is running.
+  - Schedules are chosen (every day/week at a time, every few hours or minutes) and findings are ticked by kind in plain words (`disk-full:*` is "a disk is nearly full"). Tools are ticked in groups (`fs_write`, `fs_edit`, `fs_move` are "write, edit, and move files"). Anything the form has no box for (other finding ids, other tools) is kept as it is.
+  - Saving a new order writes it with `orders::render` (commented TOML, 0600), never over another file, and checks it with `orders::parse` first. New orders start off.
+  - Nothing done to an order is destructive:
+    - Saving an existing order is `orders::update`: a `toml_edit` rewrite of only the fields that changed since the form opened, so comments, unknown keys, and changes made in the file meanwhile stay. A field changed both places stops the save once and names it.
+    - Every change from the TUI (save, on/off, delete, `$EDITOR`) goes through `Orders::commit`/`record`: the old file goes in the undo store and a receipt (`order_new`, `order_edit`, `order_toggle`, `order_delete`; T3, approved by `user`) records both sides. `u` in Orders or F4 puts it back.
+    - Picking another example over typed text asks first, and a form closed with changes is kept until quit.
+    - The examples are written once (`.examples` marker), so deleting them sticks.
+  - `reeve undo <n>` by the model is judged by what the undo writes: restoring an order or Reeve's config is T3, as writing it would be.
+- **Chosen vs rejected:**
+  - The owner found three examples and a file with no direction too little to set up automations with.
+  - Rejected a step-by-step wizard: one page with sections lets you see the whole order and change any part, and the plain-words summary does the explaining a wizard would.
+  - Rejected writing cron syntax: the schedule grammar already avoids it, and choices avoid typing the grammar.
+  - The first version re-rendered the whole file on save, dropping comments added by hand, and delete removed the file outright. The owner wants order-making to be a flagship feature and non-destructive, so both were replaced. `toml_edit` was already in the tree (under `toml`).
+  - Rejected a trash folder for deleted orders: receipts and the undo store already keep copies, and undo is how every other change comes back.
+  - Rejected locking the file while the form is open: an edit in another editor shouldn't block, and a field-level merge keeps both.
+- **Why:** An order is the only way Reeve acts unattended, so what it may do has to be easy to set and easy to read back.
+- **Where:** `reeve-tui/src/orderform.rs`, `reeve-core/src/orders.rs` (`render`, `update`, `Orders::save`/`commit`/`record`/`delete`/`set_enabled`/`seed_examples_once`, `FINDING_KINDS`, `TOOL_GROUPS`), `policy/shell.rs` (`reeve undo`), `run.rs` (`Action::OrderForm`, `Action::SaveOrder`, `order_changed`, `order_drafts`), `overlay.rs` (keys in the orders panel)
+- **Residual risks:**
+  - The finding kinds and tool groups are lists kept by hand next to the rules and tools they name. A new rule or tool shows up in the form only when it's added to them; until then it's still kept, as an "other" finding or tool.
+  - A changed list (`tools`, `paths`) is written on one line, so a list laid out over several lines by hand loses its layout (not its comments above it) when the form changes it.
+  - Drafts live in memory: quitting Reeve with a form closed unsaved loses it.
+  - `reeve orders examples` (T0) can still write the examples into an empty orders folder; they're fixed text and off.
+
 ### 2026-09-29: Less asking: reads are reads, scratch is free, and a yes can cover more
 - **Decision:**
   - The shell classifier reads grammar and programs: `if`/`for`/`case`/functions and builtins are structure; awk and sed programs are parsed, and only writing, piping to a command, or running one asks; `tool --help`/`--version` is T0 for installed programs; Reeve's own read-only commands are T0.
@@ -146,7 +193,7 @@ Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / W
   - Write redirects and `$(…)` are refused for unattended runs.
   - A refusal tells the model to stop and say what it needs. The run ends `blocked`, and its report becomes a proposal on the finding (or an `order-blocked:<id>` finding).
   - Each occurrence of a finding triggers an order at most once, and runs per day and a cooldown bound it.
-  - Order files and Reeve's `config.toml`/`settings.toml` are floor files for tools.
+  - Order files and Reeve's `config.toml`/`settings.toml` are floor files for tools. (Since 2026-09-29 the model writes orders through `order_save`, which asks the owner each time; see that entry.)
 - **Chosen vs rejected:**
   - Rejected whole-line globs: `sudo journalctl --vacuum-size=*` matched `… && sudo dnf remove x` (a test caught it before it shipped).
   - Rejected wildcard sudoers rules from `reeve orders sudoers`: a `*` in a sudoers argument allows more than it looks like.

@@ -346,6 +346,7 @@ fn asking() -> crate::view::Pending {
                 goal: "stop mailsync crashing".into(),
                 checks: vec!["app-com.getmailspring.service (user) is active".into()],
             }),
+            details: Vec::new(),
         },
         typed: String::new(),
     }

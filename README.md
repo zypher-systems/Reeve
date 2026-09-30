@@ -151,8 +151,36 @@ Set `REEVE_HOME` to use a different state directory.
 
 ## Standing orders
 
-`~/.reeve/orders/*.toml`, managed in `/orders` or with `reeve orders`. `/orders` writes three examples the first
-time, all off. An order has:
+Work Reeve does on its own, inside limits you set. The easiest way to make one is to ask:
+
+> clear my thumbnail cache every Sunday if it's over 500 MB
+
+Reeve looks first, then writes the order and asks you once, with the order in plain words on the approval
+card: when it runs, what it does, the exact commands and files it may change, and what it may spend a run
+and a day. `⏎` approves it and it's on; `n` says no. Nothing answers that card for you: not YOLO, not "yes to
+the rest", not a session yes. Ask Reeve to change, pause, or delete an order the same way.
+
+Or build one yourself: open **F7 orders** and press `n`, and a form walks you through
+one, section by section, with each field explained and a live **What it will do** beside it in plain words.
+You can start blank or from an example, pick a schedule from choices instead of writing one, tick what
+reeved finds that should start a run, and choose what it may change. `ctrl+s` saves it (off, until you turn
+it on with `space`), and the form points to anything missing first. `e` edits an order in the same form;
+`E` opens its file in `$EDITOR`.
+
+Nothing you do to an order is lost:
+
+- **Every change can be undone.** Saving, turning on or off, deleting, and editing in `$EDITOR` each leave a
+  receipt with the file as it was. `u` in F7 undoes the last one, and F4 activity has them all.
+- **Saving changes only what you changed.** Comments, keys Reeve doesn't know, and anything changed in the
+  file while the form was open stay as they are. If a field you changed was also changed in the file, the
+  form says so, and a second `ctrl+s` keeps yours.
+- **A new order never replaces another,** and picking a different example to start from asks first once
+  you've typed something.
+- **Closing a form with changes keeps it** until Reeve quits: `n` (or `e` on the same order) brings it back.
+
+Each order is a file in `~/.reeve/orders/*.toml`, also managed with `reeve orders`. F7 writes three examples
+the first time, all off; once deleted, they stay deleted (`reeve orders examples` writes them again). An
+order has:
 
 - **a task,** in plain words;
 - **triggers:** finding ids (`disk-full:/var`, `unit-failed:*`) and/or a schedule (`daily 03:00`, `weekly sun 03:00`,
@@ -161,11 +189,18 @@ time, all off. An order has:
   command must match (`*` stays within a word), and path globs for file tools. Reads are always fine.
 - **a budget:** a cap per run, runs per day, and a cooldown.
 
-`reeved` runs it when a finding or the schedule calls for it, once per occurrence of a finding. A yes inside
+**reeved runs orders, not cron.** It checks every 10 seconds whether an order's schedule has come due or a
+finding it watches for is new, and runs one at a time. A schedule's limits (runs a day, hours between) are
+set to let it run each time it's due. Because reeved is a systemd user service, it runs while you're logged
+in (a locked screen counts); a daily or weekly run missed while the machine was off or you were logged out
+runs when reeved next starts. It runs each finding once per occurrence. A yes inside
 the scope is receipted as `order:<id>`. Anything outside it is refused, and the run ends as a proposal in
 `/findings`. Nobody is there to type a password, so root commands need a sudoers rule: `reeve orders sudoers <id>`
-prints exact ones, and never wildcards. `reeve orders run <id>` runs one now, exactly as `reeved` would. Order
-files and Reeve's own config are floor-protected (T3), so the model can't give itself unattended powers.
+prints exact ones, and never wildcards. `reeve orders run <id>` runs one now, exactly as `reeved` would.
+
+The model writes orders only through `order_save` and `order_delete`, which always ask you, and only in a
+conversation: an order run or the drafter can't write one, so an order can never make another. Writing an
+order file any other way (a file tool, the shell) is on the floor (T3), and so is undoing a change to one.
 
 ## The state of the machine
 

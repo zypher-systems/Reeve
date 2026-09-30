@@ -29,6 +29,10 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         everything(f, area, e, t);
         return;
     }
+    if let Overlay::OrderForm(o) = top {
+        crate::orderform::draw(f, area, o, v, t);
+        return;
+    }
     let (w, h) = match top {
         Overlay::Providers(p) => (100, p.rows.len() as u16 + 12),
         Overlay::Key(_) => (84, 11),
@@ -50,9 +54,11 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
             area.height.saturating_sub(4),
         ),
         Overlay::Help => (84, 36),
-        Overlay::Spend(_) | Overlay::System(_) | Overlay::Everything(_) | Overlay::Needs(_) => {
-            (0, 0)
-        }
+        Overlay::Spend(_)
+        | Overlay::System(_)
+        | Overlay::Everything(_)
+        | Overlay::Needs(_)
+        | Overlay::OrderForm(_) => (0, 0),
     };
     let r = centered(area, w, h);
     f.render_widget(Clear, r);
@@ -73,6 +79,7 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::System(_) => "system",
         Overlay::Everything(_) => "everything",
         Overlay::Needs(_) => "needs you",
+        Overlay::OrderForm(_) => "standing order",
     };
     let block = panel(title, t, true);
     let inner = block.inner(r);
@@ -96,7 +103,11 @@ pub fn draw_overlay(f: &mut Frame, v: &View, t: &Theme) {
         Overlay::Privacy(p) => privacy(f, inner, p, t),
         Overlay::Orders(_) => {}
         Overlay::Help => help(f, inner, t),
-        Overlay::Spend(_) | Overlay::System(_) | Overlay::Everything(_) | Overlay::Needs(_) => {}
+        Overlay::Spend(_)
+        | Overlay::System(_)
+        | Overlay::Everything(_)
+        | Overlay::Needs(_)
+        | Overlay::OrderForm(_) => {}
     }
 }
 

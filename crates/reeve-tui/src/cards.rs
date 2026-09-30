@@ -166,6 +166,18 @@ pub(crate) fn card_lines(p: &Pending, width: usize, t: &Theme) -> Vec<Line<'stat
             Span::styled(format!(" {chunk} "), code),
         ]));
     }
+    // A standing order in plain words: what the owner is agreeing to.
+    for d in &r.details {
+        for (i, row) in crate::draw::plain_wrap(d, width.saturating_sub(4))
+            .into_iter()
+            .enumerate()
+        {
+            out.push(Line::from(vec![
+                Span::styled(if i == 0 { "  · " } else { "    " }, t.ghost()),
+                Span::styled(row, t.text()),
+            ]));
+        }
+    }
     if let Some(why) = &r.why {
         out.push(Line::from(vec![
             Span::styled("why  ", t.ghost()),
@@ -188,7 +200,7 @@ pub(crate) fn card_lines(p: &Pending, width: usize, t: &Theme) -> Vec<Line<'stat
         }
         out.push(Line::from(spans));
     }
-    if let Some(d) = &r.preview {
+    if let (Some(d), true) = (&r.preview, r.details.is_empty()) {
         out.push(Line::from(Span::styled(
             format!("change  +{} −{}", d.added, d.removed),
             t.ghost(),
@@ -485,6 +497,7 @@ mod tests {
             txn: None,
             command: None,
             paths: vec!["/home/u/.bashrc".into()],
+            details: Vec::new(),
         }
     }
 
@@ -513,6 +526,38 @@ mod tests {
             assert!(s.contains(needle), "missing {needle:?}\n{s}");
         }
         assert!(!s.contains("Ask Reeve"), "the composer should be hidden");
+    }
+
+    #[test]
+    fn an_order_is_asked_about_in_plain_words() {
+        let mut v = View::new(HostInfo::default());
+        v.chat = true;
+        v.push(Speaker::User, "clear my thumbnails every sunday");
+        let mut r = req(Tier::T2);
+        r.tool = "order_save".into();
+        r.summary = "new standing order “Clear thumbnails”".into();
+        r.details = vec![
+            "Runs every Sunday at 03:00.".into(),
+            "May change up to T1 (your files and user services), only by files in `~/.cache/thumbnails/**`.".into(),
+        ];
+        v.approval = Some(Pending {
+            req: r,
+            typed: String::new(),
+        });
+        let s = render(&v);
+        for needle in [
+            "new standing order",
+            "Runs every Sunday at 03:00.",
+            "approve",
+            "deny",
+        ] {
+            assert!(s.contains(needle), "missing {needle:?}\n{s}");
+        }
+        assert!(
+            !s.contains("− b"),
+            "the plain words stand in for the file's diff"
+        );
+        assert!(!s.contains("yes to the rest"));
     }
 
     #[test]

@@ -1298,7 +1298,7 @@ fn orders(r: Rect, v: &View, t: &Theme) -> Vec<Line<'static>> {
         return vec![
             Line::from(Span::styled("no standing orders", t.text())),
             Line::from(Span::styled(
-                "F7 to write one: work Reeve does on its own",
+                "F7, then n: work Reeve does on its own",
                 t.ghost(),
             )),
         ];

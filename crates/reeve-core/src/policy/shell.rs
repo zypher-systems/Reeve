@@ -1950,7 +1950,28 @@ fn assess_reeve(ctx: &PathCtx, args: &[String], a: &mut Assessment) {
                 );
             }
         }
-        ["undo", ..] => a.raise(Tier::T1, "undoes an earlier action"),
+        ["undo", rest @ ..] => {
+            a.raise(Tier::T1, "undoes an earlier action");
+            // Putting files back writes them: an order or Reeve's config
+            // still needs the owner's typed yes.
+            let undo = rest
+                .iter()
+                .find_map(|x| x.parse::<u64>().ok())
+                .and_then(|seq| crate::receipts::ReceiptBook::new(&ctx.reeve_home).find(seq))
+                .and_then(|r| r.undo);
+            match undo {
+                Some(crate::undo::Undo::Files { changes }) => {
+                    for c in &changes {
+                        a.merge(write(ctx, &c.path));
+                    }
+                }
+                Some(crate::undo::Undo::Move { from, to, .. }) => {
+                    a.merge(write(ctx, &from));
+                    a.merge(write(ctx, &to));
+                }
+                _ => {}
+            }
+        }
         [] => a.raise(Tier::T1, "starts another Reeve"),
         _ => a.raise_keyed(
             Tier::T1,
@@ -2367,6 +2388,24 @@ mod tests {
                 .deny
                 .is_some()
         );
+    }
+
+    #[test]
+    fn undoing_a_change_to_an_order_is_the_floor() {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = PathCtx {
+            home: d.path().into(),
+            reeve_home: d.path().join(".reeve"),
+            cwd: d.path().into(),
+            ..PathCtx::for_tests()
+        };
+        let orders = crate::orders::Orders::new(&ctx.reeve_home);
+        orders.seed_examples().unwrap();
+        let r = orders.set_enabled("tidy-user-cache", true, "t").unwrap();
+        let a = assess(&ctx, &format!("reeve undo {}", r.seq));
+        assert_eq!(a.tier, Tier::T3, "{a:?}");
+        // With no receipt to read, it's an undo like any other.
+        assert_eq!(assess(&ctx, "reeve undo 999").tier, Tier::T1);
     }
 
     #[test]

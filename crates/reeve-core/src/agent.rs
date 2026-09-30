@@ -59,6 +59,9 @@ pub struct ApprovalRequest {
     pub paths: Vec<String>,
     /// The verified change it's part of: its goal and checks.
     pub txn: Option<crate::txn::TxnBrief>,
+    /// What it means, in plain words (a standing order: when it runs,
+    /// what it may do, what it spends).
+    pub details: Vec<String>,
 }
 
 /// The owner's answer.
@@ -687,6 +690,12 @@ impl Agent {
             // Nothing happened, so there's nothing to receipt.
             Err(msg) => return Ok(call_error(call, &msg, emit)),
         };
+        // Unattended runs never write standing orders: an order can't make
+        // another, and the drafter can't make one.
+        if self.role.is_some() && plan.assessment.owner_only {
+            plan.assessment
+                .refuse("standing orders are written only in a conversation with the owner");
+        }
         // Unattended runs (the drafter, standing orders) write nothing on
         // their own, not even where writing otherwise needs no yes.
         if self.role.is_some() && plan.assessment.quiet_write {
@@ -803,6 +812,11 @@ impl Agent {
         if tier == Tier::T0 {
             return Ok("policy".into());
         }
+        // What Reeve would do on its own later is the owner's call, each time.
+        let owner_only = plan.assessment.owner_only;
+        if owner_only {
+            return self.ask(plan, tier, true).await;
+        }
         if tier == Tier::T1
             && !plan.rules.is_empty()
             && plan.rules.iter().all(|r| self.allowed.contains(r))
@@ -821,6 +835,18 @@ impl Agent {
         if tier <= Tier::T2 && self.change_allowed && self.txn.is_some() {
             return Ok("change-rule".into());
         }
+        self.ask(plan, tier, false).await
+    }
+
+    /// Ask the owner. `owner_only`: only this once (no session, request,
+    /// or change-wide yes is offered).
+    async fn ask(
+        &mut self,
+        plan: &Plan,
+        tier: Tier,
+        owner_only: bool,
+    ) -> std::result::Result<String, Option<String>> {
+        let broad = !owner_only;
         let req = ApprovalRequest {
             tool: plan.tool.clone(),
             summary: plan.summary.clone(),
@@ -830,20 +856,33 @@ impl Agent {
             why: plan.why.clone(),
             preview: plan.preview.clone(),
             undoable: plan.undoable,
-            can_allow_session: tier == Tier::T1 && !plan.rules.is_empty(),
-            session_scope: (tier == Tier::T1 && !plan.rules.is_empty()).then(|| {
+            can_allow_session: broad && tier == Tier::T1 && !plan.rules.is_empty(),
+            session_scope: (broad && tier == Tier::T1 && !plan.rules.is_empty()).then(|| {
                 plan.rules
                     .iter()
                     .map(|r| crate::policy::describe_key(r))
                     .collect::<Vec<_>>()
                     .join(" · ")
             }),
-            can_allow_turn: tier == Tier::T1,
+            can_allow_turn: broad && tier == Tier::T1,
             command: plan.command(),
             paths: plan.paths(&self.tools),
-            txn: self.txn.as_ref().map(crate::txn::Txn::brief),
+            txn: self
+                .txn
+                .as_ref()
+                .filter(|_| broad)
+                .map(crate::txn::Txn::brief),
+            details: plan.details.clone(),
         };
-        match self.approver.decide(req).await {
+        let answer = self.approver.decide(req).await;
+        // A broad yes to an owner-only ask covers only this one.
+        if owner_only {
+            return match answer {
+                Decision::Deny(note) => Err(note),
+                _ => Ok(self.approver.label()),
+            };
+        }
+        match answer {
             Decision::Approve => Ok(self.approver.label()),
             Decision::AllowSession => {
                 if tier == Tier::T1 {
@@ -1282,6 +1321,16 @@ any fails, it undoes every change made in the transaction and tells you. Pick ch
 test the fix, never ones that always pass. Changes without an undo record (most shell \
 commands) can't be rolled back, so inside a change prefer fs_ edits and the pkg_ and svc_ \
 tools. If you end your turn with a change open, Reeve checks it then.\n\n\
+## Standing orders\n\
+When the owner wants something done regularly or whenever something happens (\"every Sunday\", \
+\"whenever the disk fills up\", \"keep an eye on\"), make it a standing order with order_save \
+rather than doing it once. reeved, the background observer, runs it from then on. Look first, \
+so the order's task and scope are exact: its task is written for you running with nobody there, \
+and its commands and files are all it may change. The owner approves each order once, reading \
+it in plain words, so don't ask them to confirm it in chat first. Say what it will do and how \
+to change it (Orders, F7). Change an order with order_save and its id; pause one with enabled \
+false; order_delete removes it. Root commands in an order need a sudoers rule the owner adds \
+(Orders shows it); say so when an order uses sudo.\n\n\
 ## Memory\n\
 You remember this machine between sessions. Before diagnosing a problem, memory_search \
 for a runbook. After a fix passes its checks, record it (memory_write runbook, or its outcome \
@@ -1428,6 +1477,76 @@ mod tests {
                 .to_string()
                 .contains("already undone")
         );
+    }
+
+    fn order_call() -> Vec<StreamDelta> {
+        call(
+            "order_save",
+            serde_json::json!({
+                "name": "Clear thumbnails",
+                "task": "If ~/.cache/thumbnails is over 500 MB, empty it and say how much was freed.",
+                "schedule": "weekly sun 03:00",
+                "paths": ["~/.cache/thumbnails/**"],
+                "tools": ["fs_delete"],
+                "reason": "the owner asked for it every Sunday"
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_model_writes_an_order_the_owner_approves_in_plain_words() {
+        // YOLO is on, and the answer is the broadest yes there is.
+        let approver = fixed(Decision::AllowTurn, true);
+        let (_home, mut a) = agent(
+            vec![
+                order_call(),
+                call("shell", serde_json::json!({"command": "echo x > ~/y"})),
+                done("done"),
+            ],
+            approver.clone(),
+        );
+        run(&mut a).await;
+        let asked = approver.asked.lock().unwrap();
+        assert_eq!(asked.len(), 1, "YOLO doesn't answer for an order");
+        let card = &asked[0];
+        assert_eq!(card.tier, Tier::T2);
+        assert!(!card.can_allow_turn && !card.can_allow_session && card.txn.is_none());
+        assert!(
+            card.details
+                .iter()
+                .any(|l| l == "Runs every Sunday at 03:00."),
+            "{:?}",
+            card.details
+        );
+        assert!(
+            card.details
+                .iter()
+                .any(|l| l.contains("~/.cache/thumbnails/**"))
+        );
+        let o = crate::orders::Orders::new(&a.home)
+            .get("clear-thumbnails")
+            .unwrap();
+        assert!(o.enabled);
+        assert_eq!(o.scope.max_tier, Tier::T1);
+        // Its "yes to the rest" didn't carry over: the echo went on YOLO.
+        let receipts = ReceiptBook::new(&a.home).all();
+        assert_eq!(receipts[0].tool, "order_save");
+        assert_eq!(receipts[0].approved_by, "user");
+        assert!(receipts[0].undo.is_some());
+        assert_eq!(receipts[1].approved_by, "yolo");
+        assert!(!a.turn_allowed);
+    }
+
+    #[tokio::test]
+    async fn an_unattended_run_never_writes_an_order() {
+        let approver = fixed(Decision::Approve, true);
+        let (_home, mut a) = agent(vec![order_call(), done("ok")], approver.clone());
+        a.set_role("order:x");
+        run(&mut a).await;
+        assert!(approver.asked.lock().unwrap().is_empty());
+        let r = &ReceiptBook::new(&a.home).all()[0];
+        assert_eq!(r.outcome.status, Status::Refused);
+        assert!(crate::orders::Orders::new(&a.home).load().0.is_empty());
     }
 
     #[tokio::test]

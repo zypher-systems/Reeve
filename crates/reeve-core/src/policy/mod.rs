@@ -74,6 +74,11 @@ pub struct Assessment {
     /// scratch folder, a new file in /tmp). Unattended runs still count it.
     #[serde(default)]
     pub quiet_write: bool,
+    /// Only the owner, asked each time, can say yes: no YOLO, no "yes to
+    /// the rest", no session rule, and never an unattended run. For what
+    /// Reeve would do on its own later (standing orders).
+    #[serde(default)]
+    pub owner_only: bool,
 }
 
 impl Assessment {
@@ -87,6 +92,7 @@ impl Assessment {
             keys: Vec::new(),
             unkeyed: false,
             quiet_write: false,
+            owner_only: false,
         }
     }
 

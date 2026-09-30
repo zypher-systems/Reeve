@@ -1397,6 +1397,17 @@ fn orders(f: &mut Frame, area: Rect, v: &View, p: &OrdersPanel, t: &Theme) {
     )];
     if p.items.is_empty() {
         lines.push(Line::from(Span::styled("No orders yet.", t.muted())));
+        lines.push(Line::raw(""));
+        for l in [
+            "A standing order is work Reeve does on its own: when reeved",
+            "finds something, or on a schedule you pick. It can only do",
+            "what the order allows and spend what it budgets.",
+        ] {
+            lines.push(Line::from(Span::styled(
+                truncate(l, w.saturating_sub(1)),
+                t.ghost(),
+            )));
+        }
     }
     let mut sel_line = 0;
     for (i, o) in p.items.iter().enumerate() {
@@ -1479,7 +1490,7 @@ fn orders(f: &mut Frame, area: Rect, v: &View, p: &OrdersPanel, t: &Theme) {
             Span::styled(" new order", t.text()),
         ]));
         lines.push(Line::from(Span::styled(
-            "   from a template, opened in your editor",
+            "   a form walks you through it, one step at a time",
             t.ghost(),
         )));
     }
@@ -1657,8 +1668,10 @@ fn orders(f: &mut Frame, area: Rect, v: &View, p: &OrdersPanel, t: &Theme) {
                 ("r", "run now"),
                 ("e", "edit"),
                 ("n", "new"),
+                ("E", "edit the file"),
                 ("s", "sudoers"),
                 ("D", "delete"),
+                ("u", "undo"),
                 ("?", "ask about it"),
             ],
             t,

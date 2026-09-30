@@ -152,8 +152,17 @@ pub enum Action {
     OrderToggle(String, bool),
     /// Ask reeved to run an order now.
     OrderRun(String),
-    /// Open an order (or a new one) in `$EDITOR`.
-    OrderEdit(Option<String>),
+    /// Open an order's file in `$EDITOR`.
+    OrderEdit(String),
+    /// Open the order form: a new order, or this one to edit.
+    OrderForm(Option<String>),
+    /// Save the form's order (a new one when `editing` is `None`).
+    SaveOrder {
+        /// The id of the order edited.
+        editing: Option<String>,
+        /// What the form says.
+        order: Box<reeve_core::orders::Order>,
+    },
     /// Delete an order's file.
     OrderDelete(String),
     /// Show an order's sudoers lines.
@@ -235,6 +244,8 @@ pub enum Overlay {
     Everything(EverythingPanel),
     /// F1: what's waiting on you.
     Needs(NeedsPanel),
+    /// The standing order form.
+    OrderForm(Box<crate::orderform::OrderForm>),
     /// `/privacy`.
     Privacy(PrivacyPanel),
     /// `/help`.
@@ -244,6 +255,10 @@ pub enum Overlay {
 impl Overlay {
     /// Handle a key.
     pub fn on_key(&mut self, k: KeyEvent) -> Action {
+        // The form decides what esc means (it asks before dropping changes).
+        if let Self::OrderForm(f) = self {
+            return f.on_key(k);
+        }
         if k.code == KeyCode::Esc {
             return Action::Close;
         }
@@ -262,6 +277,7 @@ impl Overlay {
             Self::System(s) => s.on_key(k),
             Self::Everything(e) => e.on_key(k),
             Self::Needs(n) => n.on_key(k),
+            Self::OrderForm(f) => f.on_key(k),
             Self::Privacy(p) => p.on_key(k),
             Self::Help => Action::Close,
         }
@@ -292,6 +308,7 @@ impl Overlay {
                 e.sel = 0;
             }
             Self::Key(e) => e.secret.push_str(line),
+            Self::OrderForm(f) => f.paste(s),
             Self::Password(p) => p.secret.push_str(line),
             Self::Models(m) => {
                 m.query.push_str(line);
@@ -528,6 +545,8 @@ pub struct OrdersPanel {
     pub extra: Vec<String>,
     /// Delete asked once.
     pub confirm_delete: Option<String>,
+    /// The receipt of the last change made here, for `u`.
+    pub last: Option<u64>,
 }
 
 impl OrdersPanel {
@@ -566,7 +585,21 @@ impl OrdersPanel {
         match k.code {
             KeyCode::Up => self.sel = self.sel.saturating_sub(1),
             KeyCode::Down => self.sel = (self.sel + 1).min(n.saturating_sub(1)),
-            KeyCode::Char('n') => return Action::OrderEdit(None),
+            KeyCode::Char('n') => return Action::OrderForm(None),
+            KeyCode::Char('u') => {
+                return match self.last {
+                    Some(seq) => {
+                        self.note = Some(Ok(format!("undoing #{seq}…")));
+                        Action::Undo(seq)
+                    }
+                    None => {
+                        self.note = Some(Err(
+                            "nothing to undo here; F4 activity has every change".into()
+                        ));
+                        Action::None
+                    }
+                };
+            }
             _ => {}
         }
         if !matches!(k.code, KeyCode::Char('s')) {
@@ -579,7 +612,8 @@ impl OrdersPanel {
         match k.code {
             KeyCode::Char(' ') => Action::OrderToggle(id, !o.enabled),
             KeyCode::Char('r') => Action::OrderRun(id),
-            KeyCode::Char('e') | KeyCode::Enter => Action::OrderEdit(Some(id)),
+            KeyCode::Char('e') | KeyCode::Enter => Action::OrderForm(Some(id)),
+            KeyCode::Char('E') => Action::OrderEdit(id),
             KeyCode::Char('s') => Action::OrderSudoers(id),
             KeyCode::Char('D') => {
                 if self.confirm_delete.as_deref() == Some(id.as_str()) {
@@ -587,7 +621,7 @@ impl OrdersPanel {
                     Action::OrderDelete(id)
                 } else {
                     self.note = Some(Err(format!(
-                        "press D again to delete {id} (space turns it off instead)"
+                        "press D again to delete {id} (u puts it back; space only turns it off)"
                     )));
                     self.confirm_delete = Some(id);
                     Action::None

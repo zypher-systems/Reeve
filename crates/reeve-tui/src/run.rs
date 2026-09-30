@@ -175,6 +175,10 @@ struct App {
     board_at: Option<Instant>,
     /// When the board's day report was last asked for.
     report_at: Option<Instant>,
+    /// Order forms closed with changes, by the order they edit (`None`: a
+    /// new one): `n` (or `e` on the order) brings one back, until Reeve
+    /// quits.
+    order_drafts: HashMap<Option<String>, Box<crate::orderform::OrderForm>>,
 }
 
 /// Run the TUI until the user quits.
@@ -235,6 +239,7 @@ pub fn run(cfg: Config, home: PathBuf) -> io::Result<()> {
         announced: std::collections::HashSet::new(),
         board_at: None,
         report_at: None,
+        order_drafts: HashMap::new(),
     };
     view.memory = app.memory.counts();
     app.poll_observer(&mut view);
@@ -351,6 +356,7 @@ fn event_loop(
             }
         }
         if let Some(path) = view.edit_file.take() {
+            let before = std::fs::read(&path).ok();
             restore(app.cfg.ui.mouse);
             let editor = std::env::var("VISUAL")
                 .or_else(|_| std::env::var("EDITOR"))
@@ -364,7 +370,7 @@ fn event_loop(
             enter(app.cfg.ui.mouse)?;
             term.clear()?;
             match status {
-                Ok(_) => app.order_edited(view, &path),
+                Ok(_) => app.order_edited(view, &path, before),
                 Err(e) => view.push(Speaker::Error, format!("couldn't run {editor}: {e}")),
             }
         }
@@ -405,6 +411,10 @@ impl App {
                 {
                     self.session.clone_from(&r.session);
                     remembered = r.tool == "memory_write";
+                    // An order the model wrote shows on the board now.
+                    if r.tool.starts_with("order_") {
+                        self.board_at = None;
+                    }
                 }
                 let ended = matches!(ev, AgentEvent::TurnDone { .. } | AgentEvent::Error(_));
                 view.apply(ev);
@@ -548,7 +558,7 @@ impl App {
         // Secrets are being typed: those panels get every key.
         let typing_secret = matches!(
             view.overlays.last(),
-            Some(Overlay::Password(_) | Overlay::Key(_) | Overlay::Add(_))
+            Some(Overlay::Password(_) | Overlay::Key(_) | Overlay::Add(_) | Overlay::OrderForm(_))
         );
         if !typing_secret {
             // ⌃K: search everything, from anywhere.
@@ -939,13 +949,19 @@ impl App {
                     p.note = Some(note);
                 }
             }
-            Action::Close => {
-                if let Some(Overlay::Password(_)) = view.overlays.pop() {
+            Action::Close => match view.overlays.pop() {
+                Some(Overlay::Password(_)) => {
                     if let Some(r) = self.pw_reply.take() {
                         let _ = r.send(None);
                     }
                 }
-            }
+                // Closed with changes: kept, in case that was a slip. A
+                // draft closed again is thrown away.
+                Some(Overlay::OrderForm(f)) if f.dirty && !f.restored => {
+                    self.order_drafts.insert(f.editing.clone(), f);
+                }
+                _ => {}
+            },
             Action::Password(answer) => {
                 view.overlays.retain(|o| !matches!(o, Overlay::Password(_)));
                 let pw = answer.map(|(pw, remember)| {
@@ -1112,10 +1128,10 @@ impl App {
             }
             Action::OrderToggle(id, on) => {
                 let orders = reeve_core::orders::Orders::new(&self.home);
-                let note = orders
-                    .set_enabled(&id, on)
-                    .map(|()| {
-                        if on {
+                let done = orders
+                    .set_enabled(&id, on, &self.session)
+                    .map(|r| {
+                        let msg = if on {
                             let daemon = if view.observer_alive {
                                 "reeved will run it when it's due"
                             } else {
@@ -1124,10 +1140,11 @@ impl App {
                             format!("{id} is on: {daemon}")
                         } else {
                             format!("{id} is off")
-                        }
+                        };
+                        (r, msg)
                     })
                     .map_err(|e| e.to_string());
-                self.orders_note(view, note);
+                self.order_changed(view, done);
             }
             Action::OrderRun(id) => {
                 let orders = reeve_core::orders::Orders::new(&self.home);
@@ -1142,29 +1159,108 @@ impl App {
                 self.orders_note(view, note);
             }
             Action::OrderEdit(id) => {
-                let orders = reeve_core::orders::Orders::new(&self.home);
-                let path = match id {
-                    Some(id) => orders.path(&id),
-                    None => {
-                        let mut n = 1;
-                        let mut p = orders.path("new-order");
-                        while p.exists() {
-                            n += 1;
-                            p = orders.path(&format!("new-order-{n}"));
-                        }
-                        let _ = std::fs::create_dir_all(orders.dir());
-                        let _ = std::fs::write(&p, NEW_ORDER);
-                        p
-                    }
+                view.edit_file = Some(reeve_core::orders::Orders::new(&self.home).path(&id));
+            }
+            Action::OrderForm(id) if self.order_drafts.contains_key(&id) => {
+                if let Some(mut f) = self.order_drafts.remove(&id) {
+                    f.restored = true;
+                    f.error = None;
+                    f.note = Some("picked up where you left off".into());
+                    view.overlays.push(Overlay::OrderForm(f));
+                }
+            }
+            Action::OrderForm(id) => {
+                let form = match id {
+                    None => Ok(crate::orderform::OrderForm::new()),
+                    Some(id) => reeve_core::orders::Orders::new(&self.home)
+                        .get(&id)
+                        .map(|o| crate::orderform::OrderForm::edit(&o))
+                        .map_err(|e| format!("{e}: E opens the file itself")),
                 };
-                view.edit_file = Some(path);
+                match form {
+                    Ok(f) => view.overlays.push(Overlay::OrderForm(Box::new(f))),
+                    Err(e) => self.orders_note(view, Err(e)),
+                }
+            }
+            Action::SaveOrder { editing, order } => {
+                use reeve_core::orders::Saved;
+                let orders = reeve_core::orders::Orders::new(&self.home);
+                let (base, over) = match view.overlays.last() {
+                    Some(Overlay::OrderForm(f)) => (f.base.clone(), f.over),
+                    _ => (None, false),
+                };
+                let id = editing
+                    .clone()
+                    .unwrap_or_else(|| orders.free_id(&order.name));
+                let mut order = *order;
+                order.id.clone_from(&id);
+                let saved = orders.save(&id, base.as_ref(), &order, over, &self.session);
+                match saved {
+                    Ok(Saved::Written(r)) => {
+                        if top_form(view).is_some() {
+                            view.overlays.pop();
+                        }
+                        let state = if order.enabled {
+                            "it's on"
+                        } else {
+                            "it's off until you turn it on (space)"
+                        };
+                        self.order_changed(
+                            view,
+                            Ok((*r, format!("saved “{}” to {id}.toml · {state}", order.name))),
+                        );
+                        if let Some(Overlay::Orders(p)) = view.overlays.first_mut() {
+                            if let Some(i) = p.items.iter().position(|o| o.id == id) {
+                                p.sel = i;
+                            }
+                        }
+                        self.board_at = None;
+                        self.refresh_board(view);
+                    }
+                    Ok(Saved::Unchanged) => {
+                        if top_form(view).is_some() {
+                            view.overlays.pop();
+                        }
+                        self.orders_note(view, Ok(format!("{id}.toml already says that")));
+                    }
+                    Ok(Saved::Clash(fields)) => {
+                        if let Some(f) = top_form(view) {
+                            f.over = true;
+                            let fields: Vec<&str> = fields
+                                .iter()
+                                .map(|k| reeve_core::orders::field_label(k))
+                                .collect();
+                            f.error = Some(format!(
+                                "{} changed in the file too while this was open. ctrl+s again saves yours over it (u in Orders undoes that); the rest of the file's changes are kept either way",
+                                fields.join(", ")
+                            ));
+                        }
+                    }
+                    Ok(Saved::Gone) => {
+                        if let Some(f) = top_form(view) {
+                            f.over = true;
+                            f.error = Some(format!(
+                                "{id}.toml was deleted since you opened this: ctrl+s again writes it back"
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(f) = top_form(view) {
+                            f.error = Some(e.to_string());
+                        }
+                    }
+                }
             }
             Action::OrderDelete(id) => {
                 let orders = reeve_core::orders::Orders::new(&self.home);
-                let note = std::fs::remove_file(orders.path(&id))
-                    .map(|()| format!("deleted {id}"))
+                let done = orders
+                    .delete(&id, &self.session)
+                    .map(|r| {
+                        let msg = r.outcome.summary.clone();
+                        (r, msg)
+                    })
                     .map_err(|e| e.to_string());
-                self.orders_note(view, note);
+                self.order_changed(view, done);
             }
             Action::OrderSudoers(id) => {
                 let orders = reeve_core::orders::Orders::new(&self.home);
@@ -1545,23 +1641,68 @@ impl App {
         }
     }
 
+    /// After a change to an order: its receipt, the note, and `u` to undo it.
+    fn order_changed(&self, view: &mut View, done: Result<(Receipt, String), String>) {
+        let seq = done.as_ref().ok().map(|(r, _)| r.seq);
+        let note = match done {
+            Ok((r, msg)) => {
+                view.add_receipt(r);
+                Ok(format!("{msg} · u undoes it"))
+            }
+            Err(e) => Err(e),
+        };
+        self.orders_note(view, note);
+        if let Some(Overlay::Orders(p)) = view
+            .overlays
+            .iter_mut()
+            .rev()
+            .find(|o| matches!(o, Overlay::Orders(_)))
+        {
+            p.last = seq.or(p.last);
+        }
+    }
+
     /// After `$EDITOR` on an order: say whether it still parses.
-    fn order_edited(&self, view: &mut View, path: &std::path::Path) {
+    fn order_edited(&self, view: &mut View, path: &std::path::Path, before: Option<Vec<u8>>) {
         let id = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let note = match std::fs::read_to_string(path)
-            .map_err(|e| e.to_string())
-            .and_then(|t| reeve_core::orders::parse(&id, &t))
-        {
-            Ok(o) => Ok(format!(
-                "{id} saved ({})",
-                if o.enabled { "on" } else { "off" }
-            )),
-            Err(e) => Err(format!("{id} doesn't parse, so it won't run: {e}")),
+        let after = std::fs::read(path).ok();
+        if after == before {
+            self.orders_note(view, Ok(format!("{id}: no changes")));
+            return;
+        }
+        let parsed = after
+            .as_deref()
+            .ok_or_else(|| "it's gone".to_string())
+            .and_then(|t| reeve_core::orders::parse(&id, &String::from_utf8_lossy(t)));
+        let summary = match &parsed {
+            Ok(o) => format!("edited “{}” in the editor", o.name),
+            Err(_) => format!("edited {id}.toml in the editor"),
         };
-        self.orders_note(view, note);
+        let receipt = reeve_core::orders::Orders::new(&self.home)
+            .record(&id, before.as_deref(), &summary, &self.session)
+            .map_err(|e| e.to_string());
+        match (parsed, receipt) {
+            (Ok(o), Ok(r)) => self.order_changed(
+                view,
+                Ok((
+                    r,
+                    format!("{id} saved ({})", if o.enabled { "on" } else { "off" }),
+                )),
+            ),
+            (Err(e), Ok(r)) => {
+                self.order_changed(view, Ok((r, String::new())));
+                self.orders_note(
+                    view,
+                    Err(format!(
+                        "{id} doesn't parse, so it won't run: {e} · u puts the last version back"
+                    )),
+                );
+            }
+            (_, Err(e)) => self.orders_note(view, Err(e)),
+        }
     }
 
     /// Read reeved's heartbeat and the findings.
@@ -1645,7 +1786,7 @@ impl App {
             }
             Tile::Orders => {
                 let orders = reeve_core::orders::Orders::new(&self.home);
-                let seeded = orders.seed_examples().unwrap_or(0);
+                let seeded = orders.seed_examples_once().unwrap_or(0);
                 let mut p = crate::overlay::OrdersPanel::load(&orders);
                 if seeded > 0 {
                     p.note = Some(Ok(format!(
@@ -1897,6 +2038,13 @@ impl App {
     /// An undo came back from the worker.
     fn undone(&mut self, view: &mut View, seq: u64, result: Result<Box<Receipt>, String>) {
         let book = ReceiptBook::new(&self.home);
+        // What was undone, in its receipt's words: "turned on “Tidy”".
+        let what = result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.why.as_deref())
+            .and_then(|w| w.split_once(": "))
+            .map(|(_, w)| w.to_string());
         let note = match result {
             Ok(r) => {
                 let msg = format!("undid #{seq}: {} (receipt #{})", r.outcome.summary, r.seq);
@@ -1909,6 +2057,26 @@ impl App {
                 Err(e)
             }
         };
+        if view
+            .overlays
+            .iter()
+            .any(|o| matches!(o, Overlay::Orders(_)))
+        {
+            let note = match (note, what) {
+                (Ok(_), Some(w)) => Ok(format!("undone: {w}")),
+                (note, _) => note,
+            };
+            self.orders_note(view, note);
+            if let Some(Overlay::Orders(p)) = view
+                .overlays
+                .iter_mut()
+                .find(|o| matches!(o, Overlay::Orders(_)))
+            {
+                // A second `u` mustn't undo the undo.
+                p.last = None;
+            }
+            return;
+        }
         if let Some(Overlay::Receipts(p)) = view
             .overlays
             .iter_mut()
@@ -2394,37 +2562,13 @@ async fn survey(tools: ToolCtx, home: PathBuf, tx: Sender<UiMsg>, first: bool) {
     let _ = tx.send(UiMsg::MemoryChanged);
 }
 
-/// A new order, commented, for `n` in `/orders`.
-const NEW_ORDER: &str = r#"# A standing order: work Reeve does unattended, within the scope below.
-# It stays off until you set enabled = true (or press space in /orders).
-name = "My order"
-task = """
-Say plainly what to do, what to check first, and when to do nothing.
-"""
-enabled = false
-notify = "never"            # popups: a blocked run (a proposal) always gets one;
-                            # "after" adds one for every run, "before" also at the start
-
-[trigger]
-# Finding ids from /findings; * matches anything: "disk-full:*", "unit-failed:*".
-findings = []
-# hourly | every 30m | every 6h | daily 03:00 | weekly sun 03:00
-# schedule = "daily 03:00"
-min_severity = "warning"
-
-[scope]
-max_tier = "T1"             # T1 (your files) or T2 (system); never T3
-tools = ["shell"]           # tools that may change things; reads are always fine
-# Every command must match one of these. * matches within one word.
-# Root commands need a sudoers rule: press s in /orders to see it.
-commands = []
-paths = []                  # for file tools: "~/.cache/**"
-
-[budget]
-per_run_usd = 0.05
-runs_per_day = 2
-cooldown_hours = 12
-"#;
+/// The order form, when it's on top.
+fn top_form(view: &mut View) -> Option<&mut crate::orderform::OrderForm> {
+    match view.overlays.last_mut() {
+        Some(Overlay::OrderForm(f)) => Some(f),
+        _ => None,
+    }
+}
 
 /// Write the spend statement to `~/.reeve/reports/spend-<range>-<date>.csv`.
 fn export_spend(home: &std::path::Path, p: &crate::overlay::SpendPanel) -> Result<String, String> {
