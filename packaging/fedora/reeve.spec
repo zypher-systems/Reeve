@@ -10,7 +10,7 @@
 %global __brp_mangle_shebangs_exclude_from ^/usr/src/debug/.*$
 
 Name:           reeve
-Version:        0.3.2
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        An operator agent that manages this computer, with receipts
 
@@ -77,6 +77,12 @@ install -Dpm 0644 packaging/systemd/reeved.service %{buildroot}%{_userunitdir}/r
 %{_userunitdir}/reeved.service
 
 %changelog
+* Tue Sep 29 2026 Zypher Systems <zypher@zyphersystems.com> - 0.4.0-1
+- Standing orders by asking: Reeve writes the order and asks once, in plain words; nothing answers for the owner.
+- A form for orders (n in F7), with help under every field and a live summary of what it will do.
+- Nothing done to an order is lost: saves keep comments and edits made meanwhile, and every change can be undone.
+- Limits follow the schedule, so every 30m runs every 30 minutes.
+
 * Tue Sep 29 2026 Zypher Systems <zypher@zyphersystems.com> - 0.3.2-1
 - 0.3.1's changes, published; a verified change's checks refuse writes that don't need a yes.
 
