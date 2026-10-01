@@ -10,7 +10,7 @@
 %global __brp_mangle_shebangs_exclude_from ^/usr/src/debug/.*$
 
 Name:           reeve
-Version:        0.4.0
+Version:        0.5.0
 Release:        1%{?dist}
 Summary:        An operator agent that manages this computer, with receipts
 
@@ -77,6 +77,11 @@ install -Dpm 0644 packaging/systemd/reeved.service %{buildroot}%{_userunitdir}/r
 %{_userunitdir}/reeved.service
 
 %changelog
+* Wed Sep 30 2026 Zypher Systems <zypher@zyphersystems.com> - 0.5.0-1
+- reeved checks for a newer Reeve every 12 hours; the header shows it, with no popup.
+- reeve update installs it the way Reeve was installed, checked against SHA256SUMS, with a receipt and --rollback.
+- install.sh, run over an existing install, says it updated and skips the first-install notes.
+
 * Tue Sep 29 2026 Zypher Systems <zypher@zyphersystems.com> - 0.4.0-1
 - Standing orders by asking: Reeve writes the order and asks once, in plain words; nothing answers for the owner.
 - A form for orders (n in F7), with help under every field and a live summary of what it will do.
