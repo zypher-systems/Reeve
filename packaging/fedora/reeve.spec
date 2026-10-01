@@ -10,7 +10,7 @@
 %global __brp_mangle_shebangs_exclude_from ^/usr/src/debug/.*$
 
 Name:           reeve
-Version:        0.5.0
+Version:        0.6.0
 Release:        1%{?dist}
 Summary:        An operator agent that manages this computer, with receipts
 
@@ -77,6 +77,12 @@ install -Dpm 0644 packaging/systemd/reeved.service %{buildroot}%{_userunitdir}/r
 %{_userunitdir}/reeved.service
 
 %changelog
+* Thu Oct 01 2026 Zypher Systems <zypher@zyphersystems.com> - 0.6.0-1
+- Arch: package changes undo from pacman's log and cache; AUR builds show the PKGBUILD and ask every time.
+- snap-pac's snapshot pairs are recorded on receipts; reeved checks for a replaced kernel and arch-audit.
+- The theme follows Omarchy's by default (auto); custom themes in ~/.reeve/themes.
+- Skills: jobs done your way, by name (/id, the skills tab in F8, "save that as a skill").
+
 * Wed Sep 30 2026 Zypher Systems <zypher@zyphersystems.com> - 0.5.0-1
 - reeved checks for a newer Reeve every 12 hours; the header shows it, with no popup.
 - reeve update installs it the way Reeve was installed, checked against SHA256SUMS, with a receipt and --rollback.
