@@ -311,6 +311,8 @@ pub struct View {
     pub observer_alive: bool,
     /// A newer Reeve is out, or installed and waiting for a restart.
     pub update: Option<reeve_core::update::Badge>,
+    /// The owner's skills, for the slash palette and ⌃K: (id, description).
+    pub skills: Vec<(String, String)>,
     /// Open findings.
     pub findings: Vec<reeve_core::findings::Finding>,
     /// Drafter spend today and its cap, when it's on.
@@ -380,6 +382,7 @@ impl View {
             edit_file: None,
             observer_alive: false,
             update: None,
+            skills: Vec::new(),
             findings: Vec::new(),
             drafter: None,
             privacy: None,

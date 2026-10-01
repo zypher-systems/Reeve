@@ -23,6 +23,7 @@ pub mod root;
 pub mod scratch;
 pub mod session;
 pub mod settings;
+pub mod skills;
 pub mod snapshots;
 pub mod spend;
 pub mod sudo;

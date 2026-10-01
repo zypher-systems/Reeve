@@ -215,6 +215,21 @@ The model writes orders only through `order_save` and `order_delete`, which alwa
 conversation: an order run or the drafter can't write one, so an order can never make another. Writing an
 order file any other way (a file tool, the shell) is on the floor (T3), and so is undoing a change to one.
 
+## Skills
+
+A skill is a job you want done your way, saved by name in `~/.reeve/skills/<id>.md`: a one-line
+description and the steps.
+
+- **Run one** with `/id` (anything you type after it goes along), from ⌃K, or with `⏎` on the skills tab
+  of F8 memory. Reeve also uses a skill when what you ask clearly matches its description, and says so.
+- **Make one** by telling Reeve: do something, then say "save that as a skill" (or press `n` on the skills
+  tab and describe it). The approval card shows the whole text, and you're asked every time; YOLO doesn't
+  cover it. You can also write or edit the file yourself (`e`).
+- **A skill grants nothing.** Every step still asks the way it always would.
+- Three starters are written the first time Reeve runs: `tidy-downloads`, `update-everything`, and
+  `why-slow`. Delete them and they stay deleted.
+- A standing order can use a skill: "every Sunday, use the tidy-downloads skill".
+
 ## The state of the machine
 
 `/report` (or `reeve report --days 1|7|30`) draws one page and opens it in your browser:

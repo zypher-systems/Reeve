@@ -6,6 +6,7 @@ mod mem;
 pub mod obs;
 pub mod order;
 mod shell;
+mod skill;
 mod sys;
 
 use std::path::PathBuf;
@@ -154,6 +155,7 @@ enum Call {
     MemWrite(mem::WriteArgs),
     Findings(obs::Args),
     Order(Box<order::Planned>),
+    Skill(Box<skill::Planned>),
 }
 
 #[derive(Deserialize)]
@@ -200,6 +202,18 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
                 ctx,
                 &serde_json::from_value(args.clone()).map_err(parse)?,
             )?)),
+            "skill" => Call::Skill(Box::new(skill::prepare_read(
+                ctx,
+                &serde_json::from_value(args.clone()).map_err(parse)?,
+            )?)),
+            "skill_save" => Call::Skill(Box::new(skill::prepare_save(
+                ctx,
+                &serde_json::from_value(args.clone()).map_err(parse)?,
+            )?)),
+            "skill_delete" => Call::Skill(Box::new(skill::prepare_delete(
+                ctx,
+                &serde_json::from_value(args.clone()).map_err(parse)?,
+            )?)),
             other => return Err(format!("there is no tool named {other}")),
         }
     };
@@ -243,6 +257,7 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
             Vec::new(),
         ),
         Call::Order(p) => order::plan(p),
+        Call::Skill(p) => skill::plan(p),
     };
     let details = match &call {
         Call::Order(p) => order::details(p),
@@ -283,6 +298,7 @@ pub async fn execute(ctx: &ToolCtx, plan: &Plan) -> Executed {
         Call::MemWrite(a) => mem::write(ctx, a),
         Call::Findings(a) => obs::run(ctx, a),
         Call::Order(p) => order::run(ctx, p),
+        Call::Skill(p) => skill::run(ctx, p),
     }
 }
 
@@ -601,6 +617,28 @@ schedule. See existing orders with `reeve orders list` / `reeve orders show <id>
             "Delete a standing order the owner no longer wants (asks them; it can be undone). To pause one instead, order_save it with enabled false.",
             json!({"id": {"type": "string"}}),
             &["id"],
+        ),
+        spec(
+            "skill",
+            "Read one of the owner's skills: its steps, to follow when the owner names it (/id) or when their request clearly matches its description. Say which skill you're using. A skill grants nothing: each step still needs its usual approval.",
+            json!({"name": {"type": "string", "description": "The skill's id or name"}}),
+            &["name"],
+        ),
+        spec(
+            "skill_save",
+            "Save a skill: a job the owner wants done their way, to run again by name. Use it when the owner says to save how something was done as a skill, or asks for one; never on your own. Saving under an existing skill's name changes it. The owner sees the whole text and is asked every time; it can be undone.",
+            json!({
+                "name": {"type": "string", "description": "Short, for people: \"Tidy Downloads\". Its id is this in lowercase with dashes"},
+                "description": {"type": "string", "description": "One line: what it does, so it's clear when to use it"},
+                "steps": {"type": "string", "description": "The steps, in Markdown, written for yourself following them later: what to check, what to do, what to ask before, and what to report"}
+            }),
+            &["name", "description", "steps"],
+        ),
+        spec(
+            "skill_delete",
+            "Delete a skill the owner no longer wants (asks them; it can be undone).",
+            json!({"name": {"type": "string", "description": "The skill's id or name"}}),
+            &["name"],
         ),
         spec(
             "change_begin",

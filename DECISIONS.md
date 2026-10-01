@@ -2,6 +2,28 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-30: Skills: jobs done the owner's way, by name
+- **Decision:**
+  - A skill is `~/.reeve/skills/<id>.md`: a header (`name`, `description`) and steps. The system prompt lists ids and descriptions, read fresh each round; the steps load through the `skill` tool (T0) only when used.
+  - Reeve uses one when the owner types `/id`, picks it in ⌃K or on the skills tab of F8 memory, or asks for something that clearly matches a description, and it says which skill it's using. A skill grants nothing: every step meets the usual tiers.
+  - `skill_save` and `skill_delete` are `owner_only` at T1: the card shows the whole text as a diff, YOLO and broad yeses don't cover it, and unattended runs are refused. Both carry an undo. A raw write into the folder is a floor file.
+  - Three starters are written once at first launch (`tidy-downloads`, `update-everything`, `why-slow`), behind a marker file, so deleted ones stay deleted.
+  - `n` on the skills tab opens the chat with "Save a skill that …": Reeve writes it and the owner approves the text.
+  - The unattended refusal for `owner_only` no longer says "standing orders": it covers skills and AUR builds too.
+- **Chosen vs rejected:**
+  - Rejected folding skills into runbooks: a runbook is what Reeve learned, with a track record, found by search during a diagnosis. A skill is the owner's instruction, found by name. Mixing them would let reflection rewrite what the owner wrote.
+  - Rejected putting every skill's steps in the prompt: only names and one-line descriptions go in, so twenty skills cost twenty lines.
+  - Rejected letting YOLO cover `skill_save`: text from a log or a web page could talk the model into saving steps that run later, under YOLO, as trusted instructions. The owner reads each one.
+  - Rejected T2 for saving (orders are T2): a skill runs nothing by itself and grants no powers; the weight is in `owner_only`, not the tier.
+  - Rejected a form for new skills: the steps are prose, and describing the job to Reeve is the faster way to get good ones.
+  - Rejected a ninth tile: skills sit with what Reeve knows, in F8, and the board keeps its eight.
+- **Why:** The owner floated skills as recipes for recurring jobs. With orders they make Reeve "more like a bot": say how once, then name it, or schedule it.
+- **Where:** `reeve-core/src/skills.rs`, `tools/skill.rs`, `tools/mod.rs` (specs), `policy/paths.rs` (floor), `agent.rs` (prompt, refusal), `reeve-tui/src/overlay.rs` (`MemoryPanel` skills tab, `palette`, `skill_request`), `screens.rs` (`skills_tab`), `run.rs` (`skill_typed`, `delete_skill`, `skill_edited`), `panels.rs` (palette)
+- **Residual risks:**
+  - Matching a request to a skill is the model's judgment; a vague description can make it pick one the owner didn't mean. It says which skill it's using, and every step still asks.
+  - A skill the owner edits by hand is trusted as written; nothing checks its steps.
+  - A skill named like a slash command (`update`) isn't in the slash palette; it's reachable from ⌃K and F8.
+
 ### 2026-09-30: Arch (M6): pacman undo from its log, the AUR on the owner's word, Omarchy's theme
 - **Decision:**
   - pacman has no transaction ids, so a package action records what pacman logged after the log's size before it (`Undo::Pacman`: name, action, versions). Undo restores the old versions from the package cache (`pacman -U`), then removes what was new (`pacman -R`). A version the cache lost is named and the undo refused before anything runs. A failed command still records what it changed.

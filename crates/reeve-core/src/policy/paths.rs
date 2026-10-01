@@ -145,6 +145,11 @@ impl PathCtx {
         if p.starts_with(self.reeve_home.join("orders")) {
             return PathClass::FloorFile("a standing order (powers Reeve uses unattended)");
         }
+        // A skill is text Reeve trusts later; skill_save shows it to the
+        // owner, and nothing else should slip one in.
+        if p.starts_with(self.reeve_home.join("skills")) {
+            return PathClass::FloorFile("a skill (steps Reeve follows later)");
+        }
         if p == self.reeve_home.join("config.toml") || p == self.reeve_home.join("settings.toml") {
             return PathClass::FloorFile("Reeve's own configuration (budgets, approvals)");
         }
@@ -397,6 +402,10 @@ mod tests {
         ));
         assert!(matches!(
             c("~/.reeve/orders/x.toml"),
+            PathClass::FloorFile(_)
+        ));
+        assert!(matches!(
+            c("~/.reeve/skills/tidy-downloads.md"),
             PathClass::FloorFile(_)
         ));
         assert_eq!(c("~/.reeve/memory/facts/gpu.md"), PathClass::Home);

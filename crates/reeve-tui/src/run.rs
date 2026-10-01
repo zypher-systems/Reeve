@@ -184,6 +184,8 @@ struct App {
 /// Run the TUI until the user quits.
 pub fn run(cfg: Config, home: PathBuf) -> io::Result<()> {
     let mode = ColorMode::detect(&cfg.ui.colors, |k| std::env::var(k).ok());
+    // The starter skills, once: deleted ones stay deleted.
+    let _ = reeve_core::skills::Skills::new(&home).seed_examples_once();
     let mut theme_source = crate::theme::ThemeSource::new(
         &cfg.ui.theme,
         mode,
@@ -390,6 +392,9 @@ fn event_loop(
             enter(app.cfg.ui.mouse)?;
             term.clear()?;
             match status {
+                Ok(_) if path.starts_with(reeve_core::skills::Skills::new(&app.home).dir()) => {
+                    app.skill_edited(view, &path, before);
+                }
                 Ok(_) => app.order_edited(view, &path, before),
                 Err(e) => view.push(Speaker::Error, format!("couldn't run {editor}: {e}")),
             }
@@ -603,7 +608,7 @@ impl App {
                 // the board and each tile (unless the slash palette wants
                 // Tab to complete).
                 let on_tile = matches!(view.screen(), Screen::Tile(_));
-                let completing = !on_tile && !palette(&view.input).is_empty();
+                let completing = !on_tile && !palette(&view.input, &view.skills).is_empty();
                 match k.code {
                     KeyCode::F(n @ 1..=8) => {
                         if let Some(tile) = Tile::ALL.get(usize::from(n) - 1) {
@@ -717,7 +722,7 @@ impl App {
             }
         }
         // The slash palette steals arrows, tab, and enter while it's open.
-        let hits = palette(&view.input);
+        let hits = palette(&view.input, &view.skills);
         if !hits.is_empty() {
             let sel = view.palette_sel.min(hits.len() - 1);
             match k.code {
@@ -730,17 +735,23 @@ impl App {
                     return;
                 }
                 KeyCode::Tab => {
-                    view.input = hits[sel].name.to_string();
+                    view.input = hits[sel].name.clone();
                     view.cursor = view.input.len();
                     return;
                 }
                 KeyCode::Enter if !k.modifiers.contains(KeyModifiers::ALT) => {
                     let exact = hits.iter().find(|c| c.name == view.input);
-                    let name = exact.unwrap_or(&hits[sel]).name;
+                    let item = exact.unwrap_or(&hits[sel]).clone();
                     view.input.clear();
                     view.cursor = 0;
                     view.palette_sel = 0;
-                    self.command(view, name);
+                    if item.skill {
+                        // One of the owner's skills: Reeve runs it.
+                        let ask = crate::overlay::skill_request(&item.name[1..], "");
+                        self.perform(view, Action::Ask(ask));
+                    } else {
+                        self.command(view, &item.name);
+                    }
                     return;
                 }
                 _ => view.palette_sel = 0,
@@ -777,6 +788,18 @@ impl App {
         };
         view.composing = false;
         self.perform(view, Action::Ask(text));
+    }
+
+    /// `/id rest` naming one of the owner's skills, as what to send Reeve.
+    fn skill_typed(&self, text: &str) -> Option<String> {
+        let (id, rest) = text
+            .strip_prefix('/')?
+            .split_once(char::is_whitespace)
+            .unwrap_or((&text[1..], ""));
+        reeve_core::skills::valid_id(id)
+            .then(|| reeve_core::skills::Skills::new(&self.home).path(id))
+            .filter(|p| p.is_file())
+            .map(|_| crate::overlay::skill_request(id, rest))
     }
 
     fn composer_key(&mut self, view: &mut View, k: KeyEvent) {
@@ -824,6 +847,8 @@ impl App {
                     view.push(Speaker::User, text.clone());
                     view.busy = true;
                     view.chat = true;
+                    // `/tidy-downloads only the PDFs` runs that skill.
+                    let text = self.skill_typed(&text).unwrap_or(text);
                     let _ = self.work.send(Work::Send(text));
                 }
             }
@@ -1088,6 +1113,19 @@ impl App {
                 self.memory_note(view, msg);
             }
             Action::MemoryEdit(layer, id) => view.edit_request = Some((layer, id)),
+            Action::SkillEdit(id) => {
+                view.edit_file = Some(reeve_core::skills::Skills::new(&self.home).path(&id));
+            }
+            Action::SkillDelete(id) => {
+                let msg = self.delete_skill(view, &id);
+                self.memory_note(view, msg);
+            }
+            Action::SkillNew => {
+                // Reeve writes it (skill_save shows the text and asks).
+                self.go(view, Screen::Chat);
+                view.input = "Save a skill that ".into();
+                view.cursor = view.input.len();
+            }
             Action::Survey => {
                 let _ = self.work.send(Work::Survey);
                 self.memory_note(view, Ok("surveying the machine (read-only)…".into()));
@@ -1609,7 +1647,7 @@ impl App {
             .rev()
             .find(|o| matches!(o, Overlay::Memory(_)))
         {
-            p.reload(&self.memory);
+            p.reload(&self.memory, &reeve_core::skills::Skills::new(&self.home));
             p.note = Some(msg);
         }
     }
@@ -1622,8 +1660,68 @@ impl App {
             .rev()
             .find(|o| matches!(o, Overlay::Memory(_)))
         {
-            p.reload(&self.memory);
+            p.reload(&self.memory, &reeve_core::skills::Skills::new(&self.home));
         }
+    }
+
+    /// Delete a skill from the panel, with a receipt that undoes it.
+    fn delete_skill(&self, view: &View, id: &str) -> Result<String, String> {
+        use reeve_core::receipts::{Receipt, ReceiptBook};
+        let skills = reeve_core::skills::Skills::new(&self.home);
+        let before = std::fs::read(skills.path(id)).map_err(|_| format!("{id} is gone"))?;
+        let expect = reeve_core::orders::Expect::Sha(reeve_core::undo::sha256_hex(&before));
+        let change = skills
+            .write_file(id, None, &expect)
+            .map_err(|e| e.to_string())?;
+        let mut r = Receipt::draft(
+            &view.session_id,
+            "skill_delete",
+            serde_json::json!({"name": id}),
+            reeve_core::policy::Tier::T1,
+        );
+        r.approved_by = "user".into();
+        r.outcome.summary = format!("deleted skill {id}");
+        r.undo = Some(reeve_core::undo::Undo::Files {
+            changes: vec![change],
+        });
+        let r = ReceiptBook::new(&self.home)
+            .append(r)
+            .map_err(|e| e.to_string())?;
+        Ok(format!(
+            "deleted skill {id} · receipt #{} undoes it (F4 activity)",
+            r.seq
+        ))
+    }
+
+    /// After `$EDITOR` on a skill: say whether it still reads.
+    fn skill_edited(&self, view: &mut View, path: &std::path::Path, before: Option<Vec<u8>>) {
+        let id = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let after = std::fs::read(path).ok();
+        let msg = match after {
+            None => Err(format!("{id} is gone")),
+            Some(a) if Some(&a) == before.as_ref() => Ok("no changes".into()),
+            Some(a) => match reeve_core::skills::parse(&id, &String::from_utf8_lossy(&a)) {
+                Ok(s) => Ok(format!("saved skill {}: /{id} runs it", s.name)),
+                Err(e) => Err(format!(
+                    "{id} doesn't read as a skill, so Reeve won't list it: {e} · e opens it again"
+                )),
+            },
+        };
+        view.skills = self.skill_list();
+        self.memory_note(view, msg);
+    }
+
+    /// The skills as the palette and ⌃K list them: (id, description).
+    fn skill_list(&self) -> Vec<(String, String)> {
+        reeve_core::skills::Skills::new(&self.home)
+            .load()
+            .0
+            .into_iter()
+            .map(|s| (s.id, s.description))
+            .collect()
     }
 
     /// After `$EDITOR`: an edited note becomes the owner's.
@@ -1861,6 +1959,7 @@ impl App {
                 .overlays
                 .push(Overlay::Memory(crate::overlay::MemoryPanel::load(
                     &self.memory,
+                    &reeve_core::skills::Skills::new(&self.home),
                 ))),
             Tile::Spend => {
                 let (range, sel) =
@@ -1929,6 +2028,7 @@ impl App {
         self.board_at = Some(Instant::now());
         let report = view.board.report.take();
         view.board = crate::board::read(&self.home, &self.memory);
+        view.skills = self.skill_list();
         view.board.report = report;
     }
 
@@ -1948,6 +2048,15 @@ impl App {
                 detail: "reeve update, in a terminal".into(),
                 place: "/update".into(),
                 action: Action::Command("/update"),
+            });
+        }
+        for (id, about) in &view.skills {
+            hits.push(Hit {
+                group: "DO",
+                title: format!("Skill: {id}"),
+                detail: about.clone(),
+                place: format!("/{id}"),
+                action: Action::Ask(crate::overlay::skill_request(id, "")),
             });
         }
         let findings = FindingStore::new(&self.home).list();

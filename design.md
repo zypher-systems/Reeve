@@ -135,6 +135,7 @@ Every tool call goes through the same gate: `classify → decide → snapshot �
 | System | `sys_info` (hardware, OS, metrics now), `sys_disk` (usage by mount, largest dirs) |
 | Memory | `memory_search`, `memory_read`, `memory_write` |
 | Receipts | `receipt_search` (the agent can see what it did before) |
+| Skills | `skill` (read one), `skill_save`, `skill_delete` (§7.1) |
 
 The package, service, and log tools are the preferred path. They give the policy structured
 arguments to classify, and each maps to a structured undo (for example `dnf history undo <id>`).
@@ -298,6 +299,26 @@ confidence, tags, OS version).
    panel. Preferences wait for your yes.
 
 Runbook confidence falls with failures and resets for review after a major OS upgrade.
+
+### 7.1 Skills
+
+A skill is a job the owner wants done their way, by name: `~/.reeve/skills/<id>.md`, a header
+(`name`, `description`) and the steps in Markdown. Runbooks are what Reeve learned; orders say when
+Reeve works alone; a skill is how the owner wants something done when they ask, and an order's task
+can say to use one.
+
+- **Using one:** every system prompt lists the ids and descriptions. Reeve reads the steps with
+  `skill` (T0) when the owner types `/id` (anything after it goes along), picks it in ⌃K or F8, or
+  asks for something that clearly matches a description, and says which skill it's using. A skill
+  grants nothing: each step goes through the same tiers and approvals.
+- **Writing one:** "save that as a skill" makes Reeve call `skill_save`. It's `owner_only`, like an
+  order: the card shows the whole text as a diff and asks every time, YOLO and broad yeses don't
+  cover it, and unattended runs can't. The owner can also edit the file (`e` in F8). A raw write
+  into `~/.reeve/skills` is on the floor: a skill is text Reeve trusts later, so nothing gets in
+  unseen. Saves and deletes carry an undo.
+- **Where they show:** a skills tab in F8 memory (run, edit, delete, new), the slash palette, and ⌃K.
+- **Starters:** three are written once (`tidy-downloads`, `update-everything`, `why-slow`); deleted
+  ones stay deleted.
 
 ---
 
@@ -523,6 +544,7 @@ renders each screen to colored HTML (with `REEVE_SHOTS_HOME`, from a real Reeve 
   undo/objects/<sha256>  undo/index.jsonl
   spend/YYYY-MM.jsonl    # global ledger (budgets)
   memory/{facts,baselines,runbooks,preferences}/
+  skills/<id>.md         # the owner's skills
   findings/  proposals/  orders/*.toml
   observer/metrics/YYYY-MM-DD.jsonl
   observer/update.json   # newest release seen, version installed, version replaced
@@ -608,4 +630,4 @@ today; an open one is not, or not yet proven.
 - [ ] **The docs match the product.** A user guide covers approvals, undo, orders, privacy, and the
   drafter, and this design describes what shipped (§11 still shows the ledger UI, not the board).
 
-**Not needed for 1.0:** skills, themes beyond Omarchy's, timeshift, and macOS or Windows.
+**Not needed for 1.0:** timeshift, and macOS or Windows.

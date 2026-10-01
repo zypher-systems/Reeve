@@ -541,6 +541,32 @@ fn shots() {
     });
     write(&dir, "5-aur-card", html_at(&aur, &t, "aur card", 120, 60));
 
+    // Skills: the starter three in F8 memory, and one offered by the slash palette.
+    let tmp = tempfile::tempdir().unwrap();
+    let skills = reeve_core::skills::Skills::new(tmp.path());
+    skills.seed_examples_once().unwrap();
+    let mut sk = base();
+    let mut panel =
+        crate::overlay::MemoryPanel::load(&reeve_core::memory::Memory::new(tmp.path()), &skills);
+    panel.select_skill("tidy-downloads");
+    sk.overlays.push(Overlay::Memory(panel));
+    write(&dir, "f8-skills", html(&sk, &t, "skills"));
+    let mut pal = ledger();
+    pal.chat = true;
+    pal.skills = skills
+        .load()
+        .0
+        .into_iter()
+        .map(|s| (s.id, s.description))
+        .collect();
+    pal.input = "/u".into();
+    pal.cursor = 2;
+    write(
+        &dir,
+        "1c-palette-skills",
+        html(&pal, &t, "palette with skills"),
+    );
+
     // The chat, the approval asking there.
     v.chat = true;
     write(&dir, "1-chat", html(&v, &t, "chat"));
@@ -748,6 +774,7 @@ fn shots() {
     v.overlays
         .push(Overlay::Memory(crate::overlay::MemoryPanel::load(
             &reeve_core::memory::Memory::new(home),
+            &reeve_core::skills::Skills::new(home),
         )));
     write(&dir, "f8-memory", html(&v, &t, "memory"));
 }
