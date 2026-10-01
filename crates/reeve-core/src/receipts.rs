@@ -65,6 +65,17 @@ impl From<&str> for UndoFailed {
     }
 }
 
+/// Which of `receipts` have been undone, by seq. Only an undo that worked
+/// counts: after a failed attempt (which may have a partial inverse of its
+/// own) the target can be tried again.
+pub fn undone(receipts: &[Receipt]) -> std::collections::HashSet<u64> {
+    receipts
+        .iter()
+        .filter(|r| r.outcome.status == Status::Ok)
+        .filter_map(|r| r.undoes)
+        .collect()
+}
+
 /// One action.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Receipt {
@@ -350,9 +361,14 @@ impl ReceiptBook {
                 };
                 // A failed undo that changed something can itself be undone.
                 // The target stays undoable: only an undo that worked counts.
+                let partial = e.partial.is_some();
                 r.undo = e.partial;
-                self.append(r)?;
-                Err(Error::Io(e.why))
+                let r = self.append(r)?;
+                Err(Error::Io(if partial {
+                    format!("{}. Receipt #{} undoes that part.", e.why, r.seq)
+                } else {
+                    e.why
+                }))
             }
         }
     }
@@ -552,7 +568,11 @@ mod tests {
                 }),
             )
             .unwrap_err();
-        assert!(err.to_string().contains("stopped partway"));
+        let said = err.to_string();
+        assert!(
+            said.contains("stopped partway") && said.contains("Receipt #2 undoes that part"),
+            "{said}"
+        );
         let failed = b.find(2).unwrap();
         assert_eq!(failed.outcome.status, Status::Error);
         assert_eq!(failed.undo, Some(partial), "what it did has an inverse");
@@ -560,6 +580,7 @@ mod tests {
         assert!(b.undo_target(2).is_ok());
         assert_eq!(b.undone_by(1), None);
         assert!(b.undo_target(1).is_ok());
+        assert!(undone(&b.all()).is_empty(), "a failed undo undid nothing");
         // A plain failure carries nothing.
         let _ = b.record_undo(&target, "s", "user", Err("no".into()));
         assert_eq!(b.find(3).unwrap().undo, None);

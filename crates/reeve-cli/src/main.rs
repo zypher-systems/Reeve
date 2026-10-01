@@ -310,8 +310,7 @@ fn receipts(home: &std::path::Path, cmd: ReceiptsCmd) -> Result<(), String> {
             if list.is_empty() {
                 println!("No receipts yet.");
             }
-            let undone: std::collections::HashSet<u64> =
-                book.all().iter().filter_map(|r| r.undoes).collect();
+            let undone = reeve_core::receipts::undone(&book.all());
             for r in list.iter().rev() {
                 let mark = if undone.contains(&r.seq) {
                     " (undone)"

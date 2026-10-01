@@ -697,7 +697,7 @@ async fn revert_pacman(
         } else {
             UndoFailed {
                 why: format!(
-                    "{}; it stopped partway ({}), and this receipt undoes that part",
+                    "{}; it stopped partway: {}",
                     e.outcome.summary,
                     crate::pacman::summary(&back)
                 ),

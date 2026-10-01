@@ -394,9 +394,10 @@ impl View {
         }
     }
 
-    /// Remember a receipt for the rail (and mark an undone one).
+    /// Remember a receipt for the rail (and mark an undone one: only an
+    /// undo that worked undid anything).
     pub fn add_receipt(&mut self, r: Receipt) {
-        if let Some(seq) = r.undoes {
+        if let Some(seq) = r.undoes.filter(|_| r.outcome.status == Status::Ok) {
             for e in &mut self.entries {
                 if let Some(t) = e.tool.as_mut().filter(|t| t.seq == Some(seq)) {
                     t.undoable = false;

@@ -1968,14 +1968,8 @@ impl App {
             }
             Tile::Activity => {
                 let book = ReceiptBook::new(&self.home);
-                let items = book.recent(500);
-                let undone = items.iter().filter_map(|r| r.undoes).collect();
-                view.overlays.push(Overlay::Receipts(ReceiptsPanel {
-                    items,
-                    undone,
-                    sel: 0,
-                    note: None,
-                }));
+                view.overlays
+                    .push(Overlay::Receipts(ReceiptsPanel::new(book.recent(500))));
             }
             Tile::Orders => {
                 let orders = reeve_core::orders::Orders::new(&self.home);
@@ -2301,8 +2295,7 @@ impl App {
             .rev()
             .find(|o| matches!(o, Overlay::Receipts(_)))
         {
-            p.items = book.recent(500);
-            p.undone = p.items.iter().filter_map(|r| r.undoes).collect();
+            p.load(book.recent(500));
             // Stay on the receipt acted on: a second `u` must not undo the undo.
             p.sel = p.items.iter().position(|r| r.seq == seq).unwrap_or(0);
             p.note = Some(note);

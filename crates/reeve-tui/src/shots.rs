@@ -735,14 +735,8 @@ fn shots() {
     let mut v = base();
     fill(&mut v, Some(home));
     let items = reeve_core::receipts::ReceiptBook::new(home).recent(500);
-    let undone = items.iter().filter_map(|r| r.undoes).collect();
     v.overlays
-        .push(Overlay::Receipts(crate::overlay::ReceiptsPanel {
-            items,
-            undone,
-            sel: 0,
-            note: None,
-        }));
+        .push(Overlay::Receipts(crate::overlay::ReceiptsPanel::new(items)));
     write(&dir, "f4-activity", html(&v, &t, "activity"));
 
     // F5 · spend.

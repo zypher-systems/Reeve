@@ -484,6 +484,19 @@ pub struct ReceiptsPanel {
 }
 
 impl ReceiptsPanel {
+    /// The panel over `items` (newest first).
+    pub fn new(items: Vec<reeve_core::receipts::Receipt>) -> Self {
+        let mut p = Self::default();
+        p.load(items);
+        p
+    }
+
+    /// Show `items`, and work out which of them have been undone.
+    pub fn load(&mut self, items: Vec<reeve_core::receipts::Receipt>) {
+        self.undone = reeve_core::receipts::undone(&items);
+        self.items = items;
+    }
+
     /// The selected receipt.
     pub fn selected(&self) -> Option<&reeve_core::receipts::Receipt> {
         self.items.get(self.sel)
@@ -1368,6 +1381,46 @@ fn template_url(kind: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_undo_leaves_its_target_undoable() {
+        use reeve_core::policy::Tier;
+        use reeve_core::receipts::{Receipt, Status};
+        use reeve_core::undo::Undo;
+        let receipt = |seq: u64, undoes: Option<u64>, status: Status, undo: bool| {
+            let mut r = Receipt::draft("s", "pkg_install", serde_json::json!({}), Tier::T2);
+            r.seq = seq;
+            r.undoes = undoes;
+            r.outcome.status = status;
+            r.undo = undo.then(|| Undo::Pacman { changes: vec![] });
+            r
+        };
+        let u = |p: &mut ReceiptsPanel, seq: u64| {
+            p.sel = p.items.iter().position(|r| r.seq == seq).unwrap();
+            p.note = None;
+            p.on_key(KeyEvent::from(KeyCode::Char('u')))
+        };
+        // #1 changed packages. #2 tried to undo it, stopped partway, and
+        // carries the inverse of the part that ran.
+        let one = receipt(1, None, Status::Ok, true);
+        let two = receipt(2, Some(1), Status::Error, true);
+        let mut p = ReceiptsPanel::new(vec![two.clone(), one.clone()]);
+        assert!(p.undone.is_empty());
+        assert_eq!(u(&mut p, 2), Action::Undo(2), "the partial can be undone");
+        assert_eq!(u(&mut p, 1), Action::Undo(1), "and #1 tried again");
+
+        // #3 took the partial back: #2 is undone, #1 still isn't.
+        let three = receipt(3, Some(2), Status::Ok, true);
+        p.load(vec![three.clone(), two.clone(), one.clone()]);
+        assert_eq!(u(&mut p, 2), Action::None);
+        assert_eq!(p.note, Some(Err("#2 was already undone".into())));
+        assert_eq!(u(&mut p, 1), Action::Undo(1));
+
+        // #4 undid #1 for good.
+        p.load(vec![receipt(4, Some(1), Status::Ok, true), three, two, one]);
+        assert_eq!(u(&mut p, 1), Action::None);
+        assert_eq!(p.note, Some(Err("#1 was already undone".into())));
+    }
 
     #[test]
     fn the_picker_hides_models_reeve_cant_drive() {
