@@ -79,6 +79,10 @@ pub struct Assessment {
     /// Reeve would do on its own later (standing orders).
     #[serde(default)]
     pub owner_only: bool,
+    /// It runs a pacman transaction (pacman, or an AUR helper, changing
+    /// packages): where snap-pac is installed, that snapshots itself.
+    #[serde(default)]
+    pub pacman: bool,
 }
 
 impl Assessment {
@@ -93,6 +97,7 @@ impl Assessment {
             unkeyed: false,
             quiet_write: false,
             owner_only: false,
+            pacman: false,
         }
     }
 
@@ -165,6 +170,7 @@ impl Assessment {
         self.unkeyed |= other.unkeyed;
         self.quiet_write |= other.quiet_write;
         self.owner_only |= other.owner_only;
+        self.pacman |= other.pacman;
         self.tier = self.tier.max(other.tier);
         self.sudo |= other.sudo;
         if self.deny.is_none() {

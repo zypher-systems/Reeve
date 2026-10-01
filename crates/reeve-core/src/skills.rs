@@ -150,6 +150,27 @@ impl Skills {
         })
     }
 
+    /// The change an edit already made to a skill's file (in `$EDITOR`),
+    /// with `before` as what an undo puts back: for a receipt.
+    pub fn edited(&self, id: &str, before: Option<&[u8]>) -> Result<FileChange> {
+        let store = UndoStore::new(&self.home);
+        let pre = match before {
+            Some(b) => Some(crate::undo::Blob {
+                sha256: store.put(b)?,
+                mode: 0o600,
+                link: None,
+            }),
+            None => None,
+        };
+        let path = self.path(id);
+        Ok(FileChange {
+            path: path.display().to_string(),
+            pre,
+            post: store.snapshot(&path)?,
+            root: false,
+        })
+    }
+
     /// Write the starter skills, once: ones the owner deleted stay deleted.
     pub fn seed_examples_once(&self) -> Result<usize> {
         let mark = self.dir.join(".examples");
@@ -412,6 +433,32 @@ mod tests {
         fs::write(d.path().join("skills/Not An Id.md"), "x").unwrap();
         let (_, bad) = skills.load();
         assert_eq!(bad.len(), 2, "{bad:?}");
+    }
+
+    #[test]
+    fn an_edit_made_in_an_editor_can_be_put_back() {
+        let d = tempfile::tempdir().unwrap();
+        let skills = Skills::new(d.path());
+        let before = render("A", "does a", "1. a");
+        fs::create_dir_all(skills.dir()).unwrap();
+        fs::write(skills.path("a"), "---\nname: A\n---\nbroken").unwrap();
+        let change = skills.edited("a", Some(before.as_bytes())).unwrap();
+        UndoStore::new(d.path())
+            .revert(&crate::undo::Undo::Files {
+                changes: vec![change],
+            })
+            .unwrap();
+        assert_eq!(fs::read_to_string(skills.path("a")).unwrap(), before);
+        // Deleted in the editor: undo brings the file back.
+        fs::remove_file(skills.path("a")).unwrap();
+        let change = skills.edited("a", Some(before.as_bytes())).unwrap();
+        assert!(change.post.is_none());
+        UndoStore::new(d.path())
+            .revert(&crate::undo::Undo::Files {
+                changes: vec![change],
+            })
+            .unwrap();
+        assert!(skills.path("a").exists());
     }
 
     #[test]

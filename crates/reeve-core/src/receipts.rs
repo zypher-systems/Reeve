@@ -43,6 +43,28 @@ pub struct Outcome {
     pub output_sha256: Option<String>,
 }
 
+/// An undo that failed, with what takes back the part of it that ran.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UndoFailed {
+    /// Why it failed.
+    pub why: String,
+    /// The inverse of whatever it changed before failing (a pacman undo is
+    /// two transactions; the first can go through and the second not).
+    pub partial: Option<Undo>,
+}
+
+impl From<String> for UndoFailed {
+    fn from(why: String) -> Self {
+        Self { why, partial: None }
+    }
+}
+
+impl From<&str> for UndoFailed {
+    fn from(why: &str) -> Self {
+        why.to_string().into()
+    }
+}
+
 /// One action.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Receipt {
@@ -296,7 +318,7 @@ impl ReceiptBook {
         target: &Receipt,
         session: &str,
         by: &str,
-        result: std::result::Result<(Undo, String), String>,
+        result: std::result::Result<(Undo, String), UndoFailed>,
     ) -> Result<Receipt> {
         let mut r = Receipt::draft(
             session,
@@ -323,11 +345,14 @@ impl ReceiptBook {
                 r.outcome = Outcome {
                     status: Status::Error,
                     exit: None,
-                    summary: e.clone(),
+                    summary: e.why.clone(),
                     output_sha256: None,
                 };
+                // A failed undo that changed something can itself be undone.
+                // The target stays undoable: only an undo that worked counts.
+                r.undo = e.partial;
                 self.append(r)?;
-                Err(Error::Io(e))
+                Err(Error::Io(e.why))
             }
         }
     }
@@ -336,7 +361,9 @@ impl ReceiptBook {
     /// for everything else.
     pub fn undo(&self, store: &crate::undo::UndoStore, seq: u64, session: &str) -> Result<Receipt> {
         let (target, undo) = self.undo_target(seq)?;
-        let result = store.revert(&undo).map_err(|e| e.to_string());
+        let result = store
+            .revert(&undo)
+            .map_err(|e| UndoFailed::from(e.to_string()));
         self.record_undo(&target, session, "user", result)
     }
 
@@ -494,6 +521,48 @@ mod tests {
         let v = b.verify();
         assert!(v.problem.as_deref().unwrap().contains("#1"), "{v:?}");
         drop(d);
+    }
+
+    #[test]
+    fn a_half_done_undo_can_itself_be_undone() {
+        let (_d, b) = book();
+        let change = |action: &str| crate::pacman::PkgChange {
+            name: "lib".into(),
+            action: action.into(),
+            from: Some("1-1".into()),
+            to: Some("2-1".into()),
+        };
+        let mut r = Receipt::draft("s", "pkg_install", json!({}), Tier::T2);
+        r.undo = Some(Undo::Pacman {
+            changes: vec![change("upgraded")],
+        });
+        let target = b.append(r).unwrap();
+        // The undo put the old library back, then failed to remove a package.
+        let partial = Undo::Pacman {
+            changes: vec![change("downgraded")],
+        };
+        let err = b
+            .record_undo(
+                &target,
+                "s",
+                "user",
+                Err(UndoFailed {
+                    why: "pacman -R failed; it stopped partway".into(),
+                    partial: Some(partial.clone()),
+                }),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("stopped partway"));
+        let failed = b.find(2).unwrap();
+        assert_eq!(failed.outcome.status, Status::Error);
+        assert_eq!(failed.undo, Some(partial), "what it did has an inverse");
+        // The failed attempt can be taken back, and the original tried again.
+        assert!(b.undo_target(2).is_ok());
+        assert_eq!(b.undone_by(1), None);
+        assert!(b.undo_target(1).is_ok());
+        // A plain failure carries nothing.
+        let _ = b.record_undo(&target, "s", "user", Err("no".into()));
+        assert_eq!(b.find(3).unwrap().undo, None);
     }
 
     #[test]

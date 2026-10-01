@@ -1693,20 +1693,53 @@ impl App {
         ))
     }
 
-    /// After `$EDITOR` on a skill: say whether it still reads.
+    /// After `$EDITOR` on a skill: receipt the change (so F4 can undo a bad
+    /// edit, or the file deleted in the editor), and say whether it still reads.
     fn skill_edited(&self, view: &mut View, path: &std::path::Path, before: Option<Vec<u8>>) {
+        use reeve_core::receipts::{Receipt, ReceiptBook};
         let id = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         let after = std::fs::read(path).ok();
+        if after == before {
+            self.memory_note(view, Ok("no changes".into()));
+            return;
+        }
+        let skills = reeve_core::skills::Skills::new(&self.home);
+        let receipt = skills
+            .edited(&id, before.as_deref())
+            .map_err(|e| e.to_string())
+            .and_then(|change| {
+                let mut r = Receipt::draft(
+                    &view.session_id,
+                    "skill_edit",
+                    serde_json::json!({"name": id}),
+                    reeve_core::policy::Tier::T1,
+                );
+                r.approved_by = "user".into();
+                r.outcome.summary = match (&before, &after) {
+                    (None, _) => format!("new skill {id}"),
+                    (_, Some(_)) => format!("edited skill {id}"),
+                    (_, None) => format!("deleted skill {id} in the editor"),
+                };
+                r.undo = Some(reeve_core::undo::Undo::Files {
+                    changes: vec![change],
+                });
+                ReceiptBook::new(&self.home)
+                    .append(r)
+                    .map_err(|e| e.to_string())
+            });
+        let undo = match &receipt {
+            Ok(r) => format!(" · receipt #{} undoes it (F4 activity)", r.seq),
+            Err(e) => format!(" · no receipt: {e}"),
+        };
         let msg = match after {
-            None => Err(format!("{id} is gone")),
-            Some(a) if Some(&a) == before.as_ref() => Ok("no changes".into()),
+            None => Err(format!("{id} is gone{undo}")),
             Some(a) => match reeve_core::skills::parse(&id, &String::from_utf8_lossy(&a)) {
-                Ok(s) => Ok(format!("saved skill {}: /{id} runs it", s.name)),
+                Ok(s) => Ok(format!("saved skill {}: /{id} runs it{undo}", s.name)),
                 Err(e) => Err(format!(
-                    "{id} doesn't read as a skill, so Reeve won't list it: {e} · e opens it again"
+                    "{id} doesn't read as a skill, so Reeve won't list it: {e} · e opens it again{undo}"
                 )),
             },
         };

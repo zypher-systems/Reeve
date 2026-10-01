@@ -101,8 +101,8 @@ sudo and nowhere else: not to the model, a log, or a receipt. You can let Reeve 
   `visudo -c` / `findmnt --verify` first.
 - Package changes can be undone. On Fedora the receipt records the dnf transaction, and undo runs
   `dnf history undo`. On Arch it records what pacman logged (installed, upgraded, removed, with versions),
-  and undo puts the old versions back from pacman's cache, then removes what was new. If the cache was
-  cleaned, undo says which version is missing and changes nothing. Service changes record the unit's
+  and undo puts the old versions back from pacman's cache and removes what was new, in whichever order
+  pacman accepts. If the cache was cleaned, undo says which version is missing and changes nothing. Service changes record the unit's
   previous state.
 - On Arch, a package the repos don't have is built from the AUR with paru or yay. The approval card shows
   its PKGBUILD, and you're asked every time: YOLO and session yeses never cover it, and standing orders

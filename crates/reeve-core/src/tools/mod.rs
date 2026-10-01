@@ -388,12 +388,16 @@ pub async fn undo_receipt_by(
 ) -> crate::Result<crate::receipts::Receipt> {
     let (target, undo) = book.undo_target(seq)?;
     let root_files = matches!(&undo, Undo::Files { changes } if changes.iter().any(|c| c.root));
+    use crate::receipts::UndoFailed;
     let result = match &undo {
         Undo::Packages { .. } | Undo::Pacman { .. } | Undo::Unit { .. } => {
             sys::revert(ctx, &undo).await
         }
-        _ if root_files => fs::root_revert(ctx, &undo).await,
-        _ => ctx.undo.revert(&undo).map_err(|e| e.to_string()),
+        _ if root_files => fs::root_revert(ctx, &undo).await.map_err(UndoFailed::from),
+        _ => ctx
+            .undo
+            .revert(&undo)
+            .map_err(|e| UndoFailed::from(e.to_string())),
     };
     book.record_undo(&target, session, by, result)
 }

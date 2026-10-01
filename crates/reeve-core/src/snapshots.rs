@@ -74,13 +74,6 @@ pub async fn post(ctx: &ToolCtx, config: &str, pre: u64, desc: &str) -> Option<u
     exec(ctx, &cmd, true).await?.trim().parse().ok()
 }
 
-/// Whether a command runs pacman, or an AUR helper (which runs pacman).
-pub fn runs_pacman(command: &str) -> bool {
-    command
-        .split(|c: char| c.is_whitespace() || ";&|()`".contains(c))
-        .any(|w| matches!(w.rsplit('/').next().unwrap_or(w), "pacman" | "paru" | "yay"))
-}
-
 /// snap-pac is installed and its hooks aren't masked in `/etc/pacman.d/hooks`.
 pub fn snap_pac() -> bool {
     snap_pac_in(
@@ -116,8 +109,9 @@ pub async fn newest(ctx: &ToolCtx, config: &str) -> Option<u64> {
         .max()
 }
 
-/// The pre/post pair snap-pac took after snapshot `after`: the first, when
-/// the command ran pacman more than once.
+/// The snapshots snap-pac took after snapshot `after`: the first pre, and
+/// the last post of the transactions the command ran (a repo install and
+/// an AUR build are two), so `snapper undochange pre..post` covers them all.
 pub async fn snap_pac_pair(ctx: &ToolCtx, config: &str, after: u64) -> Option<SnapPair> {
     let cmd = format!(
         "sudo snapper -c {} --csvout list --columns number,type,pre-number",
@@ -143,15 +137,17 @@ fn parse_pair(csv: &str, after: u64) -> Option<(u64, Option<u64>)> {
             Some((n, kind, pre))
         })
         .collect();
-    let pre = rows
+    let pres: Vec<u64> = rows
         .iter()
         .filter(|(n, kind, _)| *n > after && kind == "pre")
         .map(|(n, ..)| *n)
-        .min()?;
+        .collect();
+    let pre = *pres.iter().min()?;
     let post = rows
         .iter()
-        .find(|(_, kind, p)| kind == "post" && *p == Some(pre))
-        .map(|(n, ..)| *n);
+        .filter(|(_, kind, p)| kind == "post" && p.is_some_and(|p| pres.contains(&p)))
+        .map(|(n, ..)| *n)
+        .max();
     Some((pre, post))
 }
 
@@ -160,23 +156,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pacman_and_its_helpers_are_spotted() {
-        for c in [
-            "sudo pacman -S --needed --noconfirm htop",
-            "paru -S --noconfirm foo",
-            "true && /usr/bin/yay -Syu",
-        ] {
-            assert!(runs_pacman(c), "{c}");
-        }
-        for c in ["pacmanager --help", "echo pacman-contrib", "dnf install x"] {
-            assert!(!runs_pacman(c), "{c}");
-        }
-    }
-
-    #[test]
     fn snap_pacs_pair_is_found_after_the_mark() {
         let csv = "number,type,pre-number\n0,single,\n40,pre,\n41,post,40\n42,pre,\n43,post,42\n44,pre,\n45,post,44\n";
-        assert_eq!(parse_pair(csv, 41), Some((42, Some(43))));
+        // Two transactions after the mark: from the first pre to the last post.
+        assert_eq!(parse_pair(csv, 41), Some((42, Some(45))));
+        assert_eq!(parse_pair(csv, 43), Some((44, Some(45))));
         assert_eq!(parse_pair(csv, 45), None);
         assert_eq!(
             parse_pair("number,type,pre-number\n50,pre,\n", 45),

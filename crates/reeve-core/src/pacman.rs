@@ -159,22 +159,55 @@ pub struct UndoPlan {
 }
 
 impl UndoPlan {
-    /// The command, with sudo: old versions back first (what's new may be
-    /// needed by the new versions until then), then the new packages out.
-    /// `None` when there's nothing to do.
-    pub fn command(&self) -> Option<String> {
-        let mut steps = Vec::new();
-        if !self.restore.is_empty() {
-            let files: Vec<String> = self
-                .restore
-                .iter()
-                .map(|p| quote(&p.display().to_string()))
-                .collect();
-            steps.push(format!("sudo pacman -U --noconfirm {}", files.join(" ")));
-        }
-        if !self.remove.is_empty() {
-            let names: Vec<String> = self.remove.iter().map(|n| quote(n)).collect();
-            steps.push(format!("sudo pacman -R --noconfirm {}", names.join(" ")));
+    fn files(&self) -> String {
+        let files: Vec<String> = self
+            .restore
+            .iter()
+            .map(|p| quote(&p.display().to_string()))
+            .collect();
+        files.join(" ")
+    }
+
+    fn names(&self) -> String {
+        let names: Vec<String> = self.remove.iter().map(|n| quote(n)).collect();
+        names.join(" ")
+    }
+
+    /// Put the old versions back (root). `None` when there are none.
+    pub fn restore_command(&self) -> Option<String> {
+        (!self.restore.is_empty()).then(|| format!("sudo pacman -U --noconfirm {}", self.files()))
+    }
+
+    /// Remove what the changes installed (root). `None` when there's nothing.
+    pub fn remove_command(&self) -> Option<String> {
+        (!self.remove.is_empty()).then(|| format!("sudo pacman -R --noconfirm {}", self.names()))
+    }
+
+    /// Whether [`UndoPlan::restore_command`] would go through now: pacman
+    /// resolves it and prints the targets, changing nothing (no root).
+    pub fn restore_check(&self) -> Option<String> {
+        (!self.restore.is_empty()).then(|| format!("pacman -U --print {}", self.files()))
+    }
+
+    /// Whether [`UndoPlan::remove_command`] would go through now.
+    pub fn remove_check(&self) -> Option<String> {
+        (!self.remove.is_empty()).then(|| format!("pacman -R --print {}", self.names()))
+    }
+
+    /// The whole undo as one line, in the order given. pacman can't put
+    /// packages back and take others out in one transaction, and either
+    /// half may need the other done first: an upgrade that pulled in a new
+    /// dependency needs the old version back before the dependency can go,
+    /// and an install that upgraded a library needs the new package gone
+    /// before the library can go back. The caller picks by trying each
+    /// (`*_check`). `None` when there's nothing to do.
+    pub fn command(&self, remove_first: bool) -> Option<String> {
+        let mut steps: Vec<String> = [self.restore_command(), self.remove_command()]
+            .into_iter()
+            .flatten()
+            .collect();
+        if remove_first {
+            steps.reverse();
         }
         (!steps.is_empty()).then(|| steps.join(" && "))
     }
@@ -226,8 +259,22 @@ pub fn undo_plan(
     plan
 }
 
-/// The cache file for `name` at `version`: `name-version-arch.pkg.tar.*`,
-/// signatures left out.
+/// What a package file's name ends in. A `.sig` isn't one, and neither is
+/// a download that never finished (`.part`).
+const ARCHIVES: &[&str] = &[
+    "pkg.tar",
+    "pkg.tar.zst",
+    "pkg.tar.xz",
+    "pkg.tar.gz",
+    "pkg.tar.bz2",
+    "pkg.tar.lz4",
+    "pkg.tar.lzo",
+    "pkg.tar.lrz",
+    "pkg.tar.lz",
+    "pkg.tar.Z",
+];
+
+/// The cache file for `name` at `version`: `name-version-arch.pkg.tar.*`.
 fn cached(names: &[String], name: &str, version: &str) -> Option<String> {
     let prefix = format!("{name}-{version}-");
     names
@@ -235,10 +282,7 @@ fn cached(names: &[String], name: &str, version: &str) -> Option<String> {
         .find(|f| {
             f.strip_prefix(&prefix).is_some_and(|rest| {
                 let (arch, ext) = rest.split_once('.').unwrap_or((rest, ""));
-                !arch.is_empty()
-                    && !arch.contains('-')
-                    && ext.starts_with("pkg.tar")
-                    && !f.ends_with(".sig")
+                !arch.is_empty() && !arch.contains('-') && ARCHIVES.contains(&ext)
             })
         })
         .cloned()
@@ -394,11 +438,18 @@ mod tests {
             ]
             .map(PathBuf::from)
         );
-        assert_eq!(
-            p.command().unwrap(),
-            "sudo pacman -U --noconfirm /var/cache/pacman/pkg/nano-8.4-1-x86_64.pkg.tar.zst \
-             /var/cache/pacman/pkg/ncurses-6.5-3-x86_64.pkg.tar.zst \
-             /var/cache/pacman/pkg/zstd-1.5.7-2-x86_64.pkg.tar.zst && sudo pacman -R --noconfirm htop libnl"
+        let restore = "sudo pacman -U --noconfirm /var/cache/pacman/pkg/nano-8.4-1-x86_64.pkg.tar.zst \
+                       /var/cache/pacman/pkg/ncurses-6.5-3-x86_64.pkg.tar.zst \
+                       /var/cache/pacman/pkg/zstd-1.5.7-2-x86_64.pkg.tar.zst";
+        let remove = "sudo pacman -R --noconfirm htop libnl";
+        // Either order, for the caller to pick by what resolves.
+        assert_eq!(p.command(false).unwrap(), format!("{restore} && {remove}"));
+        assert_eq!(p.command(true).unwrap(), format!("{remove} && {restore}"));
+        assert_eq!(p.remove_check().unwrap(), "pacman -R --print htop libnl");
+        assert!(
+            p.restore_check()
+                .unwrap()
+                .starts_with("pacman -U --print /var/cache")
         );
     }
 
@@ -429,7 +480,8 @@ mod tests {
         // bar came and went; baz went and came back as it was.
         assert!(p.remove.is_empty(), "{p:?}");
         assert!(p.missing.is_empty(), "{p:?}");
-        assert_eq!(UndoPlan::default().command(), None);
+        assert_eq!(UndoPlan::default().command(false), None);
+        assert_eq!(UndoPlan::default().restore_check(), None);
     }
 
     #[test]
@@ -444,6 +496,12 @@ mod tests {
             Some("python-3.13.7-1-x86_64.pkg.tar.zst")
         );
         assert_eq!(cached(&names, "python", "25.2-1"), None);
+        // A signature or an unfinished download is never the package.
+        let junk = vec![
+            "htop-3.5.2-1-x86_64.pkg.tar.zst.part".to_string(),
+            "htop-3.5.2-1-x86_64.pkg.tar.zst.sig".to_string(),
+        ];
+        assert_eq!(cached(&junk, "htop", "3.5.2-1"), None);
         assert_eq!(
             cached(&names, "go", "2:1.25.1-1").as_deref(),
             Some("go-2:1.25.1-1-x86_64.pkg.tar.zst")
@@ -508,10 +566,24 @@ mod tests {
                     .to_string()
             })
         };
-        let undo = |changes: &[PkgChange]| {
+        // As revert_pacman does: try each order without changing anything,
+        // and run the one that resolves. Returns whether removal went first.
+        let undo = |changes: &[PkgChange]| -> bool {
             let plan = undo_plan(changes, &paths.caches, list_dir);
             assert!(plan.missing.is_empty(), "{plan:?}");
-            assert!(sh(&plan.command().unwrap()));
+            let remove_first = match (plan.restore_check(), plan.remove_check()) {
+                (Some(restore), Some(remove)) => {
+                    if sh(&restore) {
+                        false
+                    } else {
+                        assert!(sh(&remove), "neither order resolves: {plan:?}");
+                        true
+                    }
+                }
+                _ => false,
+            };
+            assert!(sh(&plan.command(remove_first).unwrap()));
+            remove_first
         };
         let has = |c: &[PkgChange], name: &str, action: &str| {
             c.iter().any(|x| x.name == name && x.action == action)
@@ -552,7 +624,64 @@ mod tests {
         assert!(in_repos("htop") && in_repos("base-devel") && in_repos("pfetch"));
         assert!(!in_repos("pipes.sh"));
 
-        // 5. The AUR, through the helper, without a prompt; undo removes it.
+        // 5. Undo is two transactions, and which goes first depends on the
+        // change. Tiny local packages make both cases: `lib` 1, 2, and 3 (3
+        // needs `dep`), `app` (needs lib>=2), and `dep`.
+        let build = r#"set -eu
+d=$(mktemp -d); cd "$d"
+mk() { # name ver depends
+  mkdir -p "$1-$2"; cat > "$1-$2/PKGBUILD" <<EOF
+pkgname=reeve-t-$1
+pkgver=$2
+pkgrel=1
+arch=(any)
+depends=($3)
+package() { install -d "\$pkgdir/usr/share/reeve-t"; echo $2 > "\$pkgdir/usr/share/reeve-t/$1"; }
+EOF
+  (cd "$1-$2" && makepkg -f --nodeps >/dev/null 2>&1)
+  sudo cp "$1-$2"/reeve-t-$1-$2-1-any.pkg.tar.zst /var/cache/pacman/pkg/
+}
+mk lib 1 ""; mk lib 2 ""; mk lib 3 "reeve-t-dep"; mk app 1 "'reeve-t-lib>=2'"; mk dep 1 ""
+for p in reeve-t-app reeve-t-lib reeve-t-dep; do sudo pacman -Rdd --noconfirm $p >/dev/null 2>&1 || true; done
+"#;
+        assert!(sh(build), "building the test packages");
+        let pkg =
+            |n: &str, v: u32| format!("/var/cache/pacman/pkg/reeve-t-{n}-{v}-1-any.pkg.tar.zst");
+        assert!(sh(&format!("sudo pacman -U --noconfirm {}", pkg("lib", 1))));
+
+        // An install that upgraded a library the new package needs: the old
+        // library can't go back while the package is there, so it goes first.
+        let m = mark(&paths.log);
+        assert!(sh(&format!(
+            "sudo pacman -U --noconfirm {} {}",
+            pkg("lib", 2),
+            pkg("app", 1)
+        )));
+        let c = changes_since(&paths.log, m);
+        assert!(
+            has(&c, "reeve-t-app", "installed") && has(&c, "reeve-t-lib", "upgraded"),
+            "{c:?}"
+        );
+        assert!(undo(&c), "the removal has to go first");
+        assert_eq!(version("reeve-t-app"), None);
+        assert_eq!(version("reeve-t-lib").as_deref(), Some("1-1"));
+
+        // An upgrade that pulled in a new dependency: the dependency can't
+        // go while the new version needs it, so the old version goes back first.
+        assert!(sh(&format!("sudo pacman -U --noconfirm {}", pkg("lib", 2))));
+        let m = mark(&paths.log);
+        assert!(sh(&format!(
+            "sudo pacman -U --noconfirm {} {}",
+            pkg("lib", 3),
+            pkg("dep", 1)
+        )));
+        let c = changes_since(&paths.log, m);
+        assert!(!undo(&c), "the old version has to go back first");
+        assert_eq!(version("reeve-t-dep"), None);
+        assert_eq!(version("reeve-t-lib").as_deref(), Some("2-1"));
+        assert!(sh("sudo pacman -R --noconfirm reeve-t-lib"));
+
+        // 6. The AUR, through the helper, without a prompt; undo removes it.
         if let Distro::Arch { aur: Some(h) } = &d {
             let text = pkgbuild(h, "pipes.sh").unwrap();
             assert!(text.contains("pkgname=pipes.sh"), "{text}");

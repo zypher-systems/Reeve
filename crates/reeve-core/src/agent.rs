@@ -765,9 +765,7 @@ impl Agent {
                     // pacman (and the AUR helpers, which sudo on their own) counts
                     // as root; with snap-pac it takes the pair itself.
                     let pacman = matches!(self.tools.distro, crate::distro::Distro::Arch { .. })
-                        && plan
-                            .command()
-                            .is_some_and(|c| crate::snapshots::runs_pacman(&c));
+                        && plan.assessment.pacman;
                     let snap = if (plan.assessment.sudo || pacman)
                         && a.tier >= Tier::T2
                         && self.cfg.snapshots.enabled
