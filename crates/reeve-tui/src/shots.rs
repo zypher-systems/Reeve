@@ -117,6 +117,112 @@ fn html_at(v: &View, t: &Theme, title: &str, w: u16, h: u16) -> String {
     )
 }
 
+/// pipes.sh's PKGBUILD from the AUR, for the AUR card.
+const AUR_PIPES_PKGBUILD: &str = r##"
+
+# pipes.sh
+
+# Maintainer: Stefans Mezulis <stefans.mezulis@gmail.com>
+pkgname=pipes.sh
+pkgver=1.3.0
+pkgrel=1
+pkgdesc='Animated pipes terminal screensaver'
+arch=('any')
+url='https://github.com/pipeseroni/pipes.sh'
+license=('MIT')
+groups=()
+depends=('bash>=4.0.0')
+makedepends=()
+optdepends=()
+provides=()
+conflicts=()
+replaces=()
+backup=()
+options=()
+install=
+changelog=
+source=("https://github.com/pipeseroni/$pkgname/archive/v$pkgver.tar.gz")
+noextract=()
+sha256sums=('532976dd8dc2d98330c45a8bcb6d7dc19e0b0e30bba8872dcce352361655a426')
+
+package() {
+  cd "$pkgname-$pkgver"
+
+  make DESTDIR="$pkgdir/" PREFIX=/usr install
+
+  install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname" LICENSE
+  install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname" README.rst
+}
+"##;
+
+/// Omarchy's Tokyo Night `colors.toml`, as it ships.
+const OMARCHY_TOKYO_NIGHT: &str = r##"mode = "dark"
+
+accent = "#7aa2f7"
+selection = "#292e42"
+muted = "#414868"
+
+background = "#1a1b26"
+dark_background = "#13141c"
+darker_background = "#0e0e14"
+lighter_background = "#24283b"
+
+foreground = "#a9b1d6"
+dark_foreground = "#565f89"
+light_foreground = "#b4bee6"
+bright_foreground = "#c0caf5"
+
+red = "#f7768e"
+yellow = "#e0af68"
+orange = "#eb927b"
+green = "#9ece6a"
+cyan = "#449dab"
+blue = "#7aa2f7"
+magenta = "#ad8ee6"
+brown = "#75493d"
+
+bright_red = "#ff7a93"
+bright_yellow = "#ff9e64"
+bright_green = "#b9f27c"
+bright_cyan = "#0db9d7"
+bright_blue = "#7da6ff"
+bright_magenta = "#bb9af7"
+"##;
+
+/// Omarchy's Catppuccin Latte `colors.toml`, as it ships.
+const OMARCHY_LATTE: &str = r##"mode = "light"
+
+accent = "#1e66f5"
+selection = "#ccd0da"
+muted = "#acb0be"
+
+background = "#eff1f5"
+dark_background = "#e3e4e8"
+darker_background = "#d7d8dc"
+lighter_background = "#dce0e8"
+
+foreground = "#4c4f69"
+dark_foreground = "#9ca0b0"
+light_foreground = "#5c5f77"
+bright_foreground = "#4c4f69"
+
+red = "#d20f39"
+yellow = "#df8e1d"
+orange = "#d84e2b"
+green = "#40a02b"
+cyan = "#179299"
+blue = "#1e66f5"
+magenta = "#ea76cb"
+brown = "#6c2715"
+
+bright_red = "#d20f39"
+bright_yellow = "#df8e1d"
+bright_green = "#40a02b"
+bright_cyan = "#179299"
+bright_blue = "#1e66f5"
+bright_magenta = "#ea76cb"
+"##;
+
 fn host() -> HostInfo {
     HostInfo {
         hostname: "Nexus".into(),
@@ -394,6 +500,46 @@ fn shots() {
     ));
     write(&dir, "0-board-update", html(&v, &t, "board, update out"));
     v.update = None;
+
+    // On Omarchy (theme "auto"): the same board in two of its themes.
+    for (name, colors) in [
+        ("0c-board-tokyo-night", OMARCHY_TOKYO_NIGHT),
+        ("0d-board-catppuccin-latte", OMARCHY_LATTE),
+    ] {
+        let t = Theme::from_palette(&crate::theme::Palette::parse(colors)).unwrap();
+        write(&dir, name, html(&v, &t, name));
+    }
+
+    // An AUR install on Arch: the PKGBUILD on the card, asked every time.
+    let mut aur = ledger();
+    aur.chat = true;
+    aur.approval = Some(crate::view::Pending {
+        req: reeve_core::agent::ApprovalRequest {
+            tool: "pkg_install".into(),
+            summary: "yay -S --needed --noconfirm --answerclean None --answerdiff None --answeredit None pipes.sh".into(),
+            tier: Tier::T2,
+            reasons: vec![
+                "changes installed packages".into(),
+                "may build from the AUR (user-submitted PKGBUILDs Arch doesn't review)".into(),
+            ],
+            sudo: false,
+            why: Some("you asked for the pipes screensaver".into()),
+            preview: None,
+            undoable: true,
+            can_allow_session: false,
+            session_scope: None,
+            can_allow_turn: false,
+            command: None,
+            paths: vec![],
+            txn: None,
+            details: reeve_core::pacman::aur_details(
+                &[("pipes.sh".into(), AUR_PIPES_PKGBUILD.into())],
+                "yay",
+            ),
+        },
+        typed: String::new(),
+    });
+    write(&dir, "5-aur-card", html_at(&aur, &t, "aur card", 120, 60));
 
     // The chat, the approval asking there.
     v.chat = true;

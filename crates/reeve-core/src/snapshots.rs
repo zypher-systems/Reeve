@@ -4,6 +4,10 @@
 //!
 //! Only when snapper has a config for `/`. Reeve never creates one without
 //! being asked.
+//!
+//! On Arch with snap-pac, pacman already takes a pair around every
+//! transaction, so Reeve doesn't add its own around pacman: it records the
+//! pair snap-pac took.
 
 use serde::{Deserialize, Serialize};
 
@@ -70,9 +74,128 @@ pub async fn post(ctx: &ToolCtx, config: &str, pre: u64, desc: &str) -> Option<u
     exec(ctx, &cmd, true).await?.trim().parse().ok()
 }
 
+/// Whether a command runs pacman, or an AUR helper (which runs pacman).
+pub fn runs_pacman(command: &str) -> bool {
+    command
+        .split(|c: char| c.is_whitespace() || ";&|()`".contains(c))
+        .any(|w| matches!(w.rsplit('/').next().unwrap_or(w), "pacman" | "paru" | "yay"))
+}
+
+/// snap-pac is installed and its hooks aren't masked in `/etc/pacman.d/hooks`.
+pub fn snap_pac() -> bool {
+    snap_pac_in(
+        std::path::Path::new("/usr/share/libalpm/hooks"),
+        std::path::Path::new("/etc/pacman.d/hooks"),
+    )
+}
+
+fn snap_pac_in(hooks: &std::path::Path, overrides: &std::path::Path) -> bool {
+    let masked = |name: &std::ffi::OsStr| {
+        std::fs::read_link(overrides.join(name))
+            .is_ok_and(|t| t == std::path::Path::new("/dev/null"))
+    };
+    std::fs::read_dir(hooks).is_ok_and(|rd| {
+        rd.flatten().any(|e| {
+            let n = e.file_name();
+            n.to_string_lossy().contains("snap-pac") && !masked(&n)
+        })
+    })
+}
+
+/// The newest snapshot number in `config`, so snap-pac's new pair can be
+/// told apart afterwards.
+pub async fn newest(ctx: &ToolCtx, config: &str) -> Option<u64> {
+    let cmd = format!(
+        "sudo snapper -c {} --csvout list --columns number",
+        crate::distro::quote(config)
+    );
+    let out = exec(ctx, &cmd, true).await?;
+    out.lines()
+        .skip(1)
+        .filter_map(|l| l.trim().parse().ok())
+        .max()
+}
+
+/// The pre/post pair snap-pac took after snapshot `after`: the first, when
+/// the command ran pacman more than once.
+pub async fn snap_pac_pair(ctx: &ToolCtx, config: &str, after: u64) -> Option<SnapPair> {
+    let cmd = format!(
+        "sudo snapper -c {} --csvout list --columns number,type,pre-number",
+        crate::distro::quote(config)
+    );
+    let out = exec(ctx, &cmd, true).await?;
+    parse_pair(&out, after).map(|(pre, post)| SnapPair {
+        config: config.to_string(),
+        pre,
+        post,
+    })
+}
+
+fn parse_pair(csv: &str, after: u64) -> Option<(u64, Option<u64>)> {
+    let rows: Vec<(u64, String, Option<u64>)> = csv
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let mut f = l.split(',');
+            let n = f.next()?.trim().parse().ok()?;
+            let kind = f.next()?.trim().to_string();
+            let pre = f.next().and_then(|x| x.trim().parse().ok());
+            Some((n, kind, pre))
+        })
+        .collect();
+    let pre = rows
+        .iter()
+        .filter(|(n, kind, _)| *n > after && kind == "pre")
+        .map(|(n, ..)| *n)
+        .min()?;
+    let post = rows
+        .iter()
+        .find(|(_, kind, p)| kind == "post" && *p == Some(pre))
+        .map(|(n, ..)| *n);
+    Some((pre, post))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pacman_and_its_helpers_are_spotted() {
+        for c in [
+            "sudo pacman -S --needed --noconfirm htop",
+            "paru -S --noconfirm foo",
+            "true && /usr/bin/yay -Syu",
+        ] {
+            assert!(runs_pacman(c), "{c}");
+        }
+        for c in ["pacmanager --help", "echo pacman-contrib", "dnf install x"] {
+            assert!(!runs_pacman(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn snap_pacs_pair_is_found_after_the_mark() {
+        let csv = "number,type,pre-number\n0,single,\n40,pre,\n41,post,40\n42,pre,\n43,post,42\n44,pre,\n45,post,44\n";
+        assert_eq!(parse_pair(csv, 41), Some((42, Some(43))));
+        assert_eq!(parse_pair(csv, 45), None);
+        assert_eq!(
+            parse_pair("number,type,pre-number\n50,pre,\n", 45),
+            Some((50, None))
+        );
+    }
+
+    #[test]
+    fn a_masked_snap_pac_hook_doesnt_count() {
+        let d = tempfile::tempdir().unwrap();
+        let (hooks, over) = (d.path().join("hooks"), d.path().join("over"));
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::create_dir_all(&over).unwrap();
+        assert!(!snap_pac_in(&hooks, &over));
+        std::fs::write(hooks.join("05-snap-pac-pre.hook"), "").unwrap();
+        assert!(snap_pac_in(&hooks, &over));
+        std::os::unix::fs::symlink("/dev/null", over.join("05-snap-pac-pre.hook")).unwrap();
+        assert!(!snap_pac_in(&hooks, &over));
+    }
 
     #[test]
     fn finds_the_root_config() {

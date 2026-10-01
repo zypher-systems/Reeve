@@ -3,6 +3,11 @@
 //! red for what's verified, what needs you, and what failed. **Ink** (warm
 //! charcoal, the ledger's) and **Brass** (deep navy, the original) remain.
 //! Everything degrades to 256, 16, or no color.
+//!
+//! On Omarchy, `auto` (the default) follows Omarchy's current theme: its
+//! `colors.toml`, re-read while Reeve runs, so `omarchy-theme-set` recolors
+//! Reeve too. Custom themes in `~/.reeve/themes/<name>.toml` use the same
+//! keys, so any Omarchy theme's `colors.toml` can be copied in as it is.
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -214,15 +219,50 @@ impl Theme {
         }
     }
 
-    /// By name, reduced for the terminal.
+    /// A built-in theme by name, reduced for the terminal. Anything else
+    /// (`auto` off Omarchy, a custom theme that isn't there) is Slate.
     pub fn named(name: &str, mode: ColorMode) -> Self {
-        // Custom themes from ~/.reeve/themes/ arrive with M6's theme import.
         match name {
             "brass" => Self::brass(),
             "ink" => Self::ink(),
             _ => Self::slate(),
         }
         .degrade(mode)
+    }
+
+    /// From an Omarchy `colors.toml` palette. Needs at least `background` and
+    /// `foreground`; anything else missing is mixed from those two.
+    pub fn from_palette(p: &Palette) -> Option<Self> {
+        let bg = p.get("background")?;
+        let fg = p.get("foreground")?;
+        let accent = p.get("accent").or(p.get("blue")).unwrap_or(fg);
+        let either = |a: &str, b: &str, fallback: Color| p.get(a).or(p.get(b)).unwrap_or(fallback);
+        let inset = either("dark_background", "darker_background", blend(bg, fg, 0.03));
+        Some(Self {
+            mode: ColorMode::TrueColor,
+            bg,
+            panel: p.get("lighter_background").unwrap_or(blend(bg, fg, 0.06)),
+            input: p.get("selection").unwrap_or(blend(bg, fg, 0.12)),
+            inset,
+            border: p.get("muted").unwrap_or(blend(bg, fg, 0.2)),
+            border_hot: accent,
+            fg,
+            dim: blend(fg, bg, 0.3),
+            faint: p.get("dark_foreground").unwrap_or(blend(fg, bg, 0.55)),
+            brass: accent,
+            amber: p.get("yellow").unwrap_or(accent),
+            copper: either("orange", "bright_yellow", accent),
+            teal: p.get("cyan").unwrap_or(accent),
+            violet: p.get("magenta").unwrap_or(accent),
+            user: p.get("bright_foreground").unwrap_or(fg),
+            good: p.get("green").unwrap_or(fg),
+            warn: p.get("yellow").unwrap_or(fg),
+            bad: p.get("red").unwrap_or(fg),
+            code: either("bright_cyan", "cyan", accent),
+            code_bg: inset,
+            add_bg: blend(bg, p.get("green").unwrap_or(fg), 0.16),
+            del_bg: blend(bg, p.get("red").unwrap_or(fg), 0.16),
+        })
     }
 
     /// Reduce to what the terminal can show.
@@ -363,6 +403,133 @@ impl Theme {
     }
 }
 
+/// Where the theme comes from, re-read while Reeve runs so a change
+/// (`omarchy-theme-set`, an edited theme file) shows without a restart.
+#[derive(Debug, Clone)]
+pub struct ThemeSource {
+    name: String,
+    mode: ColorMode,
+    /// The colors files to try, in order; none for a built-in theme.
+    files: Vec<std::path::PathBuf>,
+    /// The text last used (`None` inside: no file, built-in).
+    last: Option<Option<String>>,
+}
+
+impl ThemeSource {
+    /// `name` is `[ui] theme`: `auto` or `omarchy` (Omarchy's current theme),
+    /// `slate`, `ink`, `brass`, or a custom theme in `reeve_home/themes`.
+    /// `home` is the person's home, where Omarchy keeps its state.
+    pub fn new(
+        name: &str,
+        mode: ColorMode,
+        reeve_home: &std::path::Path,
+        home: Option<&std::path::Path>,
+    ) -> Self {
+        let files = match name {
+            "auto" | "omarchy" => home
+                .map(|h| {
+                    vec![
+                        // Omarchy 4, then earlier releases.
+                        h.join(".local/state/omarchy/current/theme/colors.toml"),
+                        h.join(".config/omarchy/current/theme/colors.toml"),
+                    ]
+                })
+                .unwrap_or_default(),
+            "" | "slate" | "ink" | "brass" => Vec::new(),
+            custom => vec![reeve_home.join("themes").join(format!("{custom}.toml"))],
+        };
+        Self {
+            name: name.to_string(),
+            mode,
+            files,
+            last: None,
+        }
+    }
+
+    /// The theme, when it changed since the last call (the first call always
+    /// gives one).
+    pub fn changed(&mut self) -> Option<Theme> {
+        let text = self
+            .files
+            .iter()
+            .find_map(|f| std::fs::read_to_string(f).ok());
+        if self.last.as_ref() == Some(&text) {
+            return None;
+        }
+        let theme = text
+            .as_deref()
+            .map(Palette::parse)
+            .as_ref()
+            .and_then(Theme::from_palette)
+            .map_or_else(
+                || Theme::named(&self.name, self.mode),
+                |t| t.degrade(self.mode),
+            );
+        self.last = Some(text);
+        Some(theme)
+    }
+}
+
+/// Two colors blended at `t` (0–1), at full color.
+fn blend(a: Color, b: Color, t: f32) -> Color {
+    match (a, b) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let l = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+            Color::Rgb(l(r1, r2), l(g1, g2), l(b1, b2))
+        }
+        _ if t < 0.5 => a,
+        _ => b,
+    }
+}
+
+/// A theme's named colors: Omarchy's `colors.toml`, which custom themes use
+/// too. `key = "#rrggbb"` lines; everything else is ignored.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Palette {
+    colors: std::collections::BTreeMap<String, Color>,
+}
+
+impl Palette {
+    /// Read `colors.toml`.
+    pub fn parse(text: &str) -> Self {
+        let mut colors = std::collections::BTreeMap::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            // A quoted value, maybe followed by a comment.
+            let Some(value) = v
+                .trim()
+                .strip_prefix('"')
+                .and_then(|r| r.split_once('"'))
+                .map(|(val, _)| val)
+            else {
+                continue;
+            };
+            if let Some(c) = hex_color(value) {
+                colors.insert(k.trim().to_string(), c);
+            }
+        }
+        Self { colors }
+    }
+
+    /// One color by its key.
+    pub fn get(&self, key: &str) -> Option<Color> {
+        self.colors.get(key).copied()
+    }
+}
+
+fn hex_color(v: &str) -> Option<Color> {
+    let h = v.trim().trim_matches('"').strip_prefix('#')?;
+    (h.len() == 6 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| u32::from_str_radix(h, 16).ok().map(rgb))
+        .flatten()
+}
+
 fn rgb(hex: u32) -> Color {
     Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }
@@ -421,6 +588,98 @@ mod tests {
         let xterm = |k: &str| (k == "TERM").then(|| "xterm-256color".to_string());
         assert_eq!(ColorMode::detect("auto", xterm), ColorMode::Ansi256);
         assert_eq!(ColorMode::detect("16", tc), ColorMode::Ansi16);
+    }
+
+    const TOKYO_NIGHT: &str = r##"mode = "dark"
+
+accent = "#7aa2f7"
+selection = "#292e42"
+muted = "#414868"
+
+background = "#1a1b26"
+dark_background = "#13141c"
+lighter_background = "#24283b"
+
+foreground = "#a9b1d6"   # a comment after a value
+dark_foreground = "#565f89"
+bright_foreground = "#c0caf5"
+
+red = "#f7768e"
+yellow = "#e0af68"
+orange = "#eb927b"
+green = "#9ece6a"
+cyan = "#449dab"
+magenta = "#ad8ee6"
+bright_cyan = "#0db9d7"
+"##;
+
+    const LATTE: &str = r##"mode = "light"
+accent = "#1e66f5"
+background = "#eff1f5"
+foreground = "#4c4f69"
+red = "#d20f39"
+green = "#40a02b"
+"##;
+
+    #[test]
+    fn an_omarchy_palette_becomes_a_theme() {
+        let p = Palette::parse(TOKYO_NIGHT);
+        assert_eq!(p.get("foreground"), Some(rgb(0xa9b1d6)));
+        assert_eq!(p.get("mode"), None, "not a color");
+        let t = Theme::from_palette(&p).unwrap();
+        assert_eq!(
+            (t.bg, t.fg, t.brass),
+            (rgb(0x1a1b26), rgb(0xa9b1d6), rgb(0x7aa2f7))
+        );
+        assert_eq!(
+            (t.panel, t.input, t.border),
+            (rgb(0x24283b), rgb(0x292e42), rgb(0x414868))
+        );
+        assert_eq!(
+            (t.good, t.warn, t.bad, t.copper),
+            (rgb(0x9ece6a), rgb(0xe0af68), rgb(0xf7768e), rgb(0xeb927b))
+        );
+        assert_eq!(t.code, rgb(0x0db9d7));
+
+        // A light theme with only a few keys: the rest is mixed, light.
+        let l = Theme::from_palette(&Palette::parse(LATTE)).unwrap();
+        assert_eq!(
+            (l.bg, l.fg, l.good),
+            (rgb(0xeff1f5), rgb(0x4c4f69), rgb(0x40a02b))
+        );
+        let Color::Rgb(r, ..) = l.panel else { panic!() };
+        assert!(r > 0xd0, "the panel stays light: {:?}", l.panel);
+
+        assert!(Theme::from_palette(&Palette::parse("accent = \"#ffffff\"")).is_none());
+    }
+
+    #[test]
+    fn the_source_follows_omarchy_and_custom_themes() {
+        let d = tempfile::tempdir().unwrap();
+        let (home, reeve) = (d.path().join("home"), d.path().join("reeve"));
+        let mut auto = ThemeSource::new("auto", ColorMode::TrueColor, &reeve, Some(&home));
+        assert_eq!(auto.changed(), Some(Theme::slate()), "not Omarchy: slate");
+        assert_eq!(auto.changed(), None);
+        let cur = home.join(".local/state/omarchy/current/theme");
+        std::fs::create_dir_all(&cur).unwrap();
+        std::fs::write(cur.join("colors.toml"), TOKYO_NIGHT).unwrap();
+        assert_eq!(
+            auto.changed().unwrap().bg,
+            rgb(0x1a1b26),
+            "omarchy-theme-set"
+        );
+        assert_eq!(auto.changed(), None);
+        std::fs::write(cur.join("colors.toml"), LATTE).unwrap();
+        assert_eq!(auto.changed().unwrap().bg, rgb(0xeff1f5));
+
+        let mut custom = ThemeSource::new("tokyo", ColorMode::TrueColor, &reeve, Some(&home));
+        assert_eq!(custom.changed(), Some(Theme::slate()), "no file yet: slate");
+        std::fs::create_dir_all(reeve.join("themes")).unwrap();
+        std::fs::write(reeve.join("themes/tokyo.toml"), TOKYO_NIGHT).unwrap();
+        assert_eq!(custom.changed().unwrap().fg, rgb(0xa9b1d6));
+
+        let mut ink = ThemeSource::new("ink", ColorMode::Ansi16, &reeve, Some(&home));
+        assert_eq!(ink.changed(), Some(Theme::named("ink", ColorMode::Ansi16)));
     }
 
     #[test]

@@ -751,23 +751,43 @@ impl Agent {
                         draft.txn = self.txn.as_ref().map(|t| t.id.clone());
                     }
                     // Root changes get a snapper pair when snapper covers `/`.
-                    let snap =
-                        if plan.assessment.sudo && a.tier >= Tier::T2 && self.cfg.snapshots.enabled
-                        {
-                            match crate::snapshots::root_config(&self.tools).await {
-                                Some(c) => crate::snapshots::pre(&self.tools, &c, &plan.summary)
-                                    .await
-                                    .map(|n| (c, n)),
-                                None => None,
+                    // pacman (and the AUR helpers, which sudo on their own) counts
+                    // as root; with snap-pac it takes the pair itself.
+                    let pacman = matches!(self.tools.distro, crate::distro::Distro::Arch { .. })
+                        && plan
+                            .command()
+                            .is_some_and(|c| crate::snapshots::runs_pacman(&c));
+                    let snap = if (plan.assessment.sudo || pacman)
+                        && a.tier >= Tier::T2
+                        && self.cfg.snapshots.enabled
+                    {
+                        match crate::snapshots::root_config(&self.tools).await {
+                            Some(c) if pacman && crate::snapshots::snap_pac() => {
+                                let mark =
+                                    crate::snapshots::newest(&self.tools, &c).await.unwrap_or(0);
+                                Some(Snap::SnapPac(c, mark))
                             }
-                        } else {
-                            None
-                        };
+                            Some(c) => crate::snapshots::pre(&self.tools, &c, &plan.summary)
+                                .await
+                                .map(|n| Snap::Own(c, n)),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
                     let ex = tools::execute(&self.tools, &plan).await;
-                    if let Some((config, pre)) = snap {
-                        let post =
-                            crate::snapshots::post(&self.tools, &config, pre, &plan.summary).await;
-                        draft.snapshot = Some(crate::snapshots::SnapPair { config, pre, post });
+                    match snap {
+                        Some(Snap::Own(config, pre)) => {
+                            let post =
+                                crate::snapshots::post(&self.tools, &config, pre, &plan.summary)
+                                    .await;
+                            draft.snapshot = Some(crate::snapshots::SnapPair { config, pre, post });
+                        }
+                        Some(Snap::SnapPac(config, mark)) => {
+                            draft.snapshot =
+                                crate::snapshots::snap_pac_pair(&self.tools, &config, mark).await;
+                        }
+                        None => {}
                     }
                     draft.outcome = ex.outcome;
                     draft.undo = ex.undo;
@@ -1340,6 +1360,14 @@ words: it takes effect once they confirm it. Never store secrets.\n\n\
 Machine:\n{machine_profile}\n\n\
 {memory}"
     )
+}
+
+/// The snapshots around one root action.
+enum Snap {
+    /// Reeve's own pre snapshot (config, number); the post follows.
+    Own(String, u64),
+    /// snap-pac takes the pair; this is the newest number before it.
+    SnapPac(String, u64),
 }
 
 #[cfg(test)]

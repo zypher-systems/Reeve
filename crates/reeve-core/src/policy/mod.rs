@@ -164,6 +164,7 @@ impl Assessment {
         }
         self.unkeyed |= other.unkeyed;
         self.quiet_write |= other.quiet_write;
+        self.owner_only |= other.owner_only;
         self.tier = self.tier.max(other.tier);
         self.sudo |= other.sudo;
         if self.deny.is_none() {

@@ -238,7 +238,9 @@ Each receipt has four parts:
 4. **Snapshots.** On btrfs with snapper, a T2 action is wrapped in a `snapper create --type pre/post`
    pair, described `reeve #<seq>: <why>`. Several T2 actions within one approved plan share a
    single pair. If snapper isn't configured, Reeve offers to set up a root config once. It never
-   does so silently.
+   does so silently. On Arch with snap-pac, pacman already takes a pair around every transaction,
+   so Reeve adds none around a pacman command (or an AUR helper's) and records snap-pac's pair on
+   the receipt instead.
 
 ### 6.1 Verified changes
 
@@ -436,8 +438,20 @@ trait Distro {
 - **Fedora first:** `dnf5` with `dnf history undo`, `flatpak`, SELinux awareness (`restorecon`
   after writes into labeled paths, and `ausearch` in diagnoses).
 - **Atomic variants** (Silverblue, Kinoite) are detected, and package tools refuse with a clear message in v1.
-- **Arch next:** `pacman`, AUR helper detection (`paru`/`yay`), the `snap-pac` snapper integration, and
-  Omarchy theme detection.
+- **Arch:** `pacman`, with undo from its log and cache: Reeve records what its command changed as
+  pacman logged it (`/var/log/pacman.log`: installed, upgraded, downgraded, removed, with versions),
+  and undo puts the old versions back from the package cache with `pacman -U`, then removes what was
+  new with `pacman -R`. A version the cache lost is named and the undo refused, never half done.
+  - **The AUR**, through `paru` or `yay`: a package the repos can't satisfy (by name, group, or
+    something a repo package provides) is built with the helper, asking nothing, through Reeve's
+    askpass. Its PKGBUILD is on the approval card, and the yes is the owner's every time
+    (`owner_only`): YOLO and session yeses never cover it, and unattended runs refuse it. A raw
+    `paru -S` or `yay` through `shell` is owner-only too.
+  - **Upgrades:** an empty `pkg_upgrade` is `pacman -Syu`, repos only. AUR updates are listed with
+    `aur:` and rebuilt by name, each on its own card.
+  - **snap-pac** (§6) and **reeved**: a reboot is pending when the running kernel's modules are gone
+    from `/usr/lib/modules`; security updates come from `arch-audit -u` when it's installed.
+  - **Omarchy:** the theme follows Omarchy's (§11).
 
 ---
 
@@ -482,10 +496,15 @@ trait Distro {
   T1/T2 steps until `change_commit`, never T3, recorded as `change-rule`. The checks and rollback still
   guard the whole change. Outside a change, `a` is "allow this exact action for the session" (T1).
 
-**Themes:** the default **ink** is warm charcoal, with ochre for what needs you, moss for what's
-verified, and vermilion for what failed. **brass** (deep navy, brass and amber) is the original.
-Everything degrades to 256, 16, or mono colors, with `NO_COLOR` respected. Custom themes from
-`~/.reeve/themes/` come later.
+**Themes:** the default is `auto`. On Omarchy it's Omarchy's current theme, read from its
+`colors.toml` (`~/.local/state/omarchy/current/theme/`, or `~/.config/omarchy/current/theme/` before
+Omarchy 4) and re-read every second, so `omarchy-theme-set` recolors Reeve too; elsewhere it's
+**slate**. Omarchy's keys map onto Reeve's roles: `background`, `lighter_background` (tiles),
+`selection` (raised), `muted` (borders), `accent` (Reeve and the focus), `foreground`, `green`,
+`yellow`, `red`, `orange`, `cyan`, `magenta`; anything missing is mixed from the background and
+foreground, so light themes work. A custom theme is `~/.reeve/themes/<name>.toml` with the same keys.
+**ink** is warm charcoal and **brass** (deep navy, brass and amber) the original. Everything degrades
+to 256, 16, or mono colors, with `NO_COLOR` respected.
 
 **Looking at it without a terminal:** `REEVE_SHOTS=<dir> cargo test -p reeve-tui shots -- --ignored`
 renders each screen to colored HTML (with `REEVE_SHOTS_HOME`, from a real Reeve home, read-only).
@@ -526,7 +545,7 @@ $XDG_RUNTIME_DIR/reeve/  # reeved.sock, askpass-<pid>.sock
 | **M3** ✓ | Memory | Four layers, memory tools, machine profile in the prompt, the reflect step, the Memory view. |
 | **M4** ✓ | Observer | `reeved` with samplers, journal, detectors, baselines, notifications, and the Findings inbox with proposals. |
 | **M5** ✓ | Standing orders | Scheduler, scoped autonomous runs, day and month budgets enforced across TUI and daemon. |
-| **M6** | Arch | pacman/AUR, snap-pac, Omarchy theme import. |
+| **M6** ✓ | Arch | pacman undo from its log and cache, the AUR with the PKGBUILD on the card, snap-pac, Arch checks in reeved, Omarchy themes. |
 
 ---
 
@@ -539,8 +558,9 @@ today; an open one is not, or not yet proven.
 **It runs where it says it does**
 
 - [ ] **Arch is as solid as Fedora.** M6: install, remove, upgrade, and undo through pacman (and
-  the AUR helper when there is one), snap-pac snapshots, and Omarchy theme import. Today:
-  detection, search, info, and listing work.
+  the AUR helper when there is one), snap-pac snapshots, and Omarchy theme import. Today: all
+  built, and pacman, its undo, and yay pass a live test on Arch (in a container). Not yet proven
+  on a real machine: paru, snap-pac, and the Omarchy theme following a running Omarchy.
 - [ ] **It installs as a package.** Published Fedora (COPR) and Arch (AUR) packages ship `reeve`
   and `reeved.service`, and `reeve daemon install` uses the packaged unit. Today: the spec and
   PKGBUILDs are in `packaging/`, and installs go through `install.sh`.

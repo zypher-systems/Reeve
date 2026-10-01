@@ -97,6 +97,7 @@ impl Distro {
     pub fn search(&self, q: &str) -> String {
         match self {
             Self::Fedora { dnf, .. } => format!("{dnf} -q search {}", quote(q)),
+            Self::Arch { aur: Some(h) } => format!("{h} -Ss {}", quote(q)),
             Self::Arch { .. } => format!("pacman -Ss {}", quote(q)),
             Self::Other(_) => String::new(),
         }
@@ -106,6 +107,10 @@ impl Distro {
     pub fn info(&self, name: &str) -> String {
         match self {
             Self::Fedora { dnf, .. } => format!("{dnf} -q info {}", quote(name)),
+            Self::Arch { aur: Some(h) } => format!(
+                "pacman -Qi {n} 2>/dev/null || pacman -Si {n} 2>/dev/null || {h} -Si {n}",
+                n = quote(name)
+            ),
             Self::Arch { .. } => format!(
                 "pacman -Qi {n} 2>/dev/null || pacman -Si {n}",
                 n = quote(name)
@@ -128,6 +133,10 @@ impl Distro {
             (Self::Fedora { .. }, _) => {
                 "rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE} %{SIZE}\\n' | sort".into()
             }
+            // AUR updates are listed apart: each is upgraded on its own card.
+            (Self::Arch { aur: Some(h) }, "updates") => format!(
+                "(checkupdates 2>/dev/null || pacman -Qu); {h} -Qua 2>/dev/null | sed 's/^/aur: /'; true"
+            ),
             (Self::Arch { .. }, "updates") => "checkupdates 2>/dev/null || pacman -Qu; true".into(),
             (Self::Arch { .. }, "user") => "pacman -Qe".into(),
             (Self::Arch { .. }, "leaves") => "pacman -Qdtq; true".into(),
@@ -167,6 +176,21 @@ impl Distro {
         }
     }
 
+    /// Build and install AUR packages with the helper, asking nothing (the
+    /// owner already read the PKGBUILDs on the card). The helper runs as
+    /// you and calls sudo itself, which reaches Reeve's askpass.
+    pub fn aur_install(&self, pkgs: &[String]) -> Option<String> {
+        let Self::Arch { aur: Some(h) } = self else {
+            return None;
+        };
+        let flags = if h == "paru" {
+            "--needed --noconfirm --skipreview"
+        } else {
+            "--needed --noconfirm --answerclean None --answerdiff None --answeredit None"
+        };
+        Some(format!("{h} -S {flags} {}", quote_all(pkgs)))
+    }
+
     /// Recent package transactions.
     pub fn history(&self, limit: usize) -> String {
         match self {
@@ -176,6 +200,12 @@ impl Distro {
             ),
             Self::Other(_) => String::new(),
         }
+    }
+
+    /// Package changes can be undone: dnf by transaction id, pacman from
+    /// its log and cache (`crate::pacman`).
+    pub fn can_undo_packages(&self) -> bool {
+        matches!(self, Self::Fedora { .. } | Self::Arch { .. })
     }
 
     /// The newest transaction id (for undo), as a command whose stdout is the id.

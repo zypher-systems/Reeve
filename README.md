@@ -99,10 +99,18 @@ sudo and nowhere else: not to the model, a log, or a receipt. You can let Reeve 
 - Root-owned files are changed in place by `sudo reeve root`, so owner, mode, and SELinux label are kept.
   Undo copies go to `/var/lib/reeve/undo` (root-only). Edits to `/etc/sudoers*` and `/etc/fstab` must pass
   `visudo -c` / `findmnt --verify` first.
-- Package changes record their dnf transaction, so undo runs `dnf history undo`. Service changes record
-  the unit's previous state.
+- Package changes can be undone. On Fedora the receipt records the dnf transaction, and undo runs
+  `dnf history undo`. On Arch it records what pacman logged (installed, upgraded, removed, with versions),
+  and undo puts the old versions back from pacman's cache, then removes what was new. If the cache was
+  cleaned, undo says which version is missing and changes nothing. Service changes record the unit's
+  previous state.
+- On Arch, a package the repos don't have is built from the AUR with paru or yay. The approval card shows
+  its PKGBUILD, and you're asked every time: YOLO and session yeses never cover it, and standing orders
+  can't do it. A system upgrade (`pacman -Syu`) leaves AUR packages alone; they're listed with `aur:` and
+  upgraded by name.
 - With snapper configured for `/`, each root action is wrapped in a pre/post snapshot pair. The receipt holds
-  the numbers for `snapper undochange`. Reeve won't create a snapper config unless you ask.
+  the numbers for `snapper undochange`. With snap-pac, pacman takes that pair itself, and the receipt
+  records snap-pac's. Reeve won't create a snapper config unless you ask.
 - `reeve undo N` from a terminal asks for sudo there.
 
 ## Memory
@@ -278,9 +286,12 @@ The composer is always at the bottom. On an open tile it knows what's selected: 
 | `^c` | stop, clear, then quit |
 | `ctrl+l` | redraw the screen (if the terminal cleared it: Konsole's ctrl+shift+k does) |
 
-The default theme is **slate** (cool near-black, filled tiles). `[ui] theme = "ink"` is the warm charcoal
-of 0.2.0, and `"brass"` the original navy and brass. With 16 colors or none, tiles get borders instead of
-fills.
+The default theme is `auto`: on Omarchy, Reeve takes Omarchy's current theme and follows
+`omarchy-theme-set` while it runs; elsewhere it's **slate** (cool near-black, filled tiles).
+`[ui] theme = "ink"` is the warm charcoal of 0.2.0, and `"brass"` the original navy and brass. A theme
+of your own goes in `~/.reeve/themes/<name>.toml` with the keys of Omarchy's `colors.toml`
+(`background`, `foreground`, `accent`, `red`, `green`, …), so any Omarchy theme's file works as it is:
+`theme = "<name>"`. With 16 colors or none, tiles get borders instead of fills.
 
 ## Layout
 

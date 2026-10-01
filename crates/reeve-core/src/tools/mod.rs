@@ -246,6 +246,7 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
     };
     let details = match &call {
         Call::Order(p) => order::details(p),
+        Call::Sys(c) => c.details.clone(),
         _ => Vec::new(),
     };
     let mut assessment = assessment;
@@ -372,7 +373,9 @@ pub async fn undo_receipt_by(
     let (target, undo) = book.undo_target(seq)?;
     let root_files = matches!(&undo, Undo::Files { changes } if changes.iter().any(|c| c.root));
     let result = match &undo {
-        Undo::Packages { .. } | Undo::Unit { .. } => sys::revert(ctx, &undo).await,
+        Undo::Packages { .. } | Undo::Pacman { .. } | Undo::Unit { .. } => {
+            sys::revert(ctx, &undo).await
+        }
         _ if root_files => fs::root_revert(ctx, &undo).await,
         _ => ctx.undo.revert(&undo).map_err(|e| e.to_string()),
     };
@@ -475,7 +478,7 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "pkg_search",
-            "Search available packages by name and summary.",
+            "Search available packages by name and summary (on Arch with paru or yay, the AUR too).",
             json!({"query": {"type": "string"}}),
             &["query"],
         ),
@@ -487,13 +490,13 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "pkg_list",
-            "List packages: installed (name, version, size), user (explicitly installed), leaves (nothing depends on them), or updates (pending).",
+            "List packages: installed (name, version, size), user (explicitly installed), leaves (nothing depends on them), or updates (pending; on Arch, AUR updates start with aur:).",
             json!({"which": {"type": "string", "enum": ["installed", "user", "leaves", "updates"]}, "filter": {"type": "string", "description": "Case-insensitive substring"}}),
             &[],
         ),
         spec(
             "pkg_install",
-            "Install packages (needs root). The transaction is recorded so it can be rolled back.",
+            "Install packages (needs root). On Arch, packages the repos don't have are built from the AUR with paru or yay: the owner reads each PKGBUILD on the card and says yes every time. The transaction is recorded so it can be rolled back.",
             json!({"packages": {"type": "array", "items": {"type": "string"}}}),
             &["packages"],
         ),
@@ -505,7 +508,7 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "pkg_upgrade",
-            "Upgrade the named packages, or everything when the list is empty (needs root). Recorded for rollback.",
+            "Upgrade the named packages, or everything when the list is empty (needs root). On Arch an empty list upgrades repo packages only (pacman -Syu); name AUR packages to rebuild them from the AUR. Recorded for rollback.",
             json!({"packages": {"type": "array", "items": {"type": "string"}}}),
             &[],
         ),

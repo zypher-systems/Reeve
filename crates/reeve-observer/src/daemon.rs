@@ -454,10 +454,23 @@ impl Observer {
     async fn slow_checks(&mut self) {
         let now = Utc::now();
         let mut signals = Vec::new();
-        let newest = run("rpm -q kernel-core --last 2>/dev/null | head -n 1 | awk '{print $1}' | sed 's/^kernel-core-//'").await;
         let running = run("uname -r").await;
-        signals.extend(detect::reboot_pending(running.trim(), newest.trim()));
-        let adv = run("command -v dnf5 >/dev/null && timeout 120 dnf5 -q advisory list --security --updates 2>/dev/null | tail -n +2").await;
+        let adv = if matches!(
+            reeve_core::distro::Distro::detect(),
+            reeve_core::distro::Distro::Arch { .. }
+        ) {
+            let present = run("test -d \"/usr/lib/modules/$(uname -r)\" && echo yes").await;
+            signals.extend(detect::kernel_replaced(
+                running.trim(),
+                present.trim() == "yes",
+            ));
+            // arch-audit (when installed) knows the advisories with a fix out.
+            run("command -v arch-audit >/dev/null && timeout 120 arch-audit -u 2>/dev/null").await
+        } else {
+            let newest = run("rpm -q kernel-core --last 2>/dev/null | head -n 1 | awk '{print $1}' | sed 's/^kernel-core-//'").await;
+            signals.extend(detect::reboot_pending(running.trim(), newest.trim()));
+            run("command -v dnf5 >/dev/null && timeout 120 dnf5 -q advisory list --security --updates 2>/dev/null | tail -n +2").await
+        };
         let lines: Vec<String> = adv
             .lines()
             .filter(|l| !l.trim().is_empty())

@@ -2,6 +2,29 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-30: Arch (M6): pacman undo from its log, the AUR on the owner's word, Omarchy's theme
+- **Decision:**
+  - pacman has no transaction ids, so a package action records what pacman logged after the log's size before it (`Undo::Pacman`: name, action, versions). Undo restores the old versions from the package cache (`pacman -U`), then removes what was new (`pacman -R`). A version the cache lost is named and the undo refused before anything runs. A failed command still records what it changed.
+  - A package the repos can't satisfy (`pacman -Sp`: a name, a group, or a provided name) is built from the AUR with paru or yay, with no prompts (`--skipreview`, or yay's `--answer* None`), through Reeve's sudo wrapper. The card shows each PKGBUILD as code (`paru|yay -Gp`, 60 lines, with the rest's command) and names any `install=` script. AUR builds are `owner_only`, through `pkg_install` or a raw `paru`/`yay` in `shell`.
+  - An empty `pkg_upgrade` stays `pacman -Syu`: AUR packages are listed apart (`aur:`) and rebuilt by name.
+  - With snap-pac, Reeve takes no pair around a pacman command and records snap-pac's instead.
+  - reeved on Arch: a reboot is pending when `/usr/lib/modules/$(uname -r)` is gone; `arch-audit -u` supplies security updates.
+  - `[ui] theme` defaults to `auto`: Omarchy's current `colors.toml`, re-read every second, or Slate off Omarchy. Custom themes use the same file format.
+  - Fixed on the way: `Assessment::merge` dropped `owner_only`, so a compound shell command could lose it.
+- **Chosen vs rejected:**
+  - Rejected rolling back with snapper alone: it needs btrfs and a root config, which many Arch installs don't have, and it rolls back everything else on the disk too.
+  - Rejected `pacman -S <name>` to undo a removal: it installs today's version, not the one removed. The cache has the exact build.
+  - Rejected letting YOLO cover AUR builds: a PKGBUILD runs arbitrary code as you and its package installs as root, and nobody reviewed it. The owner reads it each time.
+  - Rejected `paru -Syu` for system upgrades: it would build every AUR update unattended on one yes.
+  - Rejected a one-time theme import as the default: following Omarchy live is what an Omarchy user expects when they switch themes.
+  - A name pacman resolves through a provider (pfetch → pfetch-rs) stays a repo install: the reviewed package wins over an AUR build.
+- **Why:** M6 makes Arch and Omarchy as safe to hand to Reeve as Fedora: every package change undoable, and nothing from the AUR without the owner reading it.
+- **Where:** `reeve-core/src/pacman.rs`, `distro.rs` (`aur_install`, search/info/updates), `tools/sys.rs` (capture, split, revert), `undo.rs` (`Undo::Pacman`), `snapshots.rs` + `agent.rs` (snap-pac), `policy/shell.rs` and `policy/mod.rs` (`owner_only` for helpers, `merge`), `reeve-observer/src/daemon.rs` + `detect.rs` (`kernel_replaced`), `reeve-tui/src/theme.rs` (`Palette`, `from_palette`, `ThemeSource`), `cards.rs` (code lines)
+- **Residual risks:**
+  - Undo needs the old packages in pacman's cache; `paccache` or `pacman -Sc` can remove them first.
+  - Only `-Gp`'s PKGBUILD is shown: an `install=` script and patches in the AUR repo aren't, though the card names the script.
+  - Tested live on Arch in a container: pacman, its undo, and yay. paru (its prebuilt package lagged pacman's library) and snap-pac (needs btrfs and snapper) are covered by unit tests only, and the Omarchy theme by its real `colors.toml` files and screenshots, not a running Omarchy.
+
 ### 2026-09-30: Reeve checks for releases and updates itself the way it was installed
 - **Decision:**
   - reeved asks GitHub's latest-release endpoint a minute after it starts and every 12 hours (`[updates] check`, on by default). The TUI asks when reeved isn't running and the last answer is over a day old. The answer goes to `observer/update.json`, and drafts and pre-releases never count.

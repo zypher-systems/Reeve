@@ -281,7 +281,9 @@ impl Default for DrafterConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
-    /// `slate` (the default), `ink`, `brass`, or a name from `~/.reeve/themes/<name>.toml`.
+    /// `auto` (the default: Omarchy's current theme on Omarchy, followed live;
+    /// Slate elsewhere), `omarchy`, `slate`, `ink`, `brass`, or a name from
+    /// `~/.reeve/themes/<name>.toml` (Omarchy's `colors.toml` keys).
     pub theme: String,
     /// `auto`, `truecolor`, `256`, or `16`. `NO_COLOR` always wins.
     pub colors: String,
@@ -294,7 +296,7 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            theme: "slate".into(),
+            theme: "auto".into(),
             colors: "auto".into(),
             mouse: true,
             animate: true,
@@ -620,7 +622,7 @@ daily_usd = 2.0
         assert_eq!((name.as_str(), model.as_str()), ("box", "qwen3"));
         assert!(conn.is_local());
         assert!((cfg.spend.daily_usd - 2.0).abs() < 1e-9);
-        assert_eq!(cfg.ui.theme, "slate");
+        assert_eq!(cfg.ui.theme, "auto");
     }
 
     #[test]

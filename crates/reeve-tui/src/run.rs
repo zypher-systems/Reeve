@@ -184,7 +184,15 @@ struct App {
 /// Run the TUI until the user quits.
 pub fn run(cfg: Config, home: PathBuf) -> io::Result<()> {
     let mode = ColorMode::detect(&cfg.ui.colors, |k| std::env::var(k).ok());
-    let theme = Theme::named(&cfg.ui.theme, mode);
+    let mut theme_source = crate::theme::ThemeSource::new(
+        &cfg.ui.theme,
+        mode,
+        &home,
+        reeve_core::update::user_home().as_deref(),
+    );
+    let mut theme = theme_source
+        .changed()
+        .unwrap_or_else(|| Theme::named(&cfg.ui.theme, mode));
     let host = HostInfo::read();
 
     let mut view = View::new(host.clone());
@@ -248,7 +256,14 @@ pub fn run(cfg: Config, home: PathBuf) -> io::Result<()> {
 
     let mouse = app.cfg.ui.mouse;
     let mut term = setup(mouse)?;
-    let result = event_loop(&mut term, &mut view, &theme, &ui_rx, &mut app);
+    let result = event_loop(
+        &mut term,
+        &mut view,
+        &mut theme,
+        &mut theme_source,
+        &ui_rx,
+        &mut app,
+    );
     restore(mouse);
     result
 }
@@ -292,7 +307,8 @@ fn restore(mouse: bool) {
 fn event_loop(
     term: &mut Term,
     view: &mut View,
-    theme: &Theme,
+    theme: &mut Theme,
+    theme_source: &mut crate::theme::ThemeSource,
     ui_rx: &Receiver<UiMsg>,
     app: &mut App,
 ) -> io::Result<()> {
@@ -310,6 +326,10 @@ fn event_loop(
             // A few small files: cheap enough every second.
             app.poll_observer(view);
             app.refresh_board(view);
+            // omarchy-theme-set, or an edited theme file.
+            if let Some(t) = theme_source.changed() {
+                *theme = t;
+            }
         }
         if std::mem::take(&mut view.redraw) {
             term.clear()?;

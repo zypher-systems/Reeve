@@ -73,7 +73,7 @@ zdr = false                             # OpenRouter: only zero-data-retention e
 terms = []                              # more words to mask, e.g. ["Acme", "project-x"]
 
 [ui]
-theme = "slate"                         # slate (the board) | ink (warm charcoal) | brass (the original)
+theme = "auto"                          # auto (Omarchy's theme on Omarchy, else slate) | omarchy | slate | ink | brass | a name in ~/.reeve/themes/
 colors = "auto"                         # auto | truecolor | 256 | 16 ; NO_COLOR wins
 mouse = true
 animate = true

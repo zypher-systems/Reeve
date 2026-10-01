@@ -56,6 +56,12 @@ pub enum Undo {
         /// Changes, in the order they were made.
         changes: Vec<FileChange>,
     },
+    /// Put pacman's changes back from its package cache (pacman has no
+    /// transaction ids; see `crate::pacman`).
+    Pacman {
+        /// What the transaction changed, as pacman logged it.
+        changes: Vec<crate::pacman::PkgChange>,
+    },
     /// Roll a package transaction back (`dnf history undo`).
     Packages {
         /// `dnf5` or `dnf`.
@@ -258,7 +264,7 @@ impl UndoStore {
                 };
                 Ok((Undo::Files { changes: inverse }, summary))
             }
-            Undo::Packages { .. } | Undo::Unit { .. } => Err(Error::Io(
+            Undo::Packages { .. } | Undo::Pacman { .. } | Undo::Unit { .. } => Err(Error::Io(
                 "package and service changes are undone through their own tools, not the file store".into(),
             )),
             Undo::Move { from, to, replaced } => {

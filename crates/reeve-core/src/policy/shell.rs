@@ -1052,6 +1052,15 @@ fn assess_words(
             } else if !query {
                 a.raise(Tier::T2, "changes installed packages");
             }
+            // An AUR helper that installs or upgrades may build from the AUR:
+            // PKGBUILDs anyone can submit. The owner says yes each time.
+            if prog != "pacman" && !query && !op.starts_with("-R") {
+                a.raise(
+                    Tier::T2,
+                    "may build from the AUR (user-submitted PKGBUILDs Arch doesn't review)",
+                );
+                a.owner_only = true;
+            }
             if op.starts_with("-R") {
                 protected_packages(ctx, &positional(args), &mut a);
             }
@@ -2487,6 +2496,28 @@ mod tests {
             );
         }
         assert!(assess(&PathCtx::for_tests(), "sudo ls").sudo);
+    }
+
+    #[test]
+    fn aur_builds_are_the_owners_call_every_time() {
+        let ctx = PathCtx::for_tests();
+        for cmd in [
+            "paru -S foo",
+            "yay -Syu",
+            "yay",
+            "true && paru -S --noconfirm foo",
+        ] {
+            let a = assess(&ctx, cmd);
+            assert!(a.owner_only && a.tier >= Tier::T2, "{cmd}: {a:?}");
+        }
+        for cmd in [
+            "paru -Ss foo",
+            "yay -Qi foo",
+            "yay -R foo",
+            "sudo pacman -S htop",
+        ] {
+            assert!(!assess(&ctx, cmd).owner_only, "{cmd}");
+        }
     }
 
     #[test]
