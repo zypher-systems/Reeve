@@ -628,6 +628,22 @@ mod tests {
     }
 
     #[test]
+    fn the_header_says_when_a_newer_reeve_is_out() {
+        use reeve_core::update::{Badge, Version};
+        let mut v = busy_view();
+        assert!(!render(&v, 160, 44).contains("0.5.0"));
+        v.update = Some(Badge::Available(Version(0, 5, 0)));
+        let s = render(&v, 160, 44);
+        assert!(s.lines().next().unwrap().contains("↑ 0.5.0"), "{s}");
+        v.update = Some(Badge::Restart(Version(0, 5, 0)));
+        let s = render(&v, 160, 44);
+        assert!(
+            s.lines().next().unwrap().contains("restart for 0.5.0"),
+            "{s}"
+        );
+    }
+
+    #[test]
     fn home_is_the_board_with_every_tile() {
         let s = render(&busy_view(), 160, 44);
         for needle in [

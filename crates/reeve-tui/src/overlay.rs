@@ -51,6 +51,10 @@ pub const COMMANDS: &[Command] = &[
         about: "the state of the machine as a page: charts, drift, findings",
     },
     Command {
+        name: "/update",
+        about: "is a newer Reeve out, and how to get it",
+    },
+    Command {
         name: "/privacy",
         about: "what the model sees; OpenRouter routing",
     },

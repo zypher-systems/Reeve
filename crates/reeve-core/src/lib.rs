@@ -28,5 +28,6 @@ pub mod sudo;
 pub mod tools;
 pub mod txn;
 pub mod undo;
+pub mod update;
 
 pub use error::{Error, Result};

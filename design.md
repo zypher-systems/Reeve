@@ -54,7 +54,7 @@ New for an operator:
 | `reeve-core` | lib | config, secrets, `llm` (copied from Ryter), `spend`/`meter`, session store, receipts, undo store, policy (risk tiers, safeguard floor), tools, distro layer, memory, agent loop, IPC message types |
 | `reeve-observer` | lib | samplers, journal follower, detectors, baselines, findings, notifications, standing-order scheduler |
 | `reeve-tui` | lib | mission-control UI |
-| `reeve-cli` | bin `reeve` | TUI by default; subcommands `receipts`, `undo`, `memory`, `orders`, `daemon`, `key`, `doctor`, `askpass` |
+| `reeve-cli` | bin `reeve` | TUI by default; subcommands `receipts`, `undo`, `memory`, `orders`, `daemon`, `key`, `doctor`, `update`, `askpass` |
 | `reeved` | bin | thin `main` around `reeve-observer` |
 
 Rust 1.88, edition 2024, `#![forbid(unsafe_code)]`, ratatui 0.29 + crossterm 0.28, same as Ryter.
@@ -318,6 +318,8 @@ Windows will need their own observer design later.
   the agent's prompt, with no popup. A desktop notification means a proposed fix is waiting: the drafter
   wrote one, or a standing order stopped at its scope. `notify_findings = true` opts back into popups for
   findings, paced.
+- **Releases:** a minute after it starts and every 12 h, reeved asks GitHub for the latest release
+  (§8.2).
 - **Proposals:** when you open Reeve, the Findings inbox shows each finding, and "draft a fix"
   runs a read-only (T0-only) diagnosis to produce a proposed plan you approve. Nothing runs
   without you, except under §9.
@@ -372,6 +374,27 @@ light or dark theme; a small inline script adds a hover readout. Sources:
   reboot).
 
 Everything shown is escaped. Log lines and finding text are data.
+
+### 8.2 Updates (`reeve update`)
+
+- **Checking:** reeved asks GitHub's latest-release endpoint (user agent `reeve/<version>`, nothing
+  else sent). Drafts and pre-releases never count. The answer goes to `observer/update.json`, with
+  the version reeved runs, which is the one installed. When reeved isn't running and the answer is
+  more than a day old, the TUI asks instead, in the background. `[updates] check = false` stops both.
+- **Showing:** the header gets `↑ 0.5.0`, or `restart for 0.5.0` when the new version is installed
+  but this window predates it. `/update` and ⌃K say what's out and how to get it. There's no desktop
+  notification: a new version isn't a proposed fix.
+- **Installing:** `reeve update` works out how this copy got here and does the same again:
+  - **install.sh** (a `bin/` under some prefix): download the release tarball and `SHA256SUMS`,
+    refuse a mismatch, check that the archive's binary is the expected version, then run that
+    release's own `install.sh --from` with flags matching this install. The installer never starts
+    reeved; `reeve update` restarts it only when it runs the binary just replaced.
+  - **An RPM:** the release RPM, checked the same way, through `sudo dnf upgrade` (or `downgrade`).
+  - **A pacman package:** the AUR helper.
+  - **A cargo build, or a binary somewhere no installer puts it:** refused, with what to do instead.
+- **Receipts and rollback:** every attempt leaves a `reeve_update` receipt (T1 under your home, T2
+  otherwise), failures too. `--rollback` installs the version the last update replaced, from its own
+  release; nothing kept in your home is ever copied into a system directory.
 
 ---
 
@@ -483,6 +506,7 @@ renders each screen to colored HTML (with `REEVE_SHOTS_HOME`, from a real Reeve 
   memory/{facts,baselines,runbooks,preferences}/
   findings/  proposals/  orders/*.toml
   observer/metrics/YYYY-MM-DD.jsonl
+  observer/update.json   # newest release seen, version installed, version replaced
   themes/*.toml
 /var/lib/reeve/undo/     # root-owned pre-images (created via sudo on first use)
 $XDG_RUNTIME_DIR/reeve/  # reeved.sock, askpass-<pid>.sock
@@ -503,3 +527,65 @@ $XDG_RUNTIME_DIR/reeve/  # reeved.sock, askpass-<pid>.sock
 | **M4** ✓ | Observer | `reeved` with samplers, journal, detectors, baselines, notifications, and the Findings inbox with proposals. |
 | **M5** ✓ | Standing orders | Scheduler, scoped autonomous runs, day and month budgets enforced across TUI and daemon. |
 | **M6** | Arch | pacman/AUR, snap-pac, Omarchy theme import. |
+
+---
+
+## 14. What 1.0 means
+
+1.0 is a gate, not a count. Reeve stays on 0.x (0.10, 0.11, and on) until every item below is
+done, and reaching the end of the list makes 1.0 possible, not automatic. A ticked box is done
+today; an open one is not, or not yet proven.
+
+**It runs where it says it does**
+
+- [ ] **Arch is as solid as Fedora.** M6: install, remove, upgrade, and undo through pacman (and
+  the AUR helper when there is one), snap-pac snapshots, and Omarchy theme import. Today:
+  detection, search, info, and listing work.
+- [ ] **It installs as a package.** Published Fedora (COPR) and Arch (AUR) packages ship `reeve`
+  and `reeved.service`, and `reeve daemon install` uses the packaged unit. Today: the spec and
+  PKGBUILDs are in `packaging/`, and installs go through `install.sh`.
+- [ ] **Snapshots work out of the box.** On btrfs with no snapper root config, Reeve offers once to
+  create one, never silently, and T2 actions get pre/post pairs from then on. Today: `reeve
+  doctor` reports the missing config.
+- [x] Image-based Fedora (Silverblue, Kinoite) is recognized, and package changes are refused with
+  a clear message.
+
+**Safety holds**
+
+- [ ] **The floor is proven.** Every rule in §5.3 and §5.4 has a test, a corpus of real commands
+  has expected tiers, and no mode (YOLO, a session or change "yes", a standing order) gets past
+  the floor without the typed confirmation.
+- [ ] **Undo covers what it claims.** Files, dnf and pacman transactions, and unit state each undo
+  cleanly, and an undo refuses when the target changed since.
+- [ ] **No key leaks.** Tests push known token formats through prompts, tool output, receipts,
+  logs, and session reports, and none comes out unmasked.
+- [x] A standing order that needs root runs only with the drop-in `reeve orders sudoers <order>`
+  prints. Without it, the order stops at the root step and leaves a proposal.
+
+**It runs unattended for months**
+
+- [ ] **reeved stays small.** Metrics, state, findings, proposals, and scratch all have retention
+  limits. A month of running leaves `~/.reeve` and reeved's memory flat, and it survives reboot,
+  suspend, and its own upgrade.
+- [ ] **It keeps itself current.** reeved notices a new release and the app shows it, without a
+  popup. `reeve update` installs it the way Reeve was installed, checks it against the release's
+  `SHA256SUMS`, leaves a receipt, and can roll back.
+- [x] Budgets hold across the TUI, the drafter, and standing orders, and a model with no known
+  price fails closed while any cap is set.
+
+**Nothing you keep is lost**
+
+- [ ] **Upgrades never lose data.** Every file format in `~/.reeve` carries a version, and 1.x reads
+  or migrates whatever an earlier release wrote: orders, memory, settings, receipts.
+- [x] Receipts form a hash chain, and `reeve receipts verify` reports the exact break.
+
+**It's usable without the source**
+
+- [ ] **The TUI degrades as §1 promises.** 80×24, 256 and 16 colors, mono, `NO_COLOR`, no mouse,
+  and no reeved each render correctly in the screenshot harness.
+- [ ] **First run teaches itself.** From a fresh install, you can set up a provider, run the
+  survey, and get a useful answer without opening the docs.
+- [ ] **The docs match the product.** A user guide covers approvals, undo, orders, privacy, and the
+  drafter, and this design describes what shipped (§11 still shows the ledger UI, not the board).
+
+**Not needed for 1.0:** skills, themes beyond Omarchy's, timeshift, and macOS or Windows.

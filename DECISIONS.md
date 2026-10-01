@@ -2,6 +2,29 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-30: Reeve checks for releases and updates itself the way it was installed
+- **Decision:**
+  - reeved asks GitHub's latest-release endpoint a minute after it starts and every 12 hours (`[updates] check`, on by default). The TUI asks when reeved isn't running and the last answer is over a day old. The answer goes to `observer/update.json`, and drafts and pre-releases never count.
+  - The TUI shows `↑ 0.5.0` in the header, or `restart for 0.5.0` when the new version is installed but the window predates it. `/update` and ⌃K say what's out and how to get it. No desktop notification.
+  - `reeve update` works out how this copy was installed (`update::classify`). Copied by install.sh: download the release tarball and `SHA256SUMS`, refuse a mismatch, check that the archive's binary is the expected version, and run that release's own install.sh with flags matching this install (`--prefix`, `--user`, `--no-service` where no unit was installed, always `--no-start`). An RPM: the release RPM through `sudo dnf upgrade` or `downgrade`. Pacman: the AUR helper. A cargo build or an unknown location: refused, with what to do.
+  - It restarts reeved only when the running reeved's `ExecStart` is the binary it replaced.
+  - Every attempt leaves a `reeve_update` receipt (T1 for a home install, T2 otherwise), failures included. `--rollback` installs the version the last update replaced, from its own release, checked the same way.
+  - What's on disk afterwards decides what happened, not the installer's exit code: whenever the binary's version changed, the version it replaced is recorded for `--rollback`, even if the installer then failed. An AUR helper that changed nothing is a failure, and AUR installs are pointed at the pacman cache instead of `--rollback`.
+  - `update.json` is only changed under a lock (`UpdateState::modify`), so reeved's check can't drop the rollback target an update just wrote.
+  - The install is classified against the home Reeve uses everywhere (`dirs::home_dir`, which reads passwd when `HOME` is unset); with no home, nothing counts as a home install. An RPM install on image-based Fedora is refused, as the package tools refuse there.
+  - install.sh says "updated (old → new)" when a copy was already there, and skips the first-install notes.
+- **Chosen vs rejected:**
+  - Rejected replacing the binary from Rust: install.sh already knows the layout (binary, unit, `ExecStart`, sudo only where it's needed). Running the new release's own installer keeps one install path, and a release can change its layout without the old binary knowing.
+  - Rejected keeping the old binary in `~/.reeve` for rollback: copying a file from a user-writable directory into `/usr/local/bin` would let anything running as the user plant a binary that `sudo reeve root` later runs as root. Rolling back from the release costs a download and keeps the checksum check.
+  - Rejected a desktop notification for new releases: popups are only for proposed fixes.
+  - Rejected off by default: few would ever see the tag. The check is one request to GitHub every 12 hours, with user agent `reeve/<version>`.
+- **Why:** The owner wants to know a new version is out without watching GitHub, and to install it with one command that respects how Reeve got onto the machine.
+- **Where:** `reeve-core/src/update.rs`, `reeve-core/src/config.rs` (`[updates]`), `reeve-observer/src/daemon.rs`, `reeve-cli/src/update.rs`, `reeve-cli/src/main.rs` (`ask_for_updates`, `doctor`), `reeve-tui/src/board.rs` (the header), `reeve-tui/src/run.rs` (`/update`, ⌃K), `install.sh`
+- **Residual risks:**
+  - `SHA256SUMS` comes from the same release as the files. It catches corruption and a bad mirror, not a compromised account or release. Signing releases would close that.
+  - The flags `reeve update` passes are now a contract: every future install.sh must accept `--from`, `--prefix`, `--user`, `--no-service`, and `--no-start`.
+  - The RPM and AUR paths aren't exercised by tests (they need sudo, or an Arch machine). The install.sh path is tested end to end against a local fake release.
+
 ### 2026-09-29: The model writes standing orders, asking the owner each time
 - **Decision:**
   - New tools `order_save` (make, or change by id; fields the model leaves out keep their values) and `order_delete`. The model is told to make an order whenever the owner wants something done regularly or whenever something happens.
