@@ -438,6 +438,15 @@ pub fn top_bar(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
         right.push(Span::styled(" tiered ", t.pill(t.dim)));
     }
     right.push(Span::raw(" "));
+    if let Some(b) = v.update {
+        use reeve_core::update::Badge;
+        let text = match b {
+            Badge::Available(ver) => format!(" ↑ {ver} "),
+            Badge::Restart(ver) => format!(" restart for {ver} "),
+        };
+        right.push(Span::styled(text, t.pill(t.amber)));
+        right.push(Span::raw(" "));
+    }
     right.push(if v.observer_alive {
         Span::styled(" reeved ● ", t.pill(t.good))
     } else {

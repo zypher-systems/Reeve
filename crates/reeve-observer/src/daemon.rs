@@ -1,7 +1,8 @@
 //! `reeved`: the observer loop. Samples every 5 s, runs detectors every
 //! minute, learns baselines hourly, checks kernels and updates every 6 h,
-//! follows the journal the whole time, and (only if enabled) lets the
-//! drafter prepare a proposal. It never changes the machine.
+//! asks GitHub for a newer Reeve every 12 h, follows the journal the whole
+//! time, and (only if enabled) lets the drafter prepare a proposal. It never
+//! changes the machine.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
@@ -544,6 +545,18 @@ pub async fn run_observer(home: PathBuf, once: bool) -> Result<(), String> {
     let mut slow = tokio::time::interval(Duration::from_secs(6 * 3600));
     let mut beat = tokio::time::interval(Duration::from_secs(10));
     let mut draft = tokio::time::interval(Duration::from_secs(120));
+    // A minute in, so a login doesn't wait on the network, then every 12 h.
+    let mut release = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(60),
+        reeve_core::update::EVERY,
+    );
+    // reeved runs the installed binary (an update restarts it), so this is
+    // what's on disk.
+    let mut st = reeve_core::update::UpdateState::load(&home);
+    if st.installed.as_deref() != Some(reeve_core::update::CURRENT) {
+        st.installed = Some(reeve_core::update::CURRENT.into());
+        let _ = st.save(&home);
+    }
     minute.tick().await;
     hour.tick().await;
     let profile = obs.host.profile();
@@ -559,6 +572,14 @@ pub async fn run_observer(home: PathBuf, once: bool) -> Result<(), String> {
             }
             _ = hour.tick() => obs.hour_tick(),
             _ = slow.tick() => obs.slow_checks().await,
+            _ = release.tick() => {
+                if cfg.updates.check {
+                    let h = home.clone();
+                    tokio::spawn(async move {
+                        reeve_core::update::check(&h).await;
+                    });
+                }
+            }
             _ = beat.tick() => {
                 obs.beat(&cfg);
                 // Every 10 s, so "run now" in /orders doesn't wait a minute.

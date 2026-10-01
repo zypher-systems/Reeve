@@ -34,6 +34,10 @@ With a package, start the observer yourself: `systemctl --user enable --now reev
 
 Then run `reeve`, type `/providers`, and paste your API key. `reeve doctor` checks the whole install.
 
+Updating: when a newer release is out, the header shows `↑ <version>`. `reeve update` installs it the same way
+Reeve was installed (the release's installer, dnf, or your AUR helper), checked against the release's
+`SHA256SUMS` and with a receipt. `reeve update --rollback` goes back.
+
 From source:
 
 ```sh
@@ -50,6 +54,7 @@ cargo build --release --locked -p reeve-cli && ./target/release/reeve
 - `reeve undo N` reverses the action on receipt N and writes a receipt for the undo.
 - `reeve orders [list|show|run|sudoers|check|examples]` manages standing orders.
 - `reeve daemon install|status|uninstall` manages the observer; `reeve doctor` checks the install.
+- `reeve update [--check|--version vX.Y.Z|--rollback]` installs the newest release the way this one was installed.
 
 ## Approvals
 

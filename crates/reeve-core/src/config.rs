@@ -40,6 +40,8 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     /// TUI presentation.
     pub ui: UiConfig,
+    /// Checking for new releases.
+    pub updates: UpdatesConfig,
 }
 
 impl Default for Config {
@@ -57,6 +59,7 @@ impl Default for Config {
             observer: ObserverConfig::default(),
             privacy: PrivacyConfig::default(),
             ui: UiConfig::default(),
+            updates: UpdatesConfig::default(),
         }
     }
 }
@@ -296,6 +299,21 @@ impl Default for UiConfig {
             mouse: true,
             animate: true,
         }
+    }
+}
+
+/// `[updates]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdatesConfig {
+    /// Ask GitHub for the newest release: reeved every 12 hours, or the TUI
+    /// when reeved isn't running. `reeve update --check` asks either way.
+    pub check: bool,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self { check: true }
     }
 }
 

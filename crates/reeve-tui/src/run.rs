@@ -864,6 +864,10 @@ impl App {
                 view.push_transient("Drawing the state of the machine (last 7 days)…");
                 let _ = self.work.send(Work::Report);
             }
+            "/update" => {
+                view.push(Speaker::System, self.update_note());
+                self.go(view, Screen::Chat);
+            }
             "/orders" => self.open_tile(view, Tile::Orders),
             "/memory" => self.open_tile(view, Tile::Memory),
             "/reflect" => {
@@ -1705,10 +1709,48 @@ impl App {
         }
     }
 
+    /// What `/update` says: what's out, what's installed, and how to get it.
+    fn update_note(&self) -> String {
+        use reeve_core::update::{Badge, UpdateState, Version};
+        let s = UpdateState::load(&self.home);
+        let running = Version::current();
+        match s.badge(running) {
+            Some(Badge::Available(v)) => {
+                let notes = s
+                    .url
+                    .map(|u| format!("\nWhat's new: {u}"))
+                    .unwrap_or_default();
+                format!(
+                    "Reeve {v} is out; this is {running}. To install it, run `reeve update` in a terminal.{notes}"
+                )
+            }
+            Some(Badge::Restart(v)) => format!(
+                "Reeve {v} is installed; this window still runs {running}. Quit (/quit) and open Reeve again to use it."
+            ),
+            None => match (s.checked_at, s.error) {
+                (Some(_), Some(e)) => format!(
+                    "This is Reeve {running}. The last check for a newer one failed: {e}. `reeve update --check` asks again."
+                ),
+                (Some(t), None) => format!(
+                    "Reeve {running} is the newest release (checked {}).",
+                    t.with_timezone(&chrono::Local).format("%a %H:%M")
+                ),
+                (None, _) if self.cfg.updates.check => format!(
+                    "This is Reeve {running}. No check yet: reeved asks GitHub every 12 hours, and `reeve update --check` asks now."
+                ),
+                (None, _) => format!(
+                    "This is Reeve {running}. Update checks are off ([updates] check = false); `reeve update --check` asks anyway."
+                ),
+            },
+        }
+    }
+
     /// Read reeved's heartbeat and the findings.
     fn poll_observer(&mut self, view: &mut View) {
         let status = ObserverStatus::load(&self.home);
         view.observer_alive = status.as_ref().is_some_and(|s| s.alive(chrono::Utc::now()));
+        view.update = reeve_core::update::UpdateState::load(&self.home)
+            .badge(reeve_core::update::Version::current());
         let all = FindingStore::new(&self.home).list();
         self.announce(view, &all);
         view.findings = all
@@ -1874,6 +1916,20 @@ impl App {
     fn everything(&self, view: &View) -> Vec<crate::overlay::Hit> {
         use crate::overlay::Hit;
         let mut hits = Vec::new();
+        if let Some(b) = view.update {
+            use reeve_core::update::Badge;
+            let title = match b {
+                Badge::Available(v) => format!("Update Reeve to {v}"),
+                Badge::Restart(v) => format!("Restart Reeve to use {v}"),
+            };
+            hits.push(Hit {
+                group: "DO",
+                title,
+                detail: "reeve update, in a terminal".into(),
+                place: "/update".into(),
+                action: Action::Command("/update"),
+            });
+        }
         let findings = FindingStore::new(&self.home).list();
         for f in findings.iter().filter(|f| f.is_live()) {
             if f.proposal.is_some() {

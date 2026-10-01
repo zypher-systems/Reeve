@@ -11,6 +11,8 @@ use reeve_core::llm::{HttpProvider, Provider};
 use reeve_core::receipts::ReceiptBook;
 use reeve_core::spend::{PriceBook, format_rates, format_tokens};
 
+mod update;
+
 #[derive(Parser)]
 #[command(name = "reeve", version, about = "An operator agent for your computer")]
 struct Cli {
@@ -72,6 +74,22 @@ enum Cmd {
     Undo {
         /// Receipt number.
         seq: u64,
+        /// Don't ask for confirmation.
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Install the newest Reeve the way this one was installed, checked
+    /// against the release's SHA256SUMS, with a receipt.
+    Update {
+        /// Only say whether a newer release is out.
+        #[arg(long, conflicts_with_all = ["version", "rollback"])]
+        check: bool,
+        /// Install this release instead of the newest (e.g. v0.4.0).
+        #[arg(long, conflicts_with = "rollback")]
+        version: Option<String>,
+        /// Go back to the version the last update replaced.
+        #[arg(long)]
+        rollback: bool,
         /// Don't ask for confirmation.
         #[arg(short, long)]
         yes: bool,
@@ -163,7 +181,24 @@ fn run(cli: Cli) -> Result<(), String> {
     let home = config::home_dir();
     let cfg = config::load_at(&home).map_err(|e| e.to_string())?;
     match cli.cmd {
-        None => reeve_tui::run(cfg, home).map_err(|e| e.to_string()),
+        None => {
+            ask_for_updates(&cfg, &home);
+            reeve_tui::run(cfg, home).map_err(|e| e.to_string())
+        }
+        Some(Cmd::Update {
+            check,
+            version,
+            rollback,
+            yes,
+        }) => update::run(
+            &home,
+            update::Opts {
+                check,
+                version,
+                rollback,
+                yes,
+            },
+        ),
         Some(Cmd::Key {
             cmd: KeyCmd::Set { connection },
         }) => {
@@ -587,6 +622,28 @@ fn doctor(cfg: &Config, home: &std::path::Path) {
         },
         Err(e) => bad(format!("can't find this binary: {e}")),
     }
+    {
+        use reeve_core::update::{Badge, UpdateState, Version};
+        let s = UpdateState::load(home);
+        match s.badge(Version::current()) {
+            Some(Badge::Available(v)) => warn(format!("Reeve {v} is out: reeve update")),
+            Some(Badge::Restart(v)) => warn(format!(
+                "Reeve {v} is installed, but this is {}: open Reeve again",
+                Version::current()
+            )),
+            None => match (s.checked_at, &s.error) {
+                (Some(_), Some(e)) => warn(format!("the last update check failed: {e}")),
+                (Some(t), None) => ok(format!(
+                    "the newest release (checked {})",
+                    t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M")
+                )),
+                (None, _) if !cfg.updates.check => {
+                    warn("update checks are off ([updates] check = false)".into());
+                }
+                (None, _) => ok("no update check yet (reeved asks every 12 hours)".into()),
+            },
+        }
+    }
 
     println!("model");
     match cfg.route() {
@@ -685,6 +742,29 @@ fn doctor(cfg: &Config, home: &std::path::Path) {
         None => ok(format!("{} receipts, chain intact", v.count)),
         Some(p) => bad(format!("receipt chain: {p}")),
     }
+}
+
+/// reeved asks GitHub for a newer Reeve every 12 hours. When it isn't
+/// running and the last answer is a day old, the TUI asks instead, in the
+/// background so nothing waits on the network.
+fn ask_for_updates(cfg: &Config, home: &std::path::Path) {
+    use reeve_core::update::{STALE_HOURS, UpdateState};
+    let now = chrono::Utc::now();
+    if !cfg.updates.check
+        || reeve_core::findings::ObserverStatus::load(home).is_some_and(|s| s.alive(now))
+        || !UpdateState::load(home).due(now, chrono::Duration::hours(STALE_HOURS))
+    {
+        return;
+    }
+    let home = home.to_path_buf();
+    std::thread::spawn(move || {
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            rt.block_on(reeve_core::update::check(&home));
+        }
+    });
 }
 
 fn confirm(prompt: &str) -> Result<bool, String> {

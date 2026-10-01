@@ -388,6 +388,13 @@ fn shots() {
     v.approval = Some(asking());
     write(&dir, "0-board", html(&v, &t, "board"));
 
+    // The same, with a newer Reeve out.
+    v.update = Some(reeve_core::update::Badge::Available(
+        reeve_core::update::Version(0, 5, 0),
+    ));
+    write(&dir, "0-board-update", html(&v, &t, "board, update out"));
+    v.update = None;
+
     // The chat, the approval asking there.
     v.chat = true;
     write(&dir, "1-chat", html(&v, &t, "chat"));

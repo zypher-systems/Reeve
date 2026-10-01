@@ -165,9 +165,19 @@ tar -C "$tmp" -xzf "$tmp/$asset"
 src="$tmp/reeve-$target"
 [ -x "$src/reeve" ] || die "the archive has no reeve binary"
 
+# An existing copy makes this an update (`reeve update` runs this script too).
+old=""
+if [ -x "$bindir/reeve" ]; then
+    old=$("$bindir/reeve" --version 2>/dev/null | awk '{print $NF}') || old=""
+fi
 as_root mkdir -p "$bindir"
 as_root install -m 755 "$src/reeve" "$bindir/reeve"
-say "installed $bindir/reeve ($("$bindir/reeve" --version 2>/dev/null || echo '?'))"
+new=$("$bindir/reeve" --version 2>/dev/null | awk '{print $NF}') || new="?"
+if [ -n "$old" ]; then
+    say "updated $bindir/reeve ($old → $new)"
+else
+    say "installed $bindir/reeve (reeve $new)"
+fi
 
 if [ "$service" -eq 1 ]; then
     sed "s|^ExecStart=.*|ExecStart=$bindir/reeve daemon run|" "$src/reeved.service" > "$tmp/reeved.service"
@@ -190,6 +200,9 @@ if [ "$service" -eq 1 ]; then
         fi
     fi
 fi
+
+# The setup notes were for the first install.
+[ -z "$old" ] || exit 0
 
 case ":$PATH:" in
     *":$bindir:"*) ;;

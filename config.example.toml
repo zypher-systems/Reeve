@@ -77,3 +77,6 @@ theme = "slate"                         # slate (the board) | ink (warm charcoal
 colors = "auto"                         # auto | truecolor | 256 | 16 ; NO_COLOR wins
 mouse = true
 animate = true
+
+[updates]                               # reeved asks GitHub for the newest release every 12 h
+check = true                            # false: never ask (`reeve update --check` still does)
