@@ -102,6 +102,9 @@ pub fn render(meta: &Meta, transcript: &[Message], receipts: &[Receipt], tally: 
                 Some(Undo::Packages { transaction, .. }) => {
                     format!("package transaction {transaction}")
                 }
+                Some(Undo::Pacman { changes }) => {
+                    format!("packages: {}", crate::pacman::summary(changes))
+                }
                 Some(Undo::Unit { unit, .. }) => format!("{unit}'s previous state"),
                 Some(Undo::Move { from, .. }) => format!("move back to {from}"),
                 Some(Undo::Files { changes }) if changes.len() == 1 => changes[0].path.clone(),

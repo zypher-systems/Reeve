@@ -166,8 +166,19 @@ pub(crate) fn card_lines(p: &Pending, width: usize, t: &Theme) -> Vec<Line<'stat
             Span::styled(format!(" {chunk} "), code),
         ]));
     }
-    // A standing order in plain words: what the owner is agreeing to.
+    // A standing order in plain words: what the owner is agreeing to. Code
+    // (an AUR package's PKGBUILD) is drawn as code: cut, never reflowed.
     for d in &r.details {
+        if let Some(src) = d.strip_prefix(reeve_core::pacman::CODE) {
+            out.push(Line::from(vec![
+                Span::styled("  │ ", t.ghost()),
+                Span::styled(
+                    truncate(&src.replace('\t', "    "), width.saturating_sub(4)),
+                    code,
+                ),
+            ]));
+            continue;
+        }
         for (i, row) in crate::draw::plain_wrap(d, width.saturating_sub(4))
             .into_iter()
             .enumerate()

@@ -89,12 +89,55 @@ pub const COMMANDS: &[Command] = &[
 ];
 
 /// Commands matching what's typed, while the composer holds a bare `/word`.
-pub fn palette(input: &str) -> Vec<&'static Command> {
+pub fn palette(input: &str, skills: &[(String, String)]) -> Vec<PaletteItem> {
     if !input.starts_with('/') || input.contains(char::is_whitespace) {
         return Vec::new();
     }
     let q = input.to_ascii_lowercase();
-    COMMANDS.iter().filter(|c| c.name.starts_with(&q)).collect()
+    let mut out: Vec<PaletteItem> = COMMANDS
+        .iter()
+        .filter(|c| c.name.starts_with(&q))
+        .map(|c| PaletteItem {
+            name: c.name.to_string(),
+            about: c.about.to_string(),
+            skill: false,
+        })
+        .collect();
+    // A skill named like a command stays reachable from ⌃K and F8.
+    out.extend(
+        skills
+            .iter()
+            .filter(|(id, _)| {
+                format!("/{id}").starts_with(&q) && !COMMANDS.iter().any(|c| c.name[1..] == **id)
+            })
+            .map(|(id, about)| PaletteItem {
+                name: format!("/{id}"),
+                about: about.clone(),
+                skill: true,
+            }),
+    );
+    out
+}
+
+/// A row of the slash palette: a command, or one of the owner's skills.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteItem {
+    /// `/name`.
+    pub name: String,
+    /// What it does.
+    pub about: String,
+    /// One of the owner's skills (Reeve runs it), not a command.
+    pub skill: bool,
+}
+
+/// What to send Reeve to run a skill, with anything typed after its name.
+pub fn skill_request(id: &str, rest: &str) -> String {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        format!("Use the skill {id}.")
+    } else {
+        format!("Use the skill {id}: {rest}")
+    }
 }
 
 /// What an overlay asks `run.rs` to do.
@@ -200,6 +243,12 @@ pub enum Action {
     Ask(String),
     /// Run a slash command.
     Command(&'static str),
+    /// Open a skill's file in `$EDITOR`.
+    SkillEdit(String),
+    /// Delete a skill (with a receipt, so it can be undone).
+    SkillDelete(String),
+    /// Start a new skill: describe it to Reeve, who writes it for a yes.
+    SkillNew,
     /// Open the receipts panel on this receipt.
     ShowReceipt(u64),
     /// Gather health and what changed for this many days.
@@ -435,6 +484,19 @@ pub struct ReceiptsPanel {
 }
 
 impl ReceiptsPanel {
+    /// The panel over `items` (newest first).
+    pub fn new(items: Vec<reeve_core::receipts::Receipt>) -> Self {
+        let mut p = Self::default();
+        p.load(items);
+        p
+    }
+
+    /// Show `items`, and work out which of them have been undone.
+    pub fn load(&mut self, items: Vec<reeve_core::receipts::Receipt>) {
+        self.undone = reeve_core::receipts::undone(&items);
+        self.items = items;
+    }
+
     /// The selected receipt.
     pub fn selected(&self) -> Option<&reeve_core::receipts::Receipt> {
         self.items.get(self.sel)
@@ -761,14 +823,39 @@ pub struct MemoryPanel {
     pub note: Option<Result<String, String>>,
     /// Delete asked once; asking again deletes.
     pub confirm_delete: Option<String>,
+    /// The owner's skills: the tab after the layers.
+    pub skills: Vec<reeve_core::skills::Skill>,
+    /// Skill files that don't parse, and why.
+    pub skill_errors: Vec<(String, String)>,
 }
 
 impl MemoryPanel {
-    /// Load every layer.
-    pub fn load(mem: &reeve_core::memory::Memory) -> Self {
+    /// The skills tab: after the four layers.
+    pub const SKILLS_TAB: usize = reeve_core::memory::Layer::ALL.len();
+
+    /// Load every layer, and the skills.
+    pub fn load(mem: &reeve_core::memory::Memory, skills: &reeve_core::skills::Skills) -> Self {
         let mut p = Self::default();
-        p.reload(mem);
+        p.reload(mem, skills);
         p
+    }
+
+    /// On the skills tab.
+    pub fn on_skills(&self) -> bool {
+        self.tab == Self::SKILLS_TAB
+    }
+
+    /// The selected skill, on the skills tab.
+    pub fn selected_skill(&self) -> Option<&reeve_core::skills::Skill> {
+        self.on_skills()
+            .then(|| self.skills.get(self.sel))
+            .flatten()
+    }
+
+    /// Show this skill, on the skills tab.
+    pub fn select_skill(&mut self, id: &str) {
+        self.tab = Self::SKILLS_TAB;
+        self.sel = self.skills.iter().position(|s| s.id == id).unwrap_or(0);
     }
 
     /// Re-read from disk, keeping the tab and (where possible) the selection.
@@ -783,13 +870,26 @@ impl MemoryPanel {
         }
     }
 
-    /// Reload every layer, keeping the selection.
-    pub fn reload(&mut self, mem: &reeve_core::memory::Memory) {
+    /// Reload every layer and the skills, keeping the selection.
+    pub fn reload(
+        &mut self,
+        mem: &reeve_core::memory::Memory,
+        skills: &reeve_core::skills::Skills,
+    ) {
         let keep = self.selected().map(|n| n.id.clone());
+        let keep_skill = self.selected_skill().map(|s| s.id.clone());
         self.notes = reeve_core::memory::Layer::ALL
             .iter()
             .map(|l| mem.list(*l))
             .collect();
+        (self.skills, self.skill_errors) = skills.load();
+        if self.on_skills() {
+            if let Some(i) = keep_skill.and_then(|id| self.skills.iter().position(|s| s.id == id)) {
+                self.sel = i;
+            }
+            self.sel = self.sel.min(self.skills.len().saturating_sub(1));
+            return;
+        }
         if let Some(id) = keep {
             if let Some(i) = self.current().iter().position(|n| n.id == id) {
                 self.sel = i;
@@ -809,10 +909,40 @@ impl MemoryPanel {
     }
 
     fn on_key(&mut self, k: KeyEvent) -> Action {
-        let n = self.current().len();
-        let tabs = reeve_core::memory::Layer::ALL.len();
+        let n = if self.on_skills() {
+            self.skills.len()
+        } else {
+            self.current().len()
+        };
+        // The four layers, then skills.
+        let tabs = Self::SKILLS_TAB + 1;
         if !matches!(k.code, KeyCode::Char('D')) {
             self.confirm_delete = None;
+        }
+        if self.on_skills() {
+            match k.code {
+                KeyCode::Char('n') => return Action::SkillNew,
+                KeyCode::Char('s' | 'r' | 'a' | 'x') => return Action::None,
+                _ => {}
+            }
+            if let Some(id) = self.selected_skill().map(|s| s.id.clone()) {
+                match k.code {
+                    KeyCode::Enter => return Action::Ask(skill_request(&id, "")),
+                    KeyCode::Char('e') => return Action::SkillEdit(id),
+                    KeyCode::Char('D') => {
+                        if self.confirm_delete.as_deref() == Some(id.as_str()) {
+                            self.confirm_delete = None;
+                            return Action::SkillDelete(id);
+                        }
+                        self.note = Some(Err(format!(
+                            "press D again to delete the skill {id} (F4 activity can undo it)"
+                        )));
+                        self.confirm_delete = Some(id);
+                        return Action::None;
+                    }
+                    _ => {}
+                }
+            }
         }
         match k.code {
             KeyCode::Left => {
@@ -1253,6 +1383,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_failed_undo_leaves_its_target_undoable() {
+        use reeve_core::policy::Tier;
+        use reeve_core::receipts::{Receipt, Status};
+        use reeve_core::undo::Undo;
+        let receipt = |seq: u64, undoes: Option<u64>, status: Status, undo: bool| {
+            let mut r = Receipt::draft("s", "pkg_install", serde_json::json!({}), Tier::T2);
+            r.seq = seq;
+            r.undoes = undoes;
+            r.outcome.status = status;
+            r.undo = undo.then(|| Undo::Pacman { changes: vec![] });
+            r
+        };
+        let u = |p: &mut ReceiptsPanel, seq: u64| {
+            p.sel = p.items.iter().position(|r| r.seq == seq).unwrap();
+            p.note = None;
+            p.on_key(KeyEvent::from(KeyCode::Char('u')))
+        };
+        // #1 changed packages. #2 tried to undo it, stopped partway, and
+        // carries the inverse of the part that ran.
+        let one = receipt(1, None, Status::Ok, true);
+        let two = receipt(2, Some(1), Status::Error, true);
+        let mut p = ReceiptsPanel::new(vec![two.clone(), one.clone()]);
+        assert!(p.undone.is_empty());
+        assert_eq!(u(&mut p, 2), Action::Undo(2), "the partial can be undone");
+        assert_eq!(u(&mut p, 1), Action::Undo(1), "and #1 tried again");
+
+        // #3 took the partial back: #2 is undone, #1 still isn't.
+        let three = receipt(3, Some(2), Status::Ok, true);
+        p.load(vec![three.clone(), two.clone(), one.clone()]);
+        assert_eq!(u(&mut p, 2), Action::None);
+        assert_eq!(p.note, Some(Err("#2 was already undone".into())));
+        assert_eq!(u(&mut p, 1), Action::Undo(1));
+
+        // #4 undid #1 for good.
+        p.load(vec![receipt(4, Some(1), Status::Ok, true), three, two, one]);
+        assert_eq!(u(&mut p, 1), Action::None);
+        assert_eq!(p.note, Some(Err("#1 was already undone".into())));
+    }
+
+    #[test]
     fn the_picker_hides_models_reeve_cant_drive() {
         let mut usable = ModelInfo::named("deepseek/deepseek-v4-pro");
         usable.tools = Some(true);
@@ -1378,10 +1548,30 @@ mod tests {
 
     #[test]
     fn palette_matches_prefixes_only_for_a_bare_word() {
-        assert_eq!(palette("/p")[0].name, "/providers");
-        assert_eq!(palette("/").len(), COMMANDS.len());
-        assert!(palette("/providers now").is_empty());
-        assert!(palette("hello").is_empty());
+        assert_eq!(palette("/p", &[])[0].name, "/providers");
+        assert_eq!(palette("/", &[]).len(), COMMANDS.len());
+        assert!(palette("/providers now", &[]).is_empty());
+        assert!(palette("hello", &[]).is_empty());
+        // Skills follow the commands; one named like a command doesn't shadow it.
+        let skills = vec![
+            ("tidy-downloads".to_string(), "Sort Downloads".to_string()),
+            ("update".to_string(), "mine".to_string()),
+        ];
+        let hits = palette("/ti", &skills);
+        assert_eq!(
+            (hits.len(), hits[0].name.as_str(), hits[0].skill),
+            (1, "/tidy-downloads", true)
+        );
+        assert_eq!(palette("/", &skills).len(), COMMANDS.len() + 1);
+        assert!(palette("/update", &skills).iter().all(|h| !h.skill));
+        assert_eq!(
+            skill_request("tidy-downloads", ""),
+            "Use the skill tidy-downloads."
+        );
+        assert_eq!(
+            skill_request("why-slow", " since the update "),
+            "Use the skill why-slow: since the update"
+        );
     }
 
     #[test]

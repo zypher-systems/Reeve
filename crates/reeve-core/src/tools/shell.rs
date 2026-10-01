@@ -393,6 +393,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_aur_helper_is_given_reeves_sudo() {
+        // paru and yay run as you and call sudo themselves. A stand-in
+        // helper says which sudo it would run and the askpass it was given;
+        // no sudo runs.
+        use std::os::unix::fs::PermissionsExt;
+        struct Never;
+        #[async_trait::async_trait]
+        impl crate::sudo::PasswordSource for Never {
+            async fn password(&self, _prompt: String) -> Option<String> {
+                None
+            }
+        }
+        let (d, mut c) = ctx();
+        let ap =
+            crate::sudo::Askpass::start(&c.paths.reeve_home, std::sync::Arc::new(Never)).unwrap();
+        let wrapper = ap.sudo_path().display().to_string();
+        c.askpass = Some(ap);
+        let helper = d.path().join("yay");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\ncommand -v sudo\necho \"askpass=${SUDO_ASKPASS:-none}\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (args, given) in [("-S --noconfirm foo", true), ("-Ss foo", false)] {
+            let line = format!("{} {args}", helper.display());
+            let p = prepare(&c, "shell", &json!({"command": line}).to_string()).unwrap();
+            assert_eq!(p.assessment.sudo, given, "{line}");
+            let e = execute(&c, &p).await;
+            assert_eq!(e.output.contains(&wrapper), given, "{line}: {}", e.output);
+            assert_eq!(e.output.contains("askpass=none"), !given, "{}", e.output);
+        }
+    }
+
+    #[tokio::test]
     async fn no_terminal_means_sudo_fails_fast() {
         // A real sudo attempt: it logs an auth failure (at alert level) and may
         // count toward pam_faillock. Opt in on a developer machine.

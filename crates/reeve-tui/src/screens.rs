@@ -1726,8 +1726,21 @@ fn memory(f: &mut Frame, area: Rect, p: &MemoryPanel, t: &Theme) {
         ));
         tabs.push(Span::raw("  "));
     }
+    tabs.push(Span::styled(
+        format!(" skills {} ", p.skills.len()),
+        if p.on_skills() {
+            t.key()
+        } else {
+            Style::default().fg(t.dim)
+        },
+    ));
+    tabs.push(Span::raw("  "));
     tabs.push(Span::styled("←→", t.ghost()));
     f.render_widget(Paragraph::new(Line::from(tabs)), layers);
+    if p.on_skills() {
+        skills_tab(f, body, note, foot, p, t);
+        return;
+    }
 
     let (list, detail) = list_detail(f, body, 60, t);
     let w = list.width as usize;
@@ -1888,6 +1901,104 @@ fn memory(f: &mut Frame, area: Rect, p: &MemoryPanel, t: &Theme) {
                 ("s", "survey"),
                 ("r", "reflect now"),
                 ("?", "ask about it"),
+            ],
+            t,
+        )),
+        foot,
+    );
+}
+
+/// The skills tab of memory: the owner's skills, and the selected one's steps.
+fn skills_tab(f: &mut Frame, body: Rect, note: Rect, foot: Rect, p: &MemoryPanel, t: &Theme) {
+    let (list, detail) = list_detail(f, body, 60, t);
+    let w = list.width as usize;
+    let mut lines = Vec::new();
+    if p.skills.is_empty() {
+        for l in plain_wrap(
+            "No skills yet. A skill is a job you want done your way, by name. Press n and tell Reeve what to save, or say \"save that as a skill\" after it does something.",
+            w.saturating_sub(1),
+        ) {
+            lines.push(Line::from(Span::styled(l, t.muted())));
+        }
+    }
+    let mut sel_line = 0;
+    let id_w = p
+        .skills
+        .iter()
+        .map(|s| s.id.len() + 1)
+        .max()
+        .unwrap_or(0)
+        .min(w / 2);
+    for (i, s) in p.skills.iter().enumerate() {
+        let on = i == p.sel;
+        let bg = if on { t.input } else { t.panel };
+        if on {
+            sel_line = lines.len();
+        }
+        let about_w = w.saturating_sub(id_w + 3);
+        lines.push(Line::from(vec![
+            Span::styled(" ", Style::default().bg(bg)),
+            Span::styled(
+                pad(&truncate(&format!("/{}", s.id), id_w), id_w + 1),
+                Style::default()
+                    .fg(t.brass)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                pad(&truncate(&s.description, about_w), about_w + 1),
+                if on { t.text() } else { t.muted() }.bg(bg),
+            ),
+        ]));
+    }
+    for (id, why) in &p.skill_errors {
+        lines.push(Line::from(Span::styled(
+            truncate(&format!(" ! {id}.md isn't listed: {why}"), w),
+            Style::default().fg(t.warn),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(keep_in_view(lines, sel_line, list.height as usize)),
+        list,
+    );
+
+    let dw = detail.width as usize;
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if let Some(s) = p.selected_skill() {
+        out.push(Line::from(vec![
+            Span::styled(
+                s.name.clone(),
+                Style::default().fg(t.fg).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(format!(" /{} ", s.id), t.pill(t.brass)),
+        ]));
+        for l in plain_wrap(&s.description, dw) {
+            out.push(Line::from(Span::styled(l, t.text())));
+        }
+        out.push(Line::raw(""));
+        for raw in s.body.lines() {
+            if raw.trim().is_empty() {
+                out.push(Line::raw(""));
+            }
+            for l in plain_wrap(raw, dw) {
+                out.push(Line::from(Span::styled(l, t.muted())));
+            }
+        }
+        out.push(Line::raw(""));
+        for l in plain_wrap("A skill grants nothing: each step still asks as usual.", dw) {
+            out.push(Line::from(Span::styled(l, t.ghost())));
+        }
+    }
+    f.render_widget(Paragraph::new(out), detail);
+    f.render_widget(Paragraph::new(note_line(&p.note, t)), note);
+    f.render_widget(
+        Paragraph::new(keys(
+            &[
+                ("⏎", "run it"),
+                ("e", "edit"),
+                ("D", "delete"),
+                ("n", "new: tell Reeve"),
             ],
             t,
         )),

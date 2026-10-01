@@ -309,6 +309,22 @@ pub fn reboot_pending(running: &str, newest: &str) -> Option<Signal> {
     })
 }
 
+/// Arch: the running kernel's modules are gone from `/usr/lib/modules`, so
+/// a newer kernel replaced it. Loading a module fails until a reboot.
+pub fn kernel_replaced(running: &str, modules_present: bool) -> Option<Signal> {
+    (!running.is_empty() && !modules_present).then(|| {
+        sig(
+            "reboot-pending".into(),
+            Severity::Info,
+            "The running kernel was upgraded: reboot to use the new one".into(),
+            format!(
+                "Running {running}, whose modules are gone from /usr/lib/modules: plugging in new hardware or loading a module may fail until you reboot."
+            ),
+            vec![],
+        )
+    })
+}
+
 /// Security updates waiting.
 pub fn security_updates(n: usize, sample: &[String]) -> Option<Signal> {
     (n > 0).then(|| {
@@ -325,6 +341,14 @@ pub fn security_updates(n: usize, sample: &[String]) -> Option<Signal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_arch_kernel_upgrade_wants_a_reboot() {
+        assert!(kernel_replaced("6.16.8-arch1-1", true).is_none());
+        let s = kernel_replaced("6.16.8-arch1-1", false).unwrap();
+        assert_eq!(s.id, "reboot-pending");
+        assert!(kernel_replaced("", false).is_none());
+    }
 
     fn disk(mount: &str, used_pct: u64) -> Disk {
         Disk {

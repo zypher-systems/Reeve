@@ -2,6 +2,52 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-09-30: Skills: jobs done the owner's way, by name
+- **Decision:**
+  - A skill is `~/.reeve/skills/<id>.md`: a header (`name`, `description`) and steps. The system prompt lists ids and descriptions, read fresh each round; the steps load through the `skill` tool (T0) only when used.
+  - Reeve uses one when the owner types `/id`, picks it in ⌃K or on the skills tab of F8 memory, or asks for something that clearly matches a description, and it says which skill it's using. A skill grants nothing: every step meets the usual tiers.
+  - `skill_save` and `skill_delete` are `owner_only` at T1: the card shows the whole text as a diff, YOLO and broad yeses don't cover it, and unattended runs are refused. Both carry an undo. A raw write into the folder is a floor file.
+  - Three starters are written once at first launch (`tidy-downloads`, `update-everything`, `why-slow`), behind a marker file, so deleted ones stay deleted.
+  - `n` on the skills tab opens the chat with "Save a skill that …": Reeve writes it and the owner approves the text.
+  - The unattended refusal for `owner_only` no longer says "standing orders": it covers skills and AUR builds too.
+- **Chosen vs rejected:**
+  - Rejected folding skills into runbooks: a runbook is what Reeve learned, with a track record, found by search during a diagnosis. A skill is the owner's instruction, found by name. Mixing them would let reflection rewrite what the owner wrote.
+  - Rejected putting every skill's steps in the prompt: only names and one-line descriptions go in, so twenty skills cost twenty lines.
+  - Rejected letting YOLO cover `skill_save`: text from a log or a web page could talk the model into saving steps that run later, under YOLO, as trusted instructions. The owner reads each one.
+  - Rejected T2 for saving (orders are T2): a skill runs nothing by itself and grants no powers; the weight is in `owner_only`, not the tier.
+  - Rejected a form for new skills: the steps are prose, and describing the job to Reeve is the faster way to get good ones.
+  - Rejected a ninth tile: skills sit with what Reeve knows, in F8, and the board keeps its eight.
+- **Why:** The owner floated skills as recipes for recurring jobs. With orders they make Reeve "more like a bot": say how once, then name it, or schedule it.
+- **Where:** `reeve-core/src/skills.rs`, `tools/skill.rs`, `tools/mod.rs` (specs), `policy/paths.rs` (floor), `agent.rs` (prompt, refusal), `reeve-tui/src/overlay.rs` (`MemoryPanel` skills tab, `palette`, `skill_request`), `screens.rs` (`skills_tab`), `run.rs` (`skill_typed`, `delete_skill`, `skill_edited`), `panels.rs` (palette)
+- **Residual risks:**
+  - Matching a request to a skill is the model's judgment; a vague description can make it pick one the owner didn't mean. It says which skill it's using, and every step still asks.
+  - A skill the owner edits by hand is trusted as written; nothing checks its steps.
+  - A skill named like a slash command (`update`) isn't in the slash palette; it's reachable from ⌃K and F8.
+
+### 2026-09-30: Arch (M6): pacman undo from its log, the AUR on the owner's word, Omarchy's theme
+- **Decision:**
+  - pacman has no transaction ids, so a package action records what pacman logged after the log's size before it (`Undo::Pacman`: name, action, versions). Undo restores the old versions from the package cache (`pacman -U`) and removes what was new (`pacman -R`). pacman can't do both in one transaction and either may need the other first (an upgrade that pulled in a dependency; an install that upgraded a library), so each order is tried with `--print` and the one that resolves is run; if neither does, the undo is refused. `--print` skips conflict checks (`ALPM_TRANS_FLAG_NOCONFLICTS`), so when the real command refuses with nothing logged (a replace: the old package can't go back while its replacement is installed), the other order is run before giving up. A version the cache lost is named and the undo refused before anything runs. A failed command still records what it changed, and so does a failed undo: its receipt carries the inverse of the step that ran (`UndoFailed.partial`).
+  - A package the repos can't satisfy (`pacman -Sp`: a name, a group, or a provided name) is built from the AUR with paru or yay, with no prompts (`--skipreview`, or yay's `--answer* None`), through Reeve's sudo wrapper. The card shows each PKGBUILD as code (`paru|yay -Gp`, 60 lines, with the rest's command) and names any `install=` script. AUR builds are `owner_only`, through `pkg_install` or a raw `paru`/`yay` in `shell`.
+  - An empty `pkg_upgrade` stays `pacman -Syu`: AUR packages are listed apart (`aur:`) and rebuilt by name.
+  - With snap-pac, Reeve takes no pair around a pacman command and records snap-pac's instead: from the first pre to the last post, since a repo install plus an AUR build is two transactions. The pair is told apart by the newest snapshot before the command; if that list can't be read there is no mark, and Reeve takes its own pair rather than guess. Whether a command is a pacman transaction comes from the policy's tokenizer (`Assessment.pacman`), not from the words on the line.
+  - paru and yay run as the user and call sudo themselves, so a helper that changes packages sets `Assessment.sudo`: that is what arms the askpass.
+  - reeved on Arch: a reboot is pending when `/usr/lib/modules/$(uname -r)` is gone; `arch-audit -u` supplies security updates.
+  - `[ui] theme` defaults to `auto`: Omarchy's current `colors.toml`, re-read every second, or Slate off Omarchy. Custom themes use the same file format.
+  - Fixed on the way: `Assessment::merge` dropped `owner_only`, so a compound shell command could lose it.
+- **Chosen vs rejected:**
+  - Rejected rolling back with snapper alone: it needs btrfs and a root config, which many Arch installs don't have, and it rolls back everything else on the disk too.
+  - Rejected `pacman -S <name>` to undo a removal: it installs today's version, not the one removed. The cache has the exact build.
+  - Rejected letting YOLO cover AUR builds: a PKGBUILD runs arbitrary code as you and its package installs as root, and nobody reviewed it. The owner reads it each time.
+  - Rejected `paru -Syu` for system upgrades: it would build every AUR update unattended on one yes.
+  - Rejected a one-time theme import as the default: following Omarchy live is what an Omarchy user expects when they switch themes.
+  - A name pacman resolves through a provider (pfetch → pfetch-rs) stays a repo install: the reviewed package wins over an AUR build.
+- **Why:** M6 makes Arch and Omarchy as safe to hand to Reeve as Fedora: every package change undoable, and nothing from the AUR without the owner reading it.
+- **Where:** `reeve-core/src/pacman.rs`, `distro.rs` (`aur_install`, search/info/updates), `tools/sys.rs` (capture, split, revert), `undo.rs` (`Undo::Pacman`), `snapshots.rs` + `agent.rs` (snap-pac), `policy/shell.rs` and `policy/mod.rs` (`owner_only` for helpers, `merge`), `reeve-observer/src/daemon.rs` + `detect.rs` (`kernel_replaced`), `reeve-tui/src/theme.rs` (`Palette`, `from_palette`, `ThemeSource`), `cards.rs` (code lines)
+- **Residual risks:**
+  - Undo needs the old packages in pacman's cache; `paccache` or `pacman -Sc` can remove them first.
+  - Only `-Gp`'s PKGBUILD is shown: an `install=` script and patches in the AUR repo aren't, though the card names the script.
+  - Tested live on Arch in a container: pacman, its undo, and yay. paru (its prebuilt package lagged pacman's library) and snap-pac (needs btrfs and snapper) are covered by unit tests only, and the Omarchy theme by its real `colors.toml` files and screenshots, not a running Omarchy.
+
 ### 2026-09-30: Reeve checks for releases and updates itself the way it was installed
 - **Decision:**
   - reeved asks GitHub's latest-release endpoint a minute after it starts and every 12 hours (`[updates] check`, on by default). The TUI asks when reeved isn't running and the last answer is over a day old. The answer goes to `observer/update.json`, and drafts and pre-releases never count.

@@ -6,6 +6,7 @@ mod mem;
 pub mod obs;
 pub mod order;
 mod shell;
+mod skill;
 mod sys;
 
 use std::path::PathBuf;
@@ -154,6 +155,7 @@ enum Call {
     MemWrite(mem::WriteArgs),
     Findings(obs::Args),
     Order(Box<order::Planned>),
+    Skill(Box<skill::Planned>),
 }
 
 #[derive(Deserialize)]
@@ -200,6 +202,18 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
                 ctx,
                 &serde_json::from_value(args.clone()).map_err(parse)?,
             )?)),
+            "skill" => Call::Skill(Box::new(skill::prepare_read(
+                ctx,
+                &serde_json::from_value(args.clone()).map_err(parse)?,
+            )?)),
+            "skill_save" => Call::Skill(Box::new(skill::prepare_save(
+                ctx,
+                &serde_json::from_value(args.clone()).map_err(parse)?,
+            )?)),
+            "skill_delete" => Call::Skill(Box::new(skill::prepare_delete(
+                ctx,
+                &serde_json::from_value(args.clone()).map_err(parse)?,
+            )?)),
             other => return Err(format!("there is no tool named {other}")),
         }
     };
@@ -243,9 +257,11 @@ pub fn prepare(ctx: &ToolCtx, tool: &str, raw_args: &str) -> Result<Plan, String
             Vec::new(),
         ),
         Call::Order(p) => order::plan(p),
+        Call::Skill(p) => skill::plan(p),
     };
     let details = match &call {
         Call::Order(p) => order::details(p),
+        Call::Sys(c) => c.details.clone(),
         _ => Vec::new(),
     };
     let mut assessment = assessment;
@@ -282,6 +298,7 @@ pub async fn execute(ctx: &ToolCtx, plan: &Plan) -> Executed {
         Call::MemWrite(a) => mem::write(ctx, a),
         Call::Findings(a) => obs::run(ctx, a),
         Call::Order(p) => order::run(ctx, p),
+        Call::Skill(p) => skill::run(ctx, p),
     }
 }
 
@@ -371,10 +388,16 @@ pub async fn undo_receipt_by(
 ) -> crate::Result<crate::receipts::Receipt> {
     let (target, undo) = book.undo_target(seq)?;
     let root_files = matches!(&undo, Undo::Files { changes } if changes.iter().any(|c| c.root));
+    use crate::receipts::UndoFailed;
     let result = match &undo {
-        Undo::Packages { .. } | Undo::Unit { .. } => sys::revert(ctx, &undo).await,
-        _ if root_files => fs::root_revert(ctx, &undo).await,
-        _ => ctx.undo.revert(&undo).map_err(|e| e.to_string()),
+        Undo::Packages { .. } | Undo::Pacman { .. } | Undo::Unit { .. } => {
+            sys::revert(ctx, &undo).await
+        }
+        _ if root_files => fs::root_revert(ctx, &undo).await.map_err(UndoFailed::from),
+        _ => ctx
+            .undo
+            .revert(&undo)
+            .map_err(|e| UndoFailed::from(e.to_string())),
     };
     book.record_undo(&target, session, by, result)
 }
@@ -475,7 +498,7 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "pkg_search",
-            "Search available packages by name and summary.",
+            "Search available packages by name and summary (on Arch with paru or yay, the AUR too).",
             json!({"query": {"type": "string"}}),
             &["query"],
         ),
@@ -487,13 +510,13 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "pkg_list",
-            "List packages: installed (name, version, size), user (explicitly installed), leaves (nothing depends on them), or updates (pending).",
+            "List packages: installed (name, version, size), user (explicitly installed), leaves (nothing depends on them), or updates (pending; on Arch, AUR updates start with aur:).",
             json!({"which": {"type": "string", "enum": ["installed", "user", "leaves", "updates"]}, "filter": {"type": "string", "description": "Case-insensitive substring"}}),
             &[],
         ),
         spec(
             "pkg_install",
-            "Install packages (needs root). The transaction is recorded so it can be rolled back.",
+            "Install packages (needs root). On Arch, packages the repos don't have are built from the AUR with paru or yay: the owner reads each PKGBUILD on the card and says yes every time. The transaction is recorded so it can be rolled back.",
             json!({"packages": {"type": "array", "items": {"type": "string"}}}),
             &["packages"],
         ),
@@ -505,7 +528,7 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "pkg_upgrade",
-            "Upgrade the named packages, or everything when the list is empty (needs root). Recorded for rollback.",
+            "Upgrade the named packages, or everything when the list is empty (needs root). On Arch an empty list upgrades repo packages only (pacman -Syu); name AUR packages to rebuild them from the AUR. Recorded for rollback.",
             json!({"packages": {"type": "array", "items": {"type": "string"}}}),
             &[],
         ),
@@ -598,6 +621,28 @@ schedule. See existing orders with `reeve orders list` / `reeve orders show <id>
             "Delete a standing order the owner no longer wants (asks them; it can be undone). To pause one instead, order_save it with enabled false.",
             json!({"id": {"type": "string"}}),
             &["id"],
+        ),
+        spec(
+            "skill",
+            "Read one of the owner's skills: its steps, to follow when the owner names it (/id) or when their request clearly matches its description. Say which skill you're using. A skill grants nothing: each step still needs its usual approval.",
+            json!({"name": {"type": "string", "description": "The skill's id or name"}}),
+            &["name"],
+        ),
+        spec(
+            "skill_save",
+            "Save a skill: a job the owner wants done their way, to run again by name. Use it when the owner says to save how something was done as a skill, or asks for one; never on your own. Saving under an existing skill's name changes it. The owner sees the whole text and is asked every time; it can be undone.",
+            json!({
+                "name": {"type": "string", "description": "Short, for people: \"Tidy Downloads\". Its id is this in lowercase with dashes"},
+                "description": {"type": "string", "description": "One line: what it does, so it's clear when to use it"},
+                "steps": {"type": "string", "description": "The steps, in Markdown, written for yourself following them later: what to check, what to do, what to ask before, and what to report"}
+            }),
+            &["name", "description", "steps"],
+        ),
+        spec(
+            "skill_delete",
+            "Delete a skill the owner no longer wants (asks them; it can be undone).",
+            json!({"name": {"type": "string", "description": "The skill's id or name"}}),
+            &["name"],
         ),
         spec(
             "change_begin",

@@ -1052,6 +1052,38 @@ fn assess_words(
             } else if !query {
                 a.raise(Tier::T2, "changes installed packages");
             }
+            // A transaction (which snap-pac snapshots): an install or an
+            // upgrade with something to do, a package file, a removal, or a
+            // bare helper (its `-Syu`). Not a refresh, a cache clean, a
+            // download, or a print. When unsure it isn't one: Reeve then
+            // takes its own snapshots, and a spare pair costs nothing.
+            let has = |c: char| op.contains(c);
+            let targets = !positional(args).is_empty();
+            a.pacman |= if op.is_empty() {
+                prog != "pacman" && args.is_empty()
+            } else if op.starts_with("-S") {
+                !query && !"cwplg".chars().any(has) && (has('u') || targets)
+            } else {
+                (op.starts_with("-U") || op.starts_with("-R")) && !has('p') && targets
+            };
+            // An AUR helper that installs or upgrades may build from the AUR:
+            // PKGBUILDs anyone can submit. The owner says yes each time. The
+            // helper runs as you and calls sudo itself, so the askpass has to
+            // be armed though the line holds no `sudo`.
+            if prog != "pacman" && !query && !op.starts_with("-R") {
+                a.raise(
+                    Tier::T2,
+                    "may build from the AUR (user-submitted PKGBUILDs Arch doesn't review)",
+                );
+                a.owner_only = true;
+            }
+            if prog != "pacman" && !query {
+                a.sudo = true;
+                a.raise(
+                    Tier::T2,
+                    "the helper calls sudo for the part that needs root",
+                );
+            }
             if op.starts_with("-R") {
                 protected_packages(ctx, &positional(args), &mut a);
             }
@@ -2487,6 +2519,85 @@ mod tests {
             );
         }
         assert!(assess(&PathCtx::for_tests(), "sudo ls").sudo);
+    }
+
+    #[test]
+    fn aur_builds_are_the_owners_call_every_time() {
+        let ctx = PathCtx::for_tests();
+        for cmd in [
+            "paru -S foo",
+            "yay -Syu",
+            "yay",
+            "true && paru -S --noconfirm foo",
+        ] {
+            let a = assess(&ctx, cmd);
+            assert!(a.owner_only && a.tier >= Tier::T2, "{cmd}: {a:?}");
+        }
+        for cmd in [
+            "paru -Ss foo",
+            "yay -Qi foo",
+            "yay -R foo",
+            "sudo pacman -S htop",
+        ] {
+            assert!(!assess(&ctx, cmd).owner_only, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_helper_that_changes_packages_arms_sudo() {
+        // paru and yay run as you and call sudo themselves: with no `sudo`
+        // on the line, the askpass still has to be there for it.
+        let ctx = PathCtx::for_tests();
+        for cmd in ["paru -S foo", "yay", "yay -R foo", "paru -Syu"] {
+            assert!(assess(&ctx, cmd).sudo, "{cmd}");
+        }
+        for cmd in ["paru -Ss foo", "yay -Qi foo", "pacman -Q"] {
+            assert!(!assess(&ctx, cmd).sudo, "{cmd}");
+        }
+        // What pkg_install runs for an AUR-only install, with each helper.
+        for h in ["paru", "yay"] {
+            let d = crate::distro::Distro::Arch {
+                aur: Some(h.into()),
+            };
+            let cmd = d.aur_install(&["foo".into()]).unwrap();
+            let a = assess(&ctx, &cmd);
+            assert!(a.sudo && a.owner_only && a.pacman, "{cmd}: {a:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_pacman_transaction_counts_as_one() {
+        let ctx = PathCtx::for_tests();
+        for cmd in [
+            "sudo pacman -S --needed --noconfirm htop",
+            "paru -S --noconfirm foo",
+            "true && /usr/bin/yay -Syu",
+            "sudo pacman -Rs htop",
+            "sudo pacman -Syu",
+            "sudo pacman -U /var/cache/pacman/pkg/htop-3.5.2-1-x86_64.pkg.tar.zst",
+            "yay",
+        ] {
+            assert!(assess(&ctx, cmd).pacman, "{cmd}");
+        }
+        // A path, an argument, or a query isn't a transaction.
+        for cmd in [
+            "sudo rm /usr/bin/paru",
+            "sudo chmod 755 /usr/bin/pacman",
+            "sudo rm -rf /var/cache/pacman",
+            "sudo bash -c 'echo pacman'",
+            "pacman -Q",
+            "echo pacman-contrib",
+            "sudo dnf install x",
+            // pacman, but nothing a hook runs for.
+            "sudo pacman -Sy",
+            "sudo pacman -Scc",
+            "sudo pacman -Sw htop",
+            "pacman -Sp htop",
+            "sudo pacman -Rp htop",
+            "yay -Ss foo",
+        ] {
+            assert!(!assess(&ctx, cmd).pacman, "{cmd}");
+        }
     }
 
     #[test]

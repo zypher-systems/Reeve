@@ -549,7 +549,16 @@ impl Agent {
                 // What reeved is reporting, read fresh each round.
                 system: Some(format!(
                     "{}{}\n\n{}{}",
-                    system_prompt(&self.machine_profile, &self.memory.profile(3500)),
+                    system_prompt(
+                        &self.machine_profile,
+                        &self.memory.profile(3500),
+                        // Read fresh, so a skill saved a moment ago is listed.
+                        &crate::skills::prompt(
+                            &crate::skills::Skills::new(&self.tools.paths.reeve_home)
+                                .load()
+                                .0
+                        ),
+                    ),
                     self.tools
                         .paths
                         .scratch
@@ -690,11 +699,13 @@ impl Agent {
             // Nothing happened, so there's nothing to receipt.
             Err(msg) => return Ok(call_error(call, &msg, emit)),
         };
-        // Unattended runs never write standing orders: an order can't make
-        // another, and the drafter can't make one.
+        // What only the owner may say yes to (a standing order, a skill, an
+        // AUR build) never happens unattended: an order can't make another,
+        // and the drafter can't make one.
         if self.role.is_some() && plan.assessment.owner_only {
-            plan.assessment
-                .refuse("standing orders are written only in a conversation with the owner");
+            plan.assessment.refuse(
+                "only the owner can say yes to this, in a conversation with them; an unattended run can't do it",
+            );
         }
         // Unattended runs (the drafter, standing orders) write nothing on
         // their own, not even where writing otherwise needs no yes.
@@ -751,23 +762,50 @@ impl Agent {
                         draft.txn = self.txn.as_ref().map(|t| t.id.clone());
                     }
                     // Root changes get a snapper pair when snapper covers `/`.
-                    let snap =
-                        if plan.assessment.sudo && a.tier >= Tier::T2 && self.cfg.snapshots.enabled
-                        {
-                            match crate::snapshots::root_config(&self.tools).await {
-                                Some(c) => crate::snapshots::pre(&self.tools, &c, &plan.summary)
-                                    .await
-                                    .map(|n| (c, n)),
-                                None => None,
+                    // pacman (and the AUR helpers, which sudo on their own) counts
+                    // as root; with snap-pac it takes the pair itself.
+                    let pacman = matches!(self.tools.distro, crate::distro::Distro::Arch { .. })
+                        && plan.assessment.pacman;
+                    let snap = if (plan.assessment.sudo || pacman)
+                        && a.tier >= Tier::T2
+                        && self.cfg.snapshots.enabled
+                    {
+                        match crate::snapshots::root_config(&self.tools).await {
+                            Some(c) => {
+                                // snap-pac's pair is told apart by what was
+                                // newest before. If that can't be read, a
+                                // guess would claim snapshots this command
+                                // never took: Reeve takes its own pair.
+                                let mark = if pacman && crate::snapshots::snap_pac() {
+                                    crate::snapshots::newest(&self.tools, &c).await
+                                } else {
+                                    None
+                                };
+                                match mark {
+                                    Some(mark) => Some(Snap::SnapPac(c, mark)),
+                                    None => crate::snapshots::pre(&self.tools, &c, &plan.summary)
+                                        .await
+                                        .map(|n| Snap::Own(c, n)),
+                                }
                             }
-                        } else {
-                            None
-                        };
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
                     let ex = tools::execute(&self.tools, &plan).await;
-                    if let Some((config, pre)) = snap {
-                        let post =
-                            crate::snapshots::post(&self.tools, &config, pre, &plan.summary).await;
-                        draft.snapshot = Some(crate::snapshots::SnapPair { config, pre, post });
+                    match snap {
+                        Some(Snap::Own(config, pre)) => {
+                            let post =
+                                crate::snapshots::post(&self.tools, &config, pre, &plan.summary)
+                                    .await;
+                            draft.snapshot = Some(crate::snapshots::SnapPair { config, pre, post });
+                        }
+                        Some(Snap::SnapPac(config, mark)) => {
+                            draft.snapshot =
+                                crate::snapshots::snap_pac_pair(&self.tools, &config, mark).await;
+                        }
+                        None => {}
                     }
                     draft.outcome = ex.outcome;
                     draft.undo = ex.undo;
@@ -1275,7 +1313,7 @@ command. Don't ask the owner to reveal a masked value, and don't invent placehol
 
 /// Reeve's standing instructions. The machine profile grows into the
 /// memory layer's summary in M3.
-pub fn system_prompt(machine_profile: &str, memory: &str) -> String {
+pub fn system_prompt(machine_profile: &str, memory: &str, skills: &str) -> String {
     format!(
         "You are Reeve, an operator agent that manages this computer for its owner. \
 You are not a coding assistant: your job is the health, tidiness, and configuration \
@@ -1331,6 +1369,14 @@ it in plain words, so don't ask them to confirm it in chat first. Say what it wi
 to change it (Orders, F7). Change an order with order_save and its id; pause one with enabled \
 false; order_delete removes it. Root commands in an order need a sudoers rule the owner adds \
 (Orders shows it); say so when an order uses sudo.\n\n\
+## Skills\n\
+A skill is a job the owner wants done their way, saved by name. When they name one (/id), or \
+their request clearly matches one listed below, read it with the skill tool, say which skill \
+you're using, and follow its steps. A skill grants nothing: every step still needs its usual \
+approval. When the owner says to save how you did something as a skill, or asks for one, write \
+it with skill_save: steps for yourself to follow later, with what to check first, what to ask \
+before doing, and what to report. They read and approve its whole text each time, so don't ask \
+them to confirm it in chat first. A standing order's task can say to use a skill.\n\n\
 ## Memory\n\
 You remember this machine between sessions. Before diagnosing a problem, memory_search \
 for a runbook. After a fix passes its checks, record it (memory_write runbook, or its outcome \
@@ -1338,8 +1384,21 @@ on the runbook you used). Save facts you learn from tool output that will matter
 When the owner tells you how they want things done, save it as a preference in their \
 words: it takes effect once they confirm it. Never store secrets.\n\n\
 Machine:\n{machine_profile}\n\n\
-{memory}"
+{memory}{}",
+        if skills.is_empty() {
+            String::new()
+        } else {
+            format!("\n{skills}")
+        }
     )
+}
+
+/// The snapshots around one root action.
+enum Snap {
+    /// Reeve's own pre snapshot (config, number); the post follows.
+    Own(String, u64),
+    /// snap-pac takes the pair; this is the newest number before it.
+    SnapPac(String, u64),
 }
 
 #[cfg(test)]
@@ -1547,6 +1606,87 @@ mod tests {
         let r = &ReceiptBook::new(&a.home).all()[0];
         assert_eq!(r.outcome.status, Status::Refused);
         assert!(crate::orders::Orders::new(&a.home).load().0.is_empty());
+    }
+
+    fn skill_call() -> Vec<StreamDelta> {
+        call(
+            "skill_save",
+            serde_json::json!({
+                "name": "Clear thumbnails",
+                "description": "Empty the thumbnail cache when it's over 500 MB",
+                "steps": "1. Measure ~/.cache/thumbnails.\n2. Over 500 MB: ask, then empty it.",
+                "reason": "the owner said to save it as a skill"
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn saving_a_skill_asks_the_owner_even_on_yolo() {
+        let approver = fixed(Decision::AllowTurn, true);
+        let (_home, mut a) = agent(
+            vec![
+                skill_call(),
+                call("skill", serde_json::json!({"name": "clear-thumbnails"})),
+                call("shell", serde_json::json!({"command": "echo x > ~/y"})),
+                done("done"),
+            ],
+            approver.clone(),
+        );
+        run(&mut a).await;
+        let asked = approver.asked.lock().unwrap();
+        assert_eq!(
+            asked.len(),
+            1,
+            "YOLO doesn't answer for a skill; reading one never asks"
+        );
+        let card = &asked[0];
+        assert_eq!(card.tool, "skill_save");
+        assert!(!card.can_allow_turn && !card.can_allow_session);
+        assert!(card.preview.is_some(), "the card shows the text");
+        let s = crate::skills::Skills::new(&a.home)
+            .find("clear-thumbnails")
+            .unwrap();
+        assert!(s.body.contains("ask, then empty it"));
+        let receipts = ReceiptBook::new(&a.home).all();
+        assert_eq!(
+            (receipts[0].tool.as_str(), receipts[0].approved_by.as_str()),
+            ("skill_save", "user")
+        );
+        assert!(receipts[0].undo.is_some());
+        // Its yes didn't carry over: the echo went on YOLO.
+        assert_eq!(receipts.last().unwrap().approved_by, "yolo");
+        assert!(!a.turn_allowed);
+    }
+
+    #[tokio::test]
+    async fn an_unattended_run_reads_skills_but_never_writes_one() {
+        let approver = fixed(Decision::Approve, true);
+        let (_home, mut a) = agent(
+            vec![
+                skill_call(),
+                call("skill", serde_json::json!({"name": "why-slow"})),
+                done("ok"),
+            ],
+            approver.clone(),
+        );
+        crate::skills::Skills::new(&a.home)
+            .seed_examples_once()
+            .unwrap();
+        a.set_role("order:x");
+        run(&mut a).await;
+        assert!(approver.asked.lock().unwrap().is_empty());
+        let receipts = ReceiptBook::new(&a.home).all();
+        assert_eq!(receipts[0].outcome.status, Status::Refused);
+        assert!(
+            crate::skills::Skills::new(&a.home)
+                .find("clear-thumbnails")
+                .is_none()
+        );
+        assert_eq!(
+            receipts[1].outcome.status,
+            Status::Ok,
+            "an order may follow a skill"
+        );
     }
 
     #[tokio::test]

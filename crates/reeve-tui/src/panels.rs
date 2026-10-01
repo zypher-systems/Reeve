@@ -251,7 +251,7 @@ fn everything(f: &mut Frame, area: Rect, e: &crate::overlay::EverythingPanel, t:
 
 /// The command list, just above the composer, while a `/word` is typed.
 pub fn draw_palette(f: &mut Frame, composer: Rect, v: &View, t: &Theme) {
-    let hits = palette(&v.input);
+    let hits = palette(&v.input, &v.skills);
     if hits.is_empty() || !v.overlays.is_empty() {
         return;
     }
@@ -265,10 +265,22 @@ pub fn draw_palette(f: &mut Frame, composer: Rect, v: &View, t: &Theme) {
     };
     f.render_widget(Clear, r);
     crate::board::shadow(f, r, t);
-    let block = panel("commands", t, true);
+    let title = if hits.iter().any(|h| h.skill) {
+        "commands and skills"
+    } else {
+        "commands"
+    };
+    let block = panel(title, t, true);
     let inner = block.inner(r);
     f.render_widget(block, r);
     let sel = v.palette_sel.min(hits.len() - 1);
+    // One column for the names, as wide as the longest shown.
+    let name_w = hits
+        .iter()
+        .map(|h| h.name.len() + 1)
+        .max()
+        .unwrap_or(0)
+        .clamp(12, (inner.width as usize) / 2);
     let lines: Vec<Line> = hits
         .iter()
         .enumerate()
@@ -278,14 +290,17 @@ pub fn draw_palette(f: &mut Frame, composer: Rect, v: &View, t: &Theme) {
             Line::from(vec![
                 Span::styled(" ", Style::default().bg(bg)),
                 Span::styled(
-                    pad(c.name, 12),
+                    pad(&truncate(&c.name, name_w.saturating_sub(1)), name_w),
                     Style::default()
                         .fg(t.brass)
                         .bg(bg)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    pad(c.about, inner.width.saturating_sub(13) as usize),
+                    pad(
+                        &truncate(&c.about, (inner.width as usize).saturating_sub(name_w + 1)),
+                        (inner.width as usize).saturating_sub(name_w + 1),
+                    ),
                     Style::default().fg(if on { t.fg } else { t.dim }).bg(bg),
                 ),
             ])

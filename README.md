@@ -99,10 +99,18 @@ sudo and nowhere else: not to the model, a log, or a receipt. You can let Reeve 
 - Root-owned files are changed in place by `sudo reeve root`, so owner, mode, and SELinux label are kept.
   Undo copies go to `/var/lib/reeve/undo` (root-only). Edits to `/etc/sudoers*` and `/etc/fstab` must pass
   `visudo -c` / `findmnt --verify` first.
-- Package changes record their dnf transaction, so undo runs `dnf history undo`. Service changes record
-  the unit's previous state.
+- Package changes can be undone. On Fedora the receipt records the dnf transaction, and undo runs
+  `dnf history undo`. On Arch it records what pacman logged (installed, upgraded, removed, with versions),
+  and undo puts the old versions back from pacman's cache and removes what was new, in whichever order
+  pacman accepts. If the cache was cleaned, undo says which version is missing and changes nothing. Service changes record the unit's
+  previous state.
+- On Arch, a package the repos don't have is built from the AUR with paru or yay. The approval card shows
+  its PKGBUILD, and you're asked every time: YOLO and session yeses never cover it, and standing orders
+  can't do it. A system upgrade (`pacman -Syu`) leaves AUR packages alone; they're listed with `aur:` and
+  upgraded by name.
 - With snapper configured for `/`, each root action is wrapped in a pre/post snapshot pair. The receipt holds
-  the numbers for `snapper undochange`. Reeve won't create a snapper config unless you ask.
+  the numbers for `snapper undochange`. With snap-pac, pacman takes that pair itself, and the receipt
+  records snap-pac's. Reeve won't create a snapper config unless you ask.
 - `reeve undo N` from a terminal asks for sudo there.
 
 ## Memory
@@ -207,6 +215,21 @@ The model writes orders only through `order_save` and `order_delete`, which alwa
 conversation: an order run or the drafter can't write one, so an order can never make another. Writing an
 order file any other way (a file tool, the shell) is on the floor (T3), and so is undoing a change to one.
 
+## Skills
+
+A skill is a job you want done your way, saved by name in `~/.reeve/skills/<id>.md`: a one-line
+description and the steps.
+
+- **Run one** with `/id` (anything you type after it goes along), from ⌃K, or with `⏎` on the skills tab
+  of F8 memory. Reeve also uses a skill when what you ask clearly matches its description, and says so.
+- **Make one** by telling Reeve: do something, then say "save that as a skill" (or press `n` on the skills
+  tab and describe it). The approval card shows the whole text, and you're asked every time; YOLO doesn't
+  cover it. You can also write or edit the file yourself (`e`).
+- **A skill grants nothing.** Every step still asks the way it always would.
+- Three starters are written the first time Reeve runs: `tidy-downloads`, `update-everything`, and
+  `why-slow`. Delete them and they stay deleted.
+- A standing order can use a skill: "every Sunday, use the tidy-downloads skill".
+
 ## The state of the machine
 
 `/report` (or `reeve report --days 1|7|30`) draws one page and opens it in your browser:
@@ -278,9 +301,12 @@ The composer is always at the bottom. On an open tile it knows what's selected: 
 | `^c` | stop, clear, then quit |
 | `ctrl+l` | redraw the screen (if the terminal cleared it: Konsole's ctrl+shift+k does) |
 
-The default theme is **slate** (cool near-black, filled tiles). `[ui] theme = "ink"` is the warm charcoal
-of 0.2.0, and `"brass"` the original navy and brass. With 16 colors or none, tiles get borders instead of
-fills.
+The default theme is `auto`: on Omarchy, Reeve takes Omarchy's current theme and follows
+`omarchy-theme-set` while it runs; elsewhere it's **slate** (cool near-black, filled tiles).
+`[ui] theme = "ink"` is the warm charcoal of 0.2.0, and `"brass"` the original navy and brass. A theme
+of your own goes in `~/.reeve/themes/<name>.toml` with the keys of Omarchy's `colors.toml`
+(`background`, `foreground`, `accent`, `red`, `green`, …), so any Omarchy theme's file works as it is:
+`theme = "<name>"`. With 16 colors or none, tiles get borders instead of fills.
 
 ## Layout
 
