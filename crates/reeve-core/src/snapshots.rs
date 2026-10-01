@@ -96,14 +96,18 @@ fn snap_pac_in(hooks: &std::path::Path, overrides: &std::path::Path) -> bool {
 }
 
 /// The newest snapshot number in `config`, so snap-pac's new pair can be
-/// told apart afterwards.
+/// told apart afterwards. `None` when the list couldn't be read: there is
+/// then no mark, and no telling which snapshots a command took.
 pub async fn newest(ctx: &ToolCtx, config: &str) -> Option<u64> {
     let cmd = format!(
         "sudo snapper -c {} --csvout list --columns number",
         crate::distro::quote(config)
     );
-    let out = exec(ctx, &cmd, true).await?;
-    out.lines()
+    parse_newest(&exec(ctx, &cmd, true).await?)
+}
+
+fn parse_newest(csv: &str) -> Option<u64> {
+    csv.lines()
         .skip(1)
         .filter_map(|l| l.trim().parse().ok())
         .max()
@@ -166,6 +170,17 @@ mod tests {
             parse_pair("number,type,pre-number\n50,pre,\n", 45),
             Some((50, None))
         );
+    }
+
+    #[test]
+    fn no_list_is_no_mark() {
+        // A config with only snapper's own snapshot 0 has a mark; a list
+        // that failed or came back empty has none (never 0 by default,
+        // which would claim every snapshot there is).
+        assert_eq!(parse_newest("number\n0\n"), Some(0));
+        assert_eq!(parse_newest("number\n0\n41\n7\n"), Some(41));
+        assert_eq!(parse_newest(""), None);
+        assert_eq!(parse_newest("number\n"), None);
     }
 
     #[test]

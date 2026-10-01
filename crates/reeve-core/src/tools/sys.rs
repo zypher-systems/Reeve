@@ -635,15 +635,66 @@ async fn resolves(ctx: &ToolCtx, check: &str) -> bool {
     report(&out).outcome.status == Status::Ok
 }
 
+/// One order of a pacman undo, run. `Err` carries whether pacman changed
+/// nothing at all (it refused before its first transaction).
+async fn run_undo(
+    ctx: &ToolCtx,
+    paths: &crate::pacman::Paths,
+    cmd: &str,
+) -> Result<(Undo, String), (crate::receipts::UndoFailed, bool)> {
+    use crate::receipts::UndoFailed;
+    let mark = crate::pacman::mark(&paths.log);
+    let out = run_command(
+        ctx,
+        RunSpec {
+            command: cmd,
+            cwd: &ctx.paths.home,
+            timeout: Duration::from_secs(PKG_TIMEOUT),
+            sudo: true,
+            stdin: None,
+        },
+    )
+    .await;
+    let e = report(&out);
+    // Whatever pacman did, finished or not, is in its log.
+    let back = crate::pacman::changes_since(&paths.log, mark);
+    if e.outcome.status != Status::Ok {
+        if back.is_empty() {
+            // sudo never let it start (no password): the other order
+            // would only ask again.
+            let sudo = e.output.lines().any(|l| l.starts_with("sudo: "));
+            return Err((e.outcome.summary.into(), !sudo));
+        }
+        // The first step went through and the second failed. The receipt
+        // for this failed undo carries the inverse of the first, so the
+        // half that happened can be taken back.
+        let why = format!(
+            "{}; it stopped partway: {}",
+            e.outcome.summary,
+            crate::pacman::summary(&back)
+        );
+        let partial = Some(Undo::Pacman { changes: back });
+        return Err((UndoFailed { why, partial }, false));
+    }
+    if back.is_empty() {
+        let why = format!("pacman ran, but logged no change: {}", e.outcome.summary);
+        return Err((why.into(), false));
+    }
+    let summary = format!("undid it: {}", crate::pacman::summary(&back));
+    Ok((Undo::Pacman { changes: back }, summary))
+}
+
 /// Undo pacman's changes from its cache: the old versions back, what was
 /// new out. Those are two transactions, and either may need the other done
-/// first, so each order is tried without changing anything and the one
-/// that resolves is run.
+/// first. Each order is tried with `--print` (nothing changes) and the one
+/// that resolves is run. `--print` checks dependencies but not conflicts,
+/// so the real command can still refuse (a package that replaced another:
+/// the old one can't go back while its replacement is installed). A refusal
+/// changes nothing, and the other order is run before giving up.
 async fn revert_pacman(
     ctx: &ToolCtx,
     changes: &[crate::pacman::PkgChange],
 ) -> Result<(Undo, String), crate::receipts::UndoFailed> {
-    use crate::receipts::UndoFailed;
     let paths = crate::pacman::Paths::detect();
     let plan = crate::pacman::undo_plan(changes, &paths.caches, crate::pacman::list_dir);
     if !plan.missing.is_empty() {
@@ -653,6 +704,7 @@ async fn revert_pacman(
         )
         .into());
     }
+    let two_steps = plan.restore_command().is_some() && plan.remove_command().is_some();
     let remove_first = match (plan.restore_check(), plan.remove_check()) {
         (Some(restore), Some(remove)) => {
             if resolves(ctx, &restore).await {
@@ -673,43 +725,23 @@ async fn revert_pacman(
     let cmd = plan
         .command(remove_first)
         .ok_or("those changes are already undone: nothing to put back or remove")?;
-    let mark = crate::pacman::mark(&paths.log);
-    let out = run_command(
-        ctx,
-        RunSpec {
-            command: &cmd,
-            cwd: &ctx.paths.home,
-            timeout: Duration::from_secs(PKG_TIMEOUT),
-            sudo: true,
-            stdin: None,
-        },
-    )
-    .await;
-    let e = report(&out);
-    // Whatever pacman did, finished or not, is in its log.
-    let back = crate::pacman::changes_since(&paths.log, mark);
-    if e.outcome.status != Status::Ok {
-        // The first step can go through and the second fail. The receipt
-        // for this failed undo then carries the inverse of the first, so
-        // the half that happened can be taken back.
-        return Err(if back.is_empty() {
-            e.outcome.summary.into()
-        } else {
-            UndoFailed {
-                why: format!(
-                    "{}; it stopped partway: {}",
-                    e.outcome.summary,
-                    crate::pacman::summary(&back)
-                ),
-                partial: Some(Undo::Pacman { changes: back }),
-            }
-        });
+    let first = match run_undo(ctx, &paths, &cmd).await {
+        Ok(done) => return Ok(done),
+        Err((e, unchanged)) if unchanged && two_steps => e,
+        Err((e, _)) => return Err(e),
+    };
+    let Some(other) = plan.command(!remove_first) else {
+        return Err(first);
+    };
+    match run_undo(ctx, &paths, &other).await {
+        Ok(done) => Ok(done),
+        Err((e, true)) => Err(format!(
+            "pacman refused the undo in either order, so nothing was changed. First: {}. Then: {}",
+            first.why, e.why
+        )
+        .into()),
+        Err((e, false)) => Err(e),
     }
-    if back.is_empty() {
-        return Err(format!("pacman ran, but logged no change: {}", e.outcome.summary).into());
-    }
-    let summary = format!("undid it: {}", crate::pacman::summary(&back));
-    Ok((Undo::Pacman { changes: back }, summary))
 }
 
 /// Reverse a dnf transaction or a unit change.
@@ -964,16 +996,18 @@ mod tests {
                 .success()
                 .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
         };
-        // lib 1, 2, and 3 (3 needs dep); app needs lib>=2; user needs dep.
+        // lib 1, 2, and 3 (3 needs dep); app needs lib>=2; user needs dep;
+        // new conflicts with old.
         let build = r#"set -eu
 d=$(mktemp -d); cd "$d"
-mk() { # name ver depends
+mk() { # name ver depends conflicts
   mkdir -p "$1-$2"; cat > "$1-$2/PKGBUILD" <<EOF
 pkgname=reeve-t-$1
 pkgver=$2
 pkgrel=1
 arch=(any)
 depends=($3)
+conflicts=(${4:-})
 package() { install -d "\$pkgdir/usr/share/reeve-t"; echo $2 > "\$pkgdir/usr/share/reeve-t/$1"; }
 EOF
   (cd "$1-$2" && makepkg -f --nodeps >/dev/null 2>&1)
@@ -981,7 +1015,8 @@ EOF
 }
 mk lib 1 ""; mk lib 2 ""; mk lib 3 "reeve-t-dep"; mk dep 1 ""
 mk app 1 "'reeve-t-lib>=2'"; mk user 1 "reeve-t-dep"
-for p in reeve-t-user reeve-t-app reeve-t-lib reeve-t-dep; do
+mk old 1 ""; mk new 1 "" "reeve-t-old"
+for p in reeve-t-user reeve-t-app reeve-t-lib reeve-t-dep reeve-t-old reeve-t-new; do
   sudo pacman -Rdd --noconfirm $p >/dev/null 2>&1 || true
 done
 "#;
@@ -1037,6 +1072,24 @@ done
         let partial = failed.partial.expect("the half that ran has an inverse");
         revert(&c, &partial).await.unwrap();
         assert_eq!(version("reeve-t-lib").as_deref(), Some("reeve-t-lib 3-1"));
+
+        // A package that replaced another. `--print` doesn't see the
+        // conflict, so putting the old one back looks fine and is refused
+        // for real; nothing changed, and the other order does it.
+        install(&[pkg("old", 1)]);
+        let paths = Paths::detect();
+        let m = mark(&paths.log);
+        assert!(sh(&format!("yes | sudo pacman -U {}", pkg("new", 1))));
+        let replaced = Undo::Pacman {
+            changes: changes_since(&paths.log, m),
+        };
+        println!("{replaced:?}");
+        assert_eq!(version("reeve-t-old"), None, "new replaced old");
+        let (_, summary) = revert(&c, &replaced).await.unwrap();
+        println!("{summary}");
+        assert_eq!(version("reeve-t-new"), None);
+        assert!(version("reeve-t-old").is_some());
+        assert!(sh("sudo pacman -R --noconfirm reeve-t-old"));
 
         // A cache that lost a version: refused before anything runs.
         assert!(sh(&format!("sudo rm {}", pkg("lib", 2))));

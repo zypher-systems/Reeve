@@ -771,14 +771,23 @@ impl Agent {
                         && self.cfg.snapshots.enabled
                     {
                         match crate::snapshots::root_config(&self.tools).await {
-                            Some(c) if pacman && crate::snapshots::snap_pac() => {
-                                let mark =
-                                    crate::snapshots::newest(&self.tools, &c).await.unwrap_or(0);
-                                Some(Snap::SnapPac(c, mark))
+                            Some(c) => {
+                                // snap-pac's pair is told apart by what was
+                                // newest before. If that can't be read, a
+                                // guess would claim snapshots this command
+                                // never took: Reeve takes its own pair.
+                                let mark = if pacman && crate::snapshots::snap_pac() {
+                                    crate::snapshots::newest(&self.tools, &c).await
+                                } else {
+                                    None
+                                };
+                                match mark {
+                                    Some(mark) => Some(Snap::SnapPac(c, mark)),
+                                    None => crate::snapshots::pre(&self.tools, &c, &plan.summary)
+                                        .await
+                                        .map(|n| Snap::Own(c, n)),
+                                }
                             }
-                            Some(c) => crate::snapshots::pre(&self.tools, &c, &plan.summary)
-                                .await
-                                .map(|n| Snap::Own(c, n)),
                             None => None,
                         }
                     } else {

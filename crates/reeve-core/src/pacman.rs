@@ -1,11 +1,14 @@
 //! pacman's side of package undo. pacman has no transaction ids, so Reeve
 //! reads what its own command changed out of `/var/log/pacman.log` (every
 //! install, upgrade, downgrade, and removal, with versions), and undoes it
-//! from the package cache: the old versions go back with `pacman -U`, then
-//! what was new comes out with `pacman -R`.
+//! from the package cache: the old versions go back with `pacman -U`, and
+//! what was new comes out with `pacman -R`. Those are two transactions.
+//! This module plans them; which goes first is the caller's choice, by
+//! what pacman accepts (`tools::sys`), and an undo that stops between the
+//! two is recorded so the half that ran can be taken back.
 //!
 //! An undo that needs a version the cache no longer has (`paccache` cleans
-//! it) is refused before anything runs, never done halfway.
+//! it) is refused before anything runs.
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};

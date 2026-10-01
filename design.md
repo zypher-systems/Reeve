@@ -463,9 +463,10 @@ trait Distro {
   pacman logged it (`/var/log/pacman.log`: installed, upgraded, downgraded, removed, with versions),
   and undo puts the old versions back from the package cache with `pacman -U` and removes what was
   new with `pacman -R`. Those are two transactions and either may need the other done first, so
-  Reeve tries each order with `--print` (nothing changes) and runs the one that resolves. A version
-  the cache lost, or changes neither order can take apart, are named and the undo refused before
-  anything runs. An undo that stops between its two steps leaves a receipt that takes back the
+  Reeve tries each order with `--print` (nothing changes) and runs the one that resolves. `--print`
+  checks dependencies but not conflicts, so if pacman then refuses for real (a package that replaced
+  another), which changes nothing, the other order is run. A version the cache lost, or changes
+  neither order can take apart, are named and the undo refused before anything runs. An undo that stops between its two steps leaves a receipt that takes back the
   step that ran.
   - **The AUR**, through `paru` or `yay`: a package the repos can't satisfy (by name, group, or
     something a repo package provides) is built with the helper, asking nothing, through Reeve's
