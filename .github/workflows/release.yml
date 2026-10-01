@@ -30,13 +30,11 @@ jobs:
       matrix:
         include:
           # Static musl binaries: they run on any Linux, whatever its glibc.
-          # Both build on a standard x86_64 runner: aarch64 is cross-compiled
-          # with `cross`, and QEMU runs it for the smoke and installer tests.
           - target: x86_64-unknown-linux-musl
-            cargo: cargo
+            os: ubuntu-latest
           - target: aarch64-unknown-linux-musl
-            cargo: cross
-    runs-on: ubuntu-latest
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -47,20 +45,9 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: musl tools
-        if: matrix.cargo == 'cargo'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: cross
-        if: matrix.cargo == 'cross'
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross@0.2.5
-      - name: QEMU, to run what cross builds
-        if: matrix.cargo == 'cross'
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
       - name: build
-        run: ${{ matrix.cargo }} build --release --locked -p reeve-cli --target ${{ matrix.target }}
+        run: cargo build --release --locked -p reeve-cli --target ${{ matrix.target }}
       - name: smoke test
         run: |
           target/${{ matrix.target }}/release/reeve --version
@@ -69,23 +56,16 @@ jobs:
         run: packaging/dist.sh ${{ matrix.target }} dist
       - name: installer, end to end
         # Install from the archive just built, into a scratch home, exactly
-        # as a user would; then uninstall. aarch64 runs it in an arm64
-        # container under QEMU, so the installer sees the machine it's for.
+        # as a user would; then uninstall.
         run: |
           set -eu
-          test='set -eu
-          export HOME=/tmp/reeve-home
+          export HOME="$RUNNER_TEMP/home"
           mkdir -p "$HOME"
           ./install.sh --from dist/reeve-${{ matrix.target }}.tar.gz --user --no-start
           "$HOME/.local/bin/reeve" --version
           grep -q "ExecStart=$HOME/.local/bin/reeve daemon run" "$HOME/.local/share/systemd/user/reeved.service"
           ./install.sh --user --uninstall
-          test ! -e "$HOME/.local/bin/reeve"'
-          if [ "${{ matrix.cargo }}" = cross ]; then
-            docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w alpine:3.20 sh -c "$test"
-          else
-            sh -c "$test"
-          fi
+          test ! -e "$HOME/.local/bin/reeve"
       - name: rpm
         run: |
           set -eu
