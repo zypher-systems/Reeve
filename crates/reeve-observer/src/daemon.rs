@@ -552,10 +552,14 @@ pub async fn run_observer(home: PathBuf, once: bool) -> Result<(), String> {
     );
     // reeved runs the installed binary (an update restarts it), so this is
     // what's on disk.
-    let mut st = reeve_core::update::UpdateState::load(&home);
-    if st.installed.as_deref() != Some(reeve_core::update::CURRENT) {
-        st.installed = Some(reeve_core::update::CURRENT.into());
-        let _ = st.save(&home);
+    if reeve_core::update::UpdateState::load(&home)
+        .installed
+        .as_deref()
+        != Some(reeve_core::update::CURRENT)
+    {
+        let _ = reeve_core::update::UpdateState::modify(&home, |s| {
+            s.installed = Some(reeve_core::update::CURRENT.into());
+        });
     }
     minute.tick().await;
     hour.tick().await;

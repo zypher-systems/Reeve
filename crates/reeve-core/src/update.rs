@@ -234,7 +234,27 @@ impl UpdateState {
             .unwrap_or_default()
     }
 
-    /// Write it.
+    /// Read, change, and write it under a lock, so reeved's check and
+    /// `reeve update` never drop each other's fields (the rollback target
+    /// above all).
+    pub fn modify(reeve_home: &Path, f: impl FnOnce(&mut Self)) -> Result<Self> {
+        let dir = reeve_home.join("observer");
+        fs::create_dir_all(&dir)?;
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(".update.lock"))?;
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+            .map_err(|e| Error::Io(format!("update lock: {e}")))?;
+        let mut s = Self::load(reeve_home);
+        f(&mut s);
+        s.save(reeve_home)?;
+        drop(lock);
+        Ok(s)
+    }
+
+    /// Write it. Use [`UpdateState::modify`] to change what's there.
     pub fn save(&self, reeve_home: &Path) -> Result<()> {
         let p = Self::path(reeve_home);
         if let Some(d) = p.parent() {
@@ -279,10 +299,14 @@ impl UpdateState {
 /// Ask GitHub and record the answer. A failure is recorded, not returned.
 pub async fn check(reeve_home: &Path) -> UpdateState {
     let answer = latest().await;
-    let mut s = UpdateState::load(reeve_home);
-    s.record(Utc::now(), answer);
-    let _ = s.save(reeve_home);
-    s
+    UpdateState::modify(reeve_home, |s| s.record(Utc::now(), answer))
+        .unwrap_or_else(|_| UpdateState::load(reeve_home))
+}
+
+/// The person's home directory, as the rest of Reeve finds it (from passwd
+/// when `HOME` isn't set). `None` rather than an empty path.
+pub fn user_home() -> Option<PathBuf> {
+    dirs::home_dir().filter(|p| !p.as_os_str().is_empty())
 }
 
 /// How this copy of Reeve got onto the machine.
@@ -317,13 +341,16 @@ pub enum Install {
 /// The package manager that owns a path, and the package.
 pub type Owner = Option<(&'static str, String)>;
 
-/// Work out how `bin` was installed. `home` is the person's home directory;
+/// Work out how `bin` was installed. `home` is the person's home directory
+/// (empty when there's none: then nothing counts as a home install);
 /// `owner` asks the package managers.
 pub fn classify(bin: &Path, home: &Path, owner: impl Fn(&Path) -> Owner) -> Install {
     let s = bin.to_string_lossy();
+    // Every path starts with an empty one.
+    let in_home = |p: &Path| !home.as_os_str().is_empty() && p.starts_with(home);
     if s.contains("/target/debug/")
         || s.contains("/target/release/")
-        || bin.starts_with(home.join(".cargo"))
+        || in_home(bin) && bin.starts_with(home.join(".cargo"))
     {
         return Install::Source(bin.into());
     }
@@ -343,7 +370,7 @@ pub fn classify(bin: &Path, home: &Path, owner: impl Fn(&Path) -> Owner) -> Inst
     Install::Copied {
         bin: bin.into(),
         prefix: dir.parent().unwrap_or(Path::new("/")).to_path_buf(),
-        user: bin.starts_with(home),
+        user: in_home(bin),
     }
 }
 
@@ -578,6 +605,35 @@ mod tests {
             classify(Path::new("/opt/tools/reeve"), home, none),
             Install::Unknown("/opt/tools/reeve".into())
         );
+        // No home known: a system install stays a system install.
+        assert_eq!(
+            classify(Path::new("/usr/local/bin/reeve"), Path::new(""), none),
+            Install::Copied {
+                bin: "/usr/local/bin/reeve".into(),
+                prefix: "/usr/local".into(),
+                user: false
+            }
+        );
+    }
+
+    #[test]
+    fn changes_to_the_state_keep_each_others_fields() {
+        let d = tempfile::tempdir().unwrap();
+        UpdateState::modify(d.path(), |s| s.previous = Some("0.4.0".into())).unwrap();
+        let now = Utc::now();
+        let after = UpdateState::modify(d.path(), |s| {
+            s.record(
+                now,
+                Ok(Release {
+                    version: Version(0, 6, 0),
+                    url: String::new(),
+                }),
+            )
+        })
+        .unwrap();
+        assert_eq!(after.previous.as_deref(), Some("0.4.0"));
+        assert_eq!(after.latest.as_deref(), Some("0.6.0"));
+        assert_eq!(UpdateState::load(d.path()), after);
     }
 
     #[test]

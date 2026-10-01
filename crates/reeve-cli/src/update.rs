@@ -81,9 +81,8 @@ pub fn run(home: &Path, opts: Opts) -> Result<(), String> {
         (v, None)
     } else {
         let answer = rt.block_on(update::latest());
-        let mut st = UpdateState::load(home);
-        st.record(chrono::Utc::now(), answer.clone());
-        let _ = st.save(home);
+        let seen = answer.clone();
+        let _ = UpdateState::modify(home, |s| s.record(chrono::Utc::now(), seen));
         let r = answer?;
         if r.version <= running {
             println!("Reeve {running} is the newest release.");
@@ -106,7 +105,7 @@ pub fn run(home: &Path, opts: Opts) -> Result<(), String> {
     let bin = std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .map_err(|e| format!("can't tell where this reeve is: {e}"))?;
-    let me = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let me = update::user_home().unwrap_or_default();
     let install = update::classify(&bin, &me, update::package_owner);
     let plan = plan(&install, &me, running, to, latest)?;
     println!("{}", plan.describe);
@@ -118,19 +117,41 @@ pub fn run(home: &Path, opts: Opts) -> Result<(), String> {
     }
 
     let dir = home.join("update");
-    let result = rt.block_on(execute(&plan, to, &dir)).and_then(|summary| {
-        match (version_of(&bin), &plan.kind) {
-            (Some(v), _) if v == to => Ok(summary),
-            // The AUR's package may trail the release.
-            (Some(v), Kind::Aur { .. }) => Ok(format!("{summary}; the AUR package is {v}")),
-            (v, _) => Err(format!(
-                "the install finished, but {} reports {}",
-                bin.display(),
-                v.map_or("no version".into(), |v| v.to_string())
-            )),
-        }
-    });
+    let outcome = rt.block_on(execute(&plan, to, &dir));
     let _ = fs::remove_dir_all(&dir);
+
+    // What's on disk decides what happened, whatever the installer said: a
+    // failed install may already have replaced the binary, and then
+    // --rollback must still know what to put back.
+    let after = version_of(&bin);
+    let changed = after.is_some_and(|v| v != running);
+    if changed {
+        let _ = UpdateState::modify(home, |s| {
+            s.previous = Some(running.to_string());
+            s.installed = after.map(|v| v.to_string());
+        });
+    }
+    let aur = matches!(plan.kind, Kind::Aur { .. });
+    let result = match (outcome, after) {
+        (Err(e), _) => Err(e),
+        (Ok(summary), Some(v)) if v == to => Ok(summary),
+        // The AUR's package may trail the release.
+        (Ok(_), Some(v)) if aur && v == running => Err(format!(
+            "the AUR package is still {running}; it hasn't caught up with {to} yet"
+        )),
+        (Ok(summary), Some(v)) if aur => Ok(format!("{summary}; the AUR package is {v}")),
+        (Ok(_), v) => Err(format!(
+            "the install finished, but {} reports {}",
+            bin.display(),
+            v.map_or("no version".into(), |v| v.to_string())
+        )),
+    };
+    let back = match &plan.kind {
+        Kind::Aur { package, .. } => format!(
+            "To go back, install {running} from the pacman cache: ls /var/cache/pacman/pkg/{package}-*, then sudo pacman -U <file>."
+        ),
+        _ => format!("`reeve update --rollback` goes back to {running}."),
+    };
 
     let mut r = Receipt::draft(
         "cli",
@@ -158,18 +179,18 @@ pub fn run(home: &Path, opts: Opts) -> Result<(), String> {
     let receipt = ReceiptBook::new(home)
         .append(r)
         .map_err(|e| e.to_string())?;
-    let summary = result.map_err(|e| format!("{e} (receipt #{})", receipt.seq))?;
-
-    let installed = version_of(&bin).unwrap_or(to);
-    let mut st = UpdateState::load(home);
-    st.previous = Some(running.to_string());
-    st.installed = Some(installed.to_string());
-    let _ = st.save(home);
+    let summary = match result {
+        Ok(s) => s,
+        Err(e) => {
+            if let (true, Some(v)) = (changed, after) {
+                eprintln!("{} is now Reeve {v}. {back}", bin.display());
+            }
+            return Err(format!("{e} (receipt #{})", receipt.seq));
+        }
+    };
     println!("{summary} (receipt #{})", receipt.seq);
     restart_reeved(&bin);
-    println!(
-        "`reeve update --rollback` goes back to {running}. Open Reeve windows keep running {running} until you restart them."
-    );
+    println!("{back} Open Reeve windows keep running {running} until you restart them.");
     Ok(())
 }
 
@@ -216,7 +237,13 @@ fn plan(
             })
         }
         Install::Rpm { package } => {
-            let dnf = match Distro::detect() {
+            let distro = Distro::detect();
+            // Image-based Fedora layers packages with rpm-ostree; the package
+            // tools refuse there, and so does this.
+            if let Some(why) = distro.package_block() {
+                return Err(format!("{package} is an RPM, but {why}"));
+            }
+            let dnf = match distro {
                 Distro::Fedora { dnf, .. } => dnf,
                 _ => "dnf".into(),
             };
