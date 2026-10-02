@@ -660,10 +660,11 @@ async fn run_undo(
     let back = crate::pacman::changes_since(&paths.log, mark);
     if e.outcome.status != Status::Ok {
         if back.is_empty() {
-            // sudo never let it start (no password): the other order
-            // would only ask again.
-            let sudo = e.output.lines().any(|l| l.starts_with("sudo: "));
-            return Err((e.outcome.summary.into(), !sudo));
+            // If sudo itself said no, the other order would only ask
+            // again. A warning from sudo (an unresolvable host name) is
+            // not that: the command ran, and pacman refused.
+            let refused = super::shell::sudo_refused(&String::from_utf8_lossy(&out.stderr));
+            return Err((e.outcome.summary.into(), !refused));
         }
         // The first step went through and the second failed. The receipt
         // for this failed undo carries the inverse of the first, so the
