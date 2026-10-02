@@ -227,35 +227,6 @@ pub(crate) async fn run_command(ctx: &ToolCtx, spec: RunSpec<'_>) -> RunOut {
     }
 }
 
-/// sudo was given no password: the owner cancelled the prompt, or there was
-/// no one (and no terminal) to type one.
-fn sudo_got_no_password(stderr: &str) -> bool {
-    [
-        "no password was provided",
-        "a password is required",
-        "a terminal is required",
-    ]
-    .iter()
-    .any(|p| stderr.contains(p))
-}
-
-/// sudo refused to run the command at all: no password, a wrong one, or
-/// an account sudoers doesn't allow. Asking again would only prompt again.
-///
-/// Not every line sudo prints is a refusal. `sudo: unable to resolve host`
-/// and the like are warnings, and the command runs after them.
-pub(crate) fn sudo_refused(stderr: &str) -> bool {
-    sudo_got_no_password(stderr)
-        || [
-            "incorrect password attempt",
-            "is not in the sudoers file",
-            "is not allowed to run sudo",
-            "is not allowed to execute",
-        ]
-        .iter()
-        .any(|p| stderr.contains(p))
-}
-
 /// Model-facing text, one-line summary, and receipt outcome for a run.
 pub(crate) fn report(out: &RunOut) -> Executed {
     if let Some(msg) = &out.failure {
@@ -279,7 +250,10 @@ pub(crate) fn report(out: &RunOut) -> Executed {
         text.push_str("--- stderr ---\n");
         text.push_str(&cap(&se, MAX_OUTPUT / 2));
     }
-    if sudo_got_no_password(&se) {
+    if se.contains("no password was provided")
+        || se.contains("a password is required")
+        || se.contains("a terminal is required")
+    {
         text.push_str("\n[reeve] sudo got no password (the owner cancelled, or no one was there to type it). Don't retry unless asked.\n");
     }
     let last = so
@@ -416,38 +390,6 @@ mod tests {
         assert!(e.output.contains("timed out"), "{}", e.output);
         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
         assert!(!marker.exists(), "a background child outlived the timeout");
-    }
-
-    #[test]
-    fn a_sudo_warning_isnt_a_refusal() {
-        use super::sudo_refused;
-        // What sudo says when it won't run the command.
-        for refused in [
-            "sudo: a password is required",
-            "sudo: no password was provided",
-            "sudo: a terminal is required to read the password; either use the -S option to read from standard input or configure an askpass helper",
-            "Sorry, try again.\nsudo: 1 incorrect password attempt",
-            "sudo: 3 incorrect password attempts",
-            "tester is not in the sudoers file.",
-            "Sorry, user tester is not allowed to execute '/usr/bin/pacman -U x' as root on box.",
-            "Sorry, user tester may not run sudo on box.\ntester is not allowed to run sudo on box.",
-            // A warning first doesn't hide the refusal after it.
-            "sudo: unable to resolve host box: Name or service not known\nsudo: a password is required",
-        ] {
-            assert!(sudo_refused(refused), "{refused}");
-        }
-        // What it says and then runs the command anyway, and pacman's own
-        // failures: none of these is sudo saying no.
-        for ran in [
-            "sudo: unable to resolve host box: Name or service not known",
-            "sudo: unable to resolve host box: Name or service not known\nerror: failed to prepare transaction (conflicting dependencies)",
-            "sudo: setrlimit(RLIMIT_CORE): Operation not permitted",
-            "error: failed to prepare transaction (could not satisfy dependencies)",
-            "error: target not found: sudo: a-package",
-            "",
-        ] {
-            assert!(!sudo_refused(ran), "{ran}");
-        }
     }
 
     #[tokio::test]
