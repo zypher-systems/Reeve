@@ -10,7 +10,7 @@
 %global __brp_mangle_shebangs_exclude_from ^/usr/src/debug/.*$
 
 Name:           reeve
-Version:        0.6.0
+Version:        0.6.1
 Release:        1%{?dist}
 Summary:        An operator agent that manages this computer, with receipts
 
@@ -77,6 +77,9 @@ install -Dpm 0644 packaging/systemd/reeved.service %{buildroot}%{_userunitdir}/r
 %{_userunitdir}/reeved.service
 
 %changelog
+* Thu Oct 01 2026 Zypher Systems <zypher@zyphersystems.com> - 0.6.1-1
+- Arch: a warning from sudo no longer stops a package undo from trying its other order.
+
 * Thu Oct 01 2026 Zypher Systems <zypher@zyphersystems.com> - 0.6.0-1
 - Arch: package changes undo from pacman's log and cache; AUR builds show the PKGBUILD and ask every time.
 - snap-pac's snapshot pairs are recorded on receipts; reeved checks for a replaced kernel and arch-audit.

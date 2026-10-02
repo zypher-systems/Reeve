@@ -85,16 +85,32 @@ pub fn mark(log: &Path) -> u64 {
 /// The package changes logged after `mark`. A log that got shorter was
 /// rotated, so it's read from the start.
 pub fn changes_since(log: &Path, mark: u64) -> Vec<PkgChange> {
+    parse(&text_since(log, mark))
+}
+
+/// Whether pacman started after `mark`: it logs the command it was run
+/// with before it does anything, in every locale. A pacman that started
+/// and logged no change refused the transaction itself. One that never
+/// started was never reached: sudo said no, in whatever language.
+pub fn started_since(log: &Path, mark: u64) -> bool {
+    started(&text_since(log, mark))
+}
+
+fn started(text: &str) -> bool {
+    text.lines().any(|l| l.contains("] [PACMAN] Running '"))
+}
+
+fn text_since(log: &Path, mark: u64) -> String {
     let Ok(mut f) = fs::File::open(log) else {
-        return Vec::new();
+        return String::new();
     };
     let len = f.metadata().map_or(0, |m| m.len());
     let start = if len < mark { 0 } else { mark };
     let mut text = String::new();
     if f.seek(SeekFrom::Start(start)).is_err() || f.read_to_string(&mut text).is_err() {
-        return Vec::new();
+        return String::new();
     }
-    parse(&text)
+    text
 }
 
 /// Package changes in log text: the `[ALPM]` lines.
@@ -403,6 +419,26 @@ mod tests {
         ]
         .map(String::from)
         .to_vec()
+    }
+
+    #[test]
+    fn a_pacman_that_started_is_in_its_log() {
+        // Refused in prepare (a conflict): the command is logged, no change.
+        let refused = "[2026-10-01T13:04:00+0000] [PACMAN] Running 'pacman -U --noconfirm /var/cache/pacman/pkg/a-1-1-any.pkg.tar.zst'\n";
+        assert!(started(refused));
+        assert!(parse(refused).is_empty());
+        // sudo never ran it: nothing is logged, whatever sudo printed.
+        assert!(!started(""));
+        // Only pacman's own line counts.
+        assert!(!started(
+            "[2026-10-01T13:04:00+0000] [ALPM] installed a (1-1)\n"
+        ));
+        let d = tempfile::tempdir().unwrap();
+        let log = d.path().join("pacman.log");
+        fs::write(&log, refused).unwrap();
+        assert!(started_since(&log, 0));
+        assert!(!started_since(&log, mark(&log)));
+        assert!(!started_since(&d.path().join("none.log"), 0));
     }
 
     #[test]

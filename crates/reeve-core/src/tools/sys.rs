@@ -660,10 +660,13 @@ async fn run_undo(
     let back = crate::pacman::changes_since(&paths.log, mark);
     if e.outcome.status != Status::Ok {
         if back.is_empty() {
-            // sudo never let it start (no password): the other order
-            // would only ask again.
-            let sudo = e.output.lines().any(|l| l.starts_with("sudo: "));
-            return Err((e.outcome.summary.into(), !sudo));
+            // The other order is worth running only if pacman itself
+            // refused this one. Its log says whether it started; sudo's
+            // output can't (warnings look like refusals, and refusals are
+            // translated). If it never started, sudo said no, and the
+            // other order would only ask for the password again.
+            let started = crate::pacman::started_since(&paths.log, mark);
+            return Err((e.outcome.summary.into(), started));
         }
         // The first step went through and the second failed. The receipt
         // for this failed undo carries the inverse of the first, so the
@@ -1079,7 +1082,11 @@ done
         install(&[pkg("old", 1)]);
         let paths = Paths::detect();
         let m = mark(&paths.log);
-        assert!(sh(&format!("yes | sudo pacman -U {}", pkg("new", 1))));
+        // (In the C locale, so that "y" is yes.)
+        assert!(sh(&format!(
+            "yes | LC_ALL=C sudo pacman -U {}",
+            pkg("new", 1)
+        )));
         let replaced = Undo::Pacman {
             changes: changes_since(&paths.log, m),
         };
@@ -1105,5 +1112,39 @@ done
         assert!(sh(
             "sudo pacman -R --noconfirm reeve-t-user reeve-t-lib reeve-t-dep && sudo rm -f /var/cache/pacman/pkg/reeve-t-*"
         ));
+    }
+
+    /// sudo refusing is not pacman refusing: the undo stops, and doesn't
+    /// run its other order (which would ask for the password again). For a
+    /// container where sudo wants a password and can't get one, with
+    /// `reeve-t-new` installed and `reeve-t-old` in the cache (as the test
+    /// above leaves them partway): `REEVE_LIVE_SUDO_REFUSES=1`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_pacman_undo_stops_when_sudo_says_no() {
+        use crate::pacman::{Paths, PkgChange, mark, started_since};
+        if std::env::var("REEVE_LIVE_SUDO_REFUSES").is_err() {
+            return;
+        }
+        let change = |name: &str, action: &str, from: Option<&str>, to: Option<&str>| PkgChange {
+            name: name.into(),
+            action: action.into(),
+            from: from.map(String::from),
+            to: to.map(String::from),
+        };
+        let replaced = Undo::Pacman {
+            changes: vec![
+                change("reeve-t-old", "removed", Some("1-1"), None),
+                change("reeve-t-new", "installed", None, Some("1-1")),
+            ],
+        };
+        let c = ToolCtx::new(tempfile::tempdir().unwrap().keep(), vec![]);
+        let paths = Paths::detect();
+        let m = mark(&paths.log);
+        let failed = revert(&c, &replaced).await.unwrap_err();
+        println!("{}", failed.why);
+        assert!(!started_since(&paths.log, m), "pacman never ran");
+        assert!(failed.partial.is_none());
+        assert!(!failed.why.contains("either order"), "{}", failed.why);
     }
 }
