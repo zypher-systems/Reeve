@@ -553,12 +553,18 @@ impl App {
                 }
             }
             UiMsg::SessionReset(session) => {
-                view.session_id = session;
+                if !session.is_empty() {
+                    view.session_id = session;
+                }
                 view.entries.clear();
                 view.session = Default::default();
                 view.last = None;
                 view.scroll = 0;
-                view.push(Speaker::System, "New session.");
+                view.push(
+                    Speaker::System,
+                    "New session: the chat is cleared and Reeve starts fresh. \
+                     Receipts, memory, and findings are kept.",
+                );
             }
         }
     }
@@ -821,6 +827,7 @@ impl App {
             KeyCode::Char('y') if ctrl => self.toggle_yolo(view),
             KeyCode::Char('r') if ctrl => self.command(view, "/receipts"),
             KeyCode::Char('p') if ctrl => self.command(view, "/providers"),
+            KeyCode::Char('n') if ctrl => self.command(view, "/new"),
             KeyCode::Char('w') if ctrl => view.delete_word(),
             KeyCode::Char('u') if ctrl => {
                 view.input.clear();
@@ -2590,8 +2597,8 @@ async fn agent_loop(
                     ));
                 }
             },
-            AgentWork::NewSession => {
-                if let Some(a) = agent.as_mut() {
+            AgentWork::NewSession => match agent.as_mut() {
+                Some(a) => {
                     if auto_reflect && a.has_actions() {
                         reflect_now(a, &tx).await;
                     }
@@ -2602,7 +2609,12 @@ async fn agent_loop(
                         Err(e) => emit(AgentEvent::Error(e.to_string())),
                     }
                 }
-            }
+                // Not connected: there's no transcript to drop, but the
+                // chat still clears. The session id comes with Ready.
+                None => {
+                    let _ = tx.send(UiMsg::SessionReset(String::new()));
+                }
+            },
             AgentWork::Connect(cfg) => {
                 auto_reflect = cfg.memory.auto_reflect;
                 connect(&mut agent, *cfg, &home, &profile, &tx).await;

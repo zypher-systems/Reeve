@@ -102,7 +102,7 @@ pub fn render(meta: &Meta, transcript: &[Message], receipts: &[Receipt], tally: 
                 Some(Undo::Packages { transaction, .. }) => {
                     format!("package transaction {transaction}")
                 }
-                Some(Undo::Pacman { changes }) => {
+                Some(Undo::Pacman { changes } | Undo::Apt { changes }) => {
                     format!("packages: {}", crate::pacman::summary(changes))
                 }
                 Some(Undo::Unit { unit, .. }) => format!("{unit}'s previous state"),

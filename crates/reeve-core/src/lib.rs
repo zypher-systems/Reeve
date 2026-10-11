@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+pub mod apt;
 pub mod config;
 pub mod diff;
 pub mod distro;

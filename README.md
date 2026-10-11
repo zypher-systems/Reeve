@@ -29,6 +29,8 @@ Packages:
 - **Fedora:** `sudo dnf install ./reeve-<version>-1.x86_64.rpm` from the release, or build from source with
   `packaging/fedora/reeve.spec` (offline, with the vendored crates each release ships).
 - **Arch / Omarchy:** the release's `PKGBUILD` (`reeve-bin`), or `packaging/arch/reeve` to build from source.
+- **Debian / Ubuntu:** the installer above (the binaries are static, so they run on any release). There's no
+  `.deb` yet.
 
 With a package, start the observer yourself: `systemctl --user enable --now reeved` (or `reeve daemon install`).
 
@@ -102,8 +104,15 @@ sudo and nowhere else: not to the model, a log, or a receipt. You can let Reeve 
 - Package changes can be undone. On Fedora the receipt records the dnf transaction, and undo runs
   `dnf history undo`. On Arch it records what pacman logged (installed, upgraded, removed, with versions),
   and undo puts the old versions back from pacman's cache and removes what was new, in whichever order
-  pacman accepts. If the cache was cleaned, undo says which version is missing and changes nothing. Service changes record the unit's
+  pacman accepts. If the cache was cleaned, undo says which version is missing and changes nothing. On Debian
+  and Ubuntu it records what dpkg logged, and undo is one `apt-get` that puts the old versions back from
+  `/var/cache/apt/archives` and removes what was new; `apt-get -s` runs first, and if the undo would also
+  take out a package installed since, it's refused with nothing changed. Service changes record the unit's
   previous state.
+- On Debian, `pkg_install` and `pkg_upgrade` run `apt-get update` first, keep a config file you edited rather
+  than stop at a prompt (`--force-confold`), and an empty upgrade is `apt-get upgrade --with-new-pkgs`: nothing
+  is removed, and what would need a removal is held back. `pkg_remove` is `apt-get remove`: config files stay,
+  and nothing else goes. needrestart lists services on old libraries instead of restarting them; ask Reeve to.
 - On Arch, a package the repos don't have is built from the AUR with paru or yay. The approval card shows
   its PKGBUILD, and you're asked every time: YOLO and session yeses never cover it, and standing orders
   can't do it. A system upgrade (`pacman -Syu`) leaves AUR packages alone; they're listed with `aur:` and
@@ -295,6 +304,7 @@ The composer is always at the bottom. On an open tile it knows what's selected: 
 | `$` | the spend statement (from an empty composer) |
 | `/` | commands: `/providers`, `/model`, `/findings`, `/orders`, `/spend`, `/system`, `/memory`, `/report`, `/privacy`, `/observer`, `/reflect`, `/receipts`, `/new`, `/yolo`, `/help`, `/quit` |
 | `^p` / `^r` | `/providers` / activity (`u` undo, `v` verify) |
+| `^n` | a fresh session (`/new`): the chat clears and Reeve forgets the conversation; receipts, memory, findings, and the board stay. For leaving Reeve open as a dashboard between tasks |
 | `⏎` `a` `s` `n` | on an approval: approve · yes to the rest of this request (or of the verified change) · this kind of change all session · deny |
 | `^y` | YOLO: auto-approve T0–T2 actions. The safeguard floor still asks. |
 | `pgup` / `pgdn`, mouse wheel | scroll the chat |

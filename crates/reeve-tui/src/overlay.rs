@@ -72,7 +72,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/new",
-        about: "start a fresh session",
+        about: "start a fresh session: clear the chat, keep everything else (ctrl+n)",
     },
     Command {
         name: "/yolo",

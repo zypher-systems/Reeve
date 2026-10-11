@@ -325,6 +325,51 @@ pub fn kernel_replaced(running: &str, modules_present: bool) -> Option<Signal> {
     })
 }
 
+/// Debian: the running kernel's package was upgraded under the same name
+/// (a security build with the same ABI), so `/proc/version`'s build no
+/// longer matches the installed version. `proc_version` is
+/// `Linux version 6.1.0-37-amd64 (…) #1 SMP PREEMPT_DYNAMIC Debian 6.1.140-1 (2025-05-22)`.
+pub fn kernel_rebuilt(running: &str, installed: &str, proc_version: &str) -> Option<Signal> {
+    let build = proc_version
+        .split_once(" Debian ")
+        .or_else(|| proc_version.split_once(" Ubuntu "))
+        .and_then(|(_, rest)| rest.split_whitespace().next())?;
+    (!running.is_empty() && !installed.is_empty() && installed != build).then(|| {
+        sig(
+            "reboot-pending".into(),
+            Severity::Info,
+            "The running kernel was updated in place: reboot to use the new build".into(),
+            format!("Running {running} build {build}; installed is {installed}."),
+            vec![],
+        )
+    })
+}
+
+/// Debian and Ubuntu: a package's postinst left `/var/run/reboot-required`.
+/// `pkgs` is `/var/run/reboot-required.pkgs` (one package a line, maybe
+/// empty), or empty when the flag file isn't there.
+pub fn reboot_required(pkgs: &str) -> Option<Signal> {
+    let names: Vec<&str> = pkgs
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    (!pkgs.is_empty()).then(|| {
+        let detail = if names.is_empty() {
+            "/var/run/reboot-required is set.".to_string()
+        } else {
+            format!("/var/run/reboot-required is set, by {}.", names.join(", "))
+        };
+        sig(
+            "reboot-pending".into(),
+            Severity::Info,
+            "A reboot is required: an update asked for one".into(),
+            detail,
+            vec![],
+        )
+    })
+}
+
 /// Security updates waiting.
 pub fn security_updates(n: usize, sample: &[String]) -> Option<Signal> {
     (n > 0).then(|| {
@@ -474,6 +519,31 @@ mod tests {
     fn reboot_and_updates() {
         assert!(reboot_pending("6.17.4-200.fc44.x86_64", "6.17.5-200.fc44.x86_64").is_some());
         assert!(reboot_pending("a", "a").is_none());
+        // Debian: a new ABI is a new package name…
+        assert!(reboot_pending("6.1.0-37-amd64", "6.1.0-38-amd64").is_some());
+        // …and a rebuild under the same name shows in /proc/version.
+        let proc = "Linux version 6.1.0-37-amd64 (debian-kernel@lists.debian.org) (gcc-12 (Debian 12.2.0-14+deb12u1) 12.2.0, GNU ld (GNU Binutils for Debian) 2.40) #1 SMP PREEMPT_DYNAMIC Debian 6.1.140-1 (2025-05-22)\n";
+        assert!(kernel_rebuilt("6.1.0-37-amd64", "6.1.140-1", proc).is_none());
+        let s = kernel_rebuilt("6.1.0-37-amd64", "6.1.147-1", proc).unwrap();
+        assert_eq!(s.id, "reboot-pending");
+        assert!(s.detail.contains("6.1.140-1") && s.detail.contains("6.1.147-1"));
+        assert!(kernel_rebuilt("6.1.0-37-amd64", "", proc).is_none());
+        assert!(
+            kernel_rebuilt(
+                "7.2.8-200.fc44.x86_64",
+                "x",
+                "Linux version 7.2.8 (mockbuild) #1 SMP"
+            )
+            .is_none()
+        );
+        assert!(reboot_required("").is_none());
+        assert!(reboot_required("\n").unwrap().detail.ends_with("is set."));
+        assert!(
+            reboot_required("linux-image-6.1.0-38-amd64\nlibc6\n")
+                .unwrap()
+                .detail
+                .contains("linux-image-6.1.0-38-amd64, libc6")
+        );
         assert!(security_updates(0, &[]).is_none());
     }
 }

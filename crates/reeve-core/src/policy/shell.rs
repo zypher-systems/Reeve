@@ -593,6 +593,11 @@ const READ_ONLY: &[&str] = &[
     "locale",
     "systemd-cgls",
     "systemd-cgtop",
+    "apt-cache",
+    "apt-config",
+    "dpkg-query",
+    "dpkg-architecture",
+    "debsums",
     "ss",
     "netstat",
     "ping",
@@ -1086,6 +1091,52 @@ fn assess_words(
             }
             if op.starts_with("-R") {
                 protected_packages(ctx, &positional(args), &mut a);
+            }
+        }
+        "apt-get" | "apt" | "aptitude" => assess_apt(ctx, args, &mut a),
+        "dpkg" => assess_dpkg(ctx, args, &mut a),
+        "apt-mark" => {
+            let verb = positional(args).first().copied().unwrap_or("");
+            if !verb.is_empty() && !verb.starts_with("show") {
+                a.raise(
+                    Tier::T2,
+                    "changes which packages are held or marked automatic",
+                );
+            }
+        }
+        "dpkg-reconfigure" => a.raise(Tier::T2, "changes a package's configuration"),
+        "update-alternatives" => {
+            let reads = [
+                "--display",
+                "--list",
+                "--query",
+                "--get-selections",
+                "--all",
+            ];
+            if !args.iter().any(|x| reads.contains(&x.as_str())) {
+                a.raise(Tier::T2, "changes which program a name runs");
+            }
+        }
+        "needrestart" => {
+            // `-b` reports, `-r l` lists; anything else restarts services.
+            let lists = has_flag(args, 'b', "--batch")
+                || args.iter().any(|x| x == "-rl" || x == "-l")
+                || args.windows(2).any(|w| w[0] == "-r" && w[1] == "l");
+            if !lists {
+                a.raise(Tier::T2, "restarts services");
+            }
+        }
+        "unattended-upgrade" | "unattended-upgrades" => {
+            if !args.iter().any(|x| x == "--dry-run") {
+                a.raise(Tier::T2, "changes installed packages");
+            }
+        }
+        "add-apt-repository" | "apt-add-repository" | "apt-key" => {
+            if !args
+                .iter()
+                .any(|x| x == "--list" || x == "list" || x == "-L")
+            {
+                a.raise(Tier::T2, "changes package sources or their keys");
             }
         }
         "snap" => {
@@ -2205,6 +2256,174 @@ fn assess_dnf(ctx: &PathCtx, args: &[String], a: &mut Assessment) {
     }
 }
 
+/// apt's positionals: the verb and the packages. Options that take a value
+/// (`-o Dpkg::Options::=…`, `-t bookworm-backports`) don't give one up.
+fn apt_positional(args: &[String]) -> Vec<&str> {
+    const TAKES_VALUE: &[&str] = &[
+        "-o",
+        "--option",
+        "-c",
+        "--config-file",
+        "-t",
+        "--target-release",
+        "--default-release",
+        "-a",
+        "--host-architecture",
+        "-P",
+        "--build-profiles",
+        "-S",
+        "--snapshot",
+    ];
+    let mut out = Vec::new();
+    let (mut skip, mut rest) = (false, false);
+    for a in args {
+        if rest {
+            out.push(a.as_str());
+        } else if skip {
+            skip = false;
+        } else if a == "--" {
+            rest = true;
+        } else if TAKES_VALUE.contains(&a.as_str()) {
+            skip = true;
+        } else if !a.starts_with('-') {
+            out.push(a.as_str());
+        }
+    }
+    out
+}
+
+/// apt-get, apt, aptitude: queries and simulations (`-s`) are reads;
+/// everything else changes packages, the lists, or the cache. `install
+/// foo-` removes foo, so it meets the floor like `remove foo`.
+fn assess_apt(ctx: &PathCtx, args: &[String], a: &mut Assessment) {
+    let pos = apt_positional(args);
+    let verb = pos.first().copied().unwrap_or("");
+    let simulate = args.iter().any(|x| {
+        matches!(
+            x.as_str(),
+            "--simulate" | "--just-print" | "--dry-run" | "--recon" | "--no-act"
+        )
+    }) || has_flag(args, 's', "--simulate");
+    let read_verbs = [
+        "list",
+        "show",
+        "search",
+        "policy",
+        "depends",
+        "rdepends",
+        "showsrc",
+        "changelog",
+        "madison",
+        "help",
+        "check",
+        "showpkg",
+        "stats",
+        "dump",
+        "dumpavail",
+        "pkgnames",
+        "indextargets",
+        "why",
+        "why-not",
+        "versions",
+        "moo",
+    ];
+    if verb.is_empty() || read_verbs.contains(&verb) || simulate {
+        return;
+    }
+    if args
+        .iter()
+        .any(|x| x == "--allow-remove-essential" || x == "--force-yes")
+    {
+        a.raise(
+            Tier::T3,
+            "allows removing essential packages, which the system can't run without",
+        );
+    }
+    match verb {
+        "download" | "source" => {
+            a.raise_keyed(
+                Tier::T1,
+                "downloads package files into the current directory",
+                format!("run:apt-get {verb}"),
+            );
+        }
+        "update" => a.raise(Tier::T2, "refreshes the package lists"),
+        "clean" | "autoclean" | "auto-clean" => a.raise(Tier::T2, "changes the package cache"),
+        "edit-sources" => a.raise(Tier::T2, "changes package sources"),
+        "remove" | "purge" | "autoremove" | "auto-remove" | "autopurge" => {
+            let names: Vec<&str> = pos[1..].iter().map(|p| p.trim_end_matches('+')).collect();
+            protected_packages(ctx, &names, a);
+            a.raise(Tier::T2, "changes installed packages");
+        }
+        _ => {
+            // `install` and the rest: a trailing `-` removes that package.
+            let removed: Vec<&str> = pos[1..]
+                .iter()
+                .filter_map(|p| p.strip_suffix('-'))
+                .collect();
+            protected_packages(ctx, &removed, a);
+            a.raise(Tier::T2, "changes installed packages");
+        }
+    }
+}
+
+/// dpkg: listing, searching, and inspecting are reads; installing,
+/// removing, and configuring change packages. Removing while forcing past
+/// dependencies or essential status is the floor, like `rpm -e --nodeps`.
+fn assess_dpkg(ctx: &PathCtx, args: &[String], a: &mut Assessment) {
+    let remove = has_flag(args, 'r', "--remove") || has_flag(args, 'P', "--purge");
+    let forced = |name: &str| args.iter().any(|x| x == name);
+    let past_essential = forced("--force-all")
+        || forced("--force-remove-essential")
+        || forced("--force-remove-protected");
+    if remove && (past_essential || forced("--force-depends")) {
+        a.raise(
+            Tier::T3,
+            "removes a package while ignoring what depends on it",
+        );
+    } else if past_essential {
+        a.raise(
+            Tier::T3,
+            "forces dpkg past the checks that keep the system bootable",
+        );
+    }
+    let changes = remove
+        || has_flag(args, 'i', "--install")
+        || has_flag(args, 'A', "--record-avail")
+        || args.iter().any(|x| {
+            matches!(
+                x.as_str(),
+                "--unpack"
+                    | "--configure"
+                    | "--triggers-only"
+                    | "--set-selections"
+                    | "--clear-selections"
+                    | "--add-architecture"
+                    | "--remove-architecture"
+                    | "--update-avail"
+                    | "--merge-avail"
+                    | "--clear-avail"
+                    | "--forget-old-unavail"
+            )
+        });
+    if changes {
+        a.raise(Tier::T2, "changes installed packages");
+    } else if has_flag(args, 'x', "--extract")
+        || has_flag(args, 'X', "--vextract")
+        || has_flag(args, 'e', "--control")
+        || args.iter().any(|x| x == "--raw-extract")
+    {
+        a.raise_keyed(
+            Tier::T1,
+            "unpacks a package into a directory",
+            "run:dpkg --extract",
+        );
+    }
+    if remove {
+        protected_packages(ctx, &positional(args), a);
+    }
+}
+
 /// Packages whose removal breaks the system, and the running kernel.
 fn protected_packages(ctx: &PathCtx, pkgs: &[&str], a: &mut Assessment) {
     const PROTECTED: &[&str] = &[
@@ -2235,15 +2454,52 @@ fn protected_packages(ctx: &PathCtx, pkgs: &[&str], a: &mut Assessment) {
         "openssh-server",
         "polkit",
         "pam",
+        // Debian and its family.
+        "libc6",
+        "dpkg",
+        "apt",
+        "base-files",
+        "base-passwd",
+        "login",
+        "passwd",
+        "init",
+        "systemd-sysv",
+        "udev",
+        "dash",
+        "mount",
+        "e2fsprogs",
+        "initramfs-tools",
+        "grub-pc",
+        "grub-efi-amd64",
+        "grub-efi-amd64-signed",
+        "grub-efi-arm64",
+        "grub-efi-arm64-signed",
+        "shim-signed",
+        "grub-common",
+        "grub2-common",
+        "linux-image-amd64",
+        "linux-image-arm64",
+        "network-manager",
+        "ifupdown",
+        "netplan.io",
+        "libpam-modules",
+        "libpam-runtime",
     ];
     for p in pkgs {
-        let name = p.trim();
-        if PROTECTED.contains(&name) || name == "kernel*" || name == "kernel-core*" {
+        // `libc6:amd64`, `htop=3.2.2-2`: the name is what's before.
+        let name = p.trim().split_once(['=', ':']).map_or(p.trim(), |(n, _)| n);
+        let kernel_glob = matches!(
+            name,
+            "kernel*" | "kernel-core*" | "linux-image*" | "linux-image-*"
+        );
+        if PROTECTED.contains(&name) || kernel_glob {
             a.raise(
                 Tier::T3,
                 format!("removes {name}, which the system can't run without"),
             );
-        } else if !ctx.kernel.is_empty() && name.starts_with("kernel") && name.contains(&ctx.kernel)
+        } else if !ctx.kernel.is_empty()
+            && (name.starts_with("kernel") || name.starts_with("linux-image-"))
+            && name.contains(&ctx.kernel)
         {
             a.raise(Tier::T3, "removes the running kernel");
         }
@@ -2462,6 +2718,20 @@ mod tests {
             "btrfs filesystem usage /",
             "efibootmgr -v",
             "fdisk -l",
+            "apt list --installed 2>/dev/null | wc -l",
+            "apt-cache policy htop",
+            "apt show htop",
+            "apt-get -s upgrade",
+            "apt-get -s -q install --allow-downgrades /var/cache/apt/archives/htop_3.2.2-2_amd64.deb nano-",
+            "dpkg -l 'linux-image*'",
+            "dpkg -S /usr/bin/htop",
+            "dpkg -L htop",
+            "dpkg-query -W -f='${binary:Package} ${Version}\\n'",
+            "apt-mark showmanual",
+            "apt-config dump",
+            "needrestart -b",
+            "update-alternatives --display editor",
+            "unattended-upgrade --dry-run",
         ] {
             assert_eq!(
                 tier(cmd),
@@ -2510,6 +2780,21 @@ mod tests {
             "sudo -u root ls",
             "pacman -Syu",
             "yay",
+            "sudo apt-get install htop",
+            "apt-get update",
+            "sudo apt-get update -qq; sudo apt-get install -y -o Dpkg::Options::=--force-confold htop",
+            "apt remove htop",
+            "sudo apt-get upgrade -y --with-new-pkgs",
+            "sudo apt-get install -y --allow-downgrades -o Dpkg::Options::=--force-confold /var/cache/apt/archives/htop_3.2.2-2_amd64.deb nano-",
+            "sudo dpkg -i foo.deb",
+            "sudo dpkg --configure -a",
+            "sudo apt-mark hold linux-image-amd64",
+            "sudo dpkg-reconfigure tzdata",
+            "sudo update-alternatives --set editor /usr/bin/vim.basic",
+            "needrestart",
+            "sudo unattended-upgrade",
+            "sudo add-apt-repository ppa:x/y",
+            "apt-get clean",
         ] {
             assert_eq!(
                 tier(cmd),
@@ -2566,6 +2851,34 @@ mod tests {
     }
 
     #[test]
+    fn debians_running_kernel_is_the_floor() {
+        let ctx = PathCtx {
+            kernel: "6.1.0-37-amd64".into(),
+            ..PathCtx::for_tests()
+        };
+        for cmd in [
+            "sudo apt-get remove linux-image-6.1.0-37-amd64",
+            "sudo apt purge -y linux-image-6.1.0-37-amd64",
+            "sudo dpkg -P linux-image-6.1.0-37-amd64",
+            "sudo apt-get install -y linux-image-6.1.0-37-amd64-",
+        ] {
+            assert_eq!(assess(&ctx, cmd).tier, Tier::T3, "{cmd}");
+        }
+        // Another kernel can go; `-o`'s value isn't a package.
+        for cmd in [
+            "sudo apt-get remove -y linux-image-6.1.0-36-amd64",
+            "sudo apt-get -o Dpkg::Options::=--force-confold remove -y linux-image-6.1.0-36-amd64",
+            "sudo apt-get -t bookworm-backports install linux-image-amd64",
+        ] {
+            assert_eq!(assess(&ctx, cmd).tier, Tier::T2, "{cmd}");
+        }
+        assert_eq!(
+            apt_positional(&["-y", "-o", "X=1", "install", "a", "--", "-b"].map(String::from)),
+            ["install", "a", "-b"]
+        );
+    }
+
+    #[test]
     fn only_a_pacman_transaction_counts_as_one() {
         let ctx = PathCtx::for_tests();
         for cmd in [
@@ -2619,6 +2932,16 @@ mod tests {
             "dnf remove kernel-core-6.17.4-200.fc44.x86_64",
             "rpm -e --nodeps glibc",
             "pacman -Rdd linux",
+            "apt-get remove libc6",
+            "sudo apt purge -y systemd",
+            "apt-get remove 'linux-image*'",
+            "sudo apt-get install -y libc6-",
+            "sudo apt-get -y --allow-remove-essential remove bash",
+            "sudo apt-get --force-yes remove htop",
+            "sudo dpkg -r --force-depends dpkg",
+            "sudo dpkg --purge --force-all bash",
+            "sudo dpkg -r libc6:amd64",
+            "sudo apt-get -o Dpkg::Options::=--force-confold remove apt",
             "echo 'x' | sudo tee /etc/sudoers.d/nopass",
             "sudo cp fstab.new /etc/fstab",
             "systemctl stop sshd",

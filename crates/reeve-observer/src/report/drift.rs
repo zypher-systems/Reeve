@@ -2,7 +2,7 @@
 //! and kernels.
 //!
 //! Some of it needs no history. rpm records when each package was
-//! installed, pacman logs every transaction, and file times show `/etc`
+//! installed, pacman and dpkg log every change, and file times show `/etc`
 //! edits. What those can't show (a package removed on Fedora, a unit
 //! enabled or disabled) comes from comparing daily snapshots, which reeved
 //! takes in `~/.reeve/observer/state/`.
@@ -171,6 +171,22 @@ pub fn take(distro: &Distro) -> State {
                 }
             }
         }
+        Distro::Debian { .. } => {
+            let out = run(
+                "dpkg-query",
+                &[
+                    "-W",
+                    "-f=${db:Status-Status}\\t${binary:Package}\\t${Version}\\n",
+                ],
+            )
+            .unwrap_or_default();
+            for l in out.lines() {
+                let mut f = l.split('\t');
+                if let (Some("installed"), Some(n), Some(v)) = (f.next(), f.next(), f.next()) {
+                    add(n.to_string(), v.to_string());
+                }
+            }
+        }
         Distro::Other(_) => {}
     }
     State {
@@ -241,10 +257,23 @@ fn is_kernel(name: &str) -> bool {
     matches!(
         base,
         "kernel" | "kernel-core" | "linux" | "linux-lts" | "linux-zen" | "linux-hardened"
-    )
+    ) || name
+        .strip_prefix("linux-image-")
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
 }
 
-/// One line of pacman's log.
+/// `6.1.0-37-amd64` against `6.1.0-38-amd64`: by numeric runs, like
+/// `sort -V`, so 10 comes after 9.
+fn version_order(a: &str, b: &str) -> std::cmp::Ordering {
+    let parts = |s: &str| -> Vec<(u64, String)> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .map(|p| (p.parse::<u64>().unwrap_or(u64::MAX), p.to_string()))
+            .collect()
+    };
+    parts(a).cmp(&parts(b))
+}
+
+/// One line of pacman's or dpkg's log.
 struct PacEvent {
     at: DateTime<Utc>,
     installed: bool,
@@ -289,6 +318,52 @@ fn pacman_events(text: &str, since: DateTime<Utc>) -> Vec<PacEvent> {
         out.push(PacEvent {
             at,
             installed: verb == "installed",
+            name: name.to_string(),
+            from,
+            to,
+        });
+    }
+    out
+}
+
+/// dpkg's log, in local time: `2026-10-11 02:30:43 upgrade reeve-t-lib:all 1 2`,
+/// `install htop:amd64 <none> 3.2.2-2`, `remove nano:amd64 7.2-1 <none>`.
+/// A purge of an installed package logs `remove` too, so `purge` alone is
+/// config files going, not a package.
+fn dpkg_events(text: &str, since: DateTime<Utc>) -> Vec<PacEvent> {
+    let mut out = Vec::new();
+    for l in text.lines() {
+        let mut f = l.split_whitespace();
+        let (Some(day), Some(clock), Some(verb), Some(name), Some(from), Some(to)) =
+            (f.next(), f.next(), f.next(), f.next(), f.next(), f.next())
+        else {
+            continue;
+        };
+        let Ok(naive) =
+            chrono::NaiveDateTime::parse_from_str(&format!("{day} {clock}"), "%Y-%m-%d %H:%M:%S")
+        else {
+            continue;
+        };
+        let Some(at) = naive.and_local_timezone(Local).single() else {
+            continue;
+        };
+        let at = at.with_timezone(&Utc);
+        if at < since {
+            continue;
+        }
+        let version = |v: &str| (v != "<none>").then(|| v.to_string());
+        let (from, to) = match verb {
+            "install" => (None, version(to)),
+            "upgrade" | "downgrade" => (version(from), version(to)),
+            "remove" => (version(from), None),
+            _ => continue,
+        };
+        if to.is_none() && from.is_none() {
+            continue;
+        }
+        out.push(PacEvent {
+            at,
+            installed: verb == "install",
             name: name.to_string(),
             from,
             to,
@@ -392,12 +467,39 @@ pub fn gather(home: &Path, distro: &Distro, since: DateTime<Utc>, receipts: &[Re
                     .or(Some("a newer kernel".into()));
             }
         }
+        Distro::Debian { .. } => {
+            d.source = "dpkg's log".into();
+            // This month's log and last month's: logrotate turns it over
+            // monthly, and the window can span that.
+            let mut log = fs::read_to_string("/var/log/dpkg.log.1").unwrap_or_default();
+            log.push_str(&fs::read_to_string("/var/log/dpkg.log").unwrap_or_default());
+            let (installed, upgraded, removed) = net_changes(dpkg_events(&log, since));
+            d.installed = installed;
+            d.upgraded = upgraded;
+            d.removed = removed;
+            // The newest installed kernel package, against the one running
+            // (a new ABI is a new package name).
+            let running = run("uname", &["-r"]).unwrap_or_default();
+            let running = running.trim();
+            let newest = now
+                .packages
+                .keys()
+                .filter_map(|n| n.strip_prefix("linux-image-"))
+                .filter(|n| n.starts_with(|c: char| c.is_ascii_digit()))
+                .map(|n| n.split_once(':').map_or(n, |(a, _)| a))
+                .max_by(|a, b| version_order(a, b));
+            if let Some(newest) = newest {
+                if !running.is_empty() && running != newest {
+                    d.reboot_for = Some(newest.to_string());
+                }
+            }
+        }
         Distro::Other(_) => d.source = "daily snapshots".into(),
     }
     if let Some(b) = &base {
         // Removals only a snapshot can show (Fedora), and everything on
         // distros Reeve doesn't read logs for.
-        if !matches!(distro, Distro::Arch { .. }) {
+        if !matches!(distro, Distro::Arch { .. } | Distro::Debian { .. }) {
             for (name, ver) in &b.packages {
                 if !now.packages.contains_key(name) {
                     d.removed.push(Pkg {
@@ -543,9 +645,58 @@ mod tests {
     }
 
     #[test]
+    fn dpkgs_log_nets_out() {
+        use chrono::TimeZone;
+        let log = "\
+2026-09-20 10:00:00 upgrade old:amd64 1-1 2-1
+2026-09-27 10:00:00 startup archives unpack
+2026-09-27 10:00:00 install htop:amd64 <none> 3.3-1
+2026-09-27 10:00:00 status half-installed htop:amd64 3.3-1
+2026-09-27 10:01:00 upgrade linux-image-amd64:amd64 6.1.129-1 6.1.135-1
+2026-09-27 10:01:00 install linux-image-6.1.0-35-amd64:amd64 <none> 6.1.135-1
+2026-09-27 10:02:00 upgrade linux-image-amd64:amd64 6.1.135-1 6.1.140-1
+2026-09-27 10:03:00 install tmp:amd64 <none> 1-1
+2026-09-27 10:04:00 remove tmp:amd64 1-1 <none>
+2026-09-27 10:05:00 remove nano:amd64 8.0-1 <none>
+2026-09-27 10:05:00 purge nano:amd64 8.0-1 <none>
+2026-09-27 10:06:00 purge gone:amd64 1.0 <none>
+2026-09-27 10:07:00 configure htop:amd64 3.3-1 <none>
+";
+        let since = Local
+            .with_ymd_and_hms(2026, 9, 25, 0, 0, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        let (i, u, r) = net_changes(dpkg_events(log, since));
+        let names = |v: &[Pkg]| v.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            names(&i),
+            ["htop:amd64", "linux-image-6.1.0-35-amd64:amd64"]
+        );
+        assert_eq!(names(&u), ["linux-image-amd64:amd64"]);
+        assert_eq!(u[0].from.as_deref(), Some("6.1.129-1"));
+        assert_eq!(u[0].to.as_deref(), Some("6.1.140-1"));
+        assert_eq!(names(&r), ["nano:amd64"]);
+        assert!(i[0].at.is_some());
+    }
+
+    #[test]
     fn kernels_are_recognized() {
         assert!(is_kernel("kernel-core.x86_64") && is_kernel("linux-zen"));
+        assert!(is_kernel("linux-image-6.1.0-37-amd64:amd64"));
         assert!(!is_kernel("kernel-headers.x86_64") && !is_kernel("linux-firmware"));
+        assert!(
+            !is_kernel("linux-image-amd64:amd64"),
+            "the metapackage isn't a kernel"
+        );
+        assert_eq!(
+            version_order("6.1.0-9-amd64", "6.1.0-10-amd64"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            version_order("6.12.0-1-amd64", "6.1.0-38-amd64"),
+            std::cmp::Ordering::Greater
+        );
     }
 
     #[test]

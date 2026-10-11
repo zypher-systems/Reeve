@@ -1,8 +1,10 @@
 //! Which Linux this is, and how to speak to its package manager.
 //!
 //! Fedora first (dnf5, with `dnf history undo`), then Arch (pacman, an AUR
-//! helper if present). Image-based systems (Silverblue, Kinoite, …) are
-//! recognized and package changes are refused: they need rpm-ostree.
+//! helper if present), then Debian and its family (apt-get and dpkg, with
+//! undo from dpkg's log and apt's cache). Image-based systems (Silverblue,
+//! Kinoite, …) are recognized and package changes are refused: they need
+//! rpm-ostree.
 
 use std::path::Path;
 
@@ -21,9 +23,21 @@ pub enum Distro {
         /// `paru` or `yay`, when installed.
         aur: Option<String>,
     },
+    /// Debian and relatives (Ubuntu, Mint, Raspberry Pi OS…): apt and dpkg.
+    Debian {
+        /// `/etc/os-release`'s `ID`: `debian`, `ubuntu`, `linuxmint`…
+        id: String,
+    },
     /// Anything else: package tools refuse, `shell` still works.
     Other(String),
 }
+
+/// apt-get, told to keep a conffile the owner edited rather than stop at a
+/// prompt nobody can answer (commands run without a terminal).
+const APT_CONFOLD: &str = "-o Dpkg::Options::=--force-confold";
+/// Refresh the lists first, so an install doesn't fetch a version the mirror
+/// has since replaced. Quiet, and a mirror being down doesn't stop the rest.
+const APT_UPDATE: &str = "sudo apt-get update -qq;";
 
 fn has(bin: &str) -> bool {
     std::env::var("PATH")
@@ -65,6 +79,10 @@ impl Distro {
                     .find(|b| has(b))
                     .map(String::from),
             }
+        } else if family("debian") || family("ubuntu") {
+            Self::Debian {
+                id: if id.is_empty() { "debian".into() } else { id },
+            }
         } else {
             Self::Other(if id.is_empty() { "unknown".into() } else { id })
         }
@@ -76,6 +94,15 @@ impl Distro {
             Self::Fedora { atomic: true, .. } => "Fedora (atomic/rpm-ostree)".into(),
             Self::Fedora { .. } => "Fedora".into(),
             Self::Arch { .. } => "Arch".into(),
+            Self::Debian { id } if id == "debian" => "Debian".into(),
+            Self::Debian { id } => {
+                let mut c = id.chars();
+                let cap: String = c
+                    .next()
+                    .map(|f| f.to_uppercase().chain(c).collect())
+                    .unwrap_or_default();
+                format!("{cap} (Debian-based)")
+            }
             Self::Other(id) => id.clone(),
         }
     }
@@ -99,6 +126,7 @@ impl Distro {
             Self::Fedora { dnf, .. } => format!("{dnf} -q search {}", quote(q)),
             Self::Arch { aur: Some(h) } => format!("{h} -Ss {}", quote(q)),
             Self::Arch { .. } => format!("pacman -Ss {}", quote(q)),
+            Self::Debian { .. } => format!("apt-cache search {}", quote(q)),
             Self::Other(_) => String::new(),
         }
     }
@@ -113,6 +141,12 @@ impl Distro {
             ),
             Self::Arch { .. } => format!(
                 "pacman -Qi {n} 2>/dev/null || pacman -Si {n}",
+                n = quote(name)
+            ),
+            // Installed and candidate versions with where they come from,
+            // then the newest version's record (`show` lists every version).
+            Self::Debian { .. } => format!(
+                "apt-cache policy {n}; apt-cache show {n} 2>/dev/null | sed -n '1,/^$/p'",
                 n = quote(name)
             ),
             Self::Other(_) => String::new(),
@@ -141,6 +175,22 @@ impl Distro {
             (Self::Arch { .. }, "user") => "pacman -Qe".into(),
             (Self::Arch { .. }, "leaves") => "pacman -Qdtq; true".into(),
             (Self::Arch { .. }, _) => "pacman -Q".into(),
+            // What the lists know; only root can refresh them, and the
+            // upgrade and install commands do.
+            (Self::Debian { .. }, "updates") => {
+                "echo '(as of the last apt-get update; pkg_upgrade refreshes the lists first)'; \
+                 apt list --upgradable 2>/dev/null | tail -n +2; true"
+                    .into()
+            }
+            (Self::Debian { .. }, "user") => "apt-mark showmanual | sort".into(),
+            (Self::Debian { .. }, "leaves") => {
+                "apt-get -s autoremove 2>/dev/null | awk '/^Remv/ {print $2}'; true".into()
+            }
+            (Self::Debian { .. }, _) => {
+                "dpkg-query -W -f='${db:Status-Status} ${binary:Package} ${Version} ${Installed-Size}\\n' \
+                 | awk '$1==\"installed\" {print $2, $3, $4 \"K\"}' | sort"
+                    .into()
+            }
             (Self::Other(_), _) => String::new(),
         };
         format!("{base}{grep}")
@@ -151,6 +201,10 @@ impl Distro {
         match self {
             Self::Fedora { dnf, .. } => format!("sudo {dnf} install -y {}", quote_all(pkgs)),
             Self::Arch { .. } => format!("sudo pacman -S --needed --noconfirm {}", quote_all(pkgs)),
+            Self::Debian { .. } => format!(
+                "{APT_UPDATE} sudo apt-get install -y {APT_CONFOLD} {}",
+                quote_all(pkgs)
+            ),
             Self::Other(_) => String::new(),
         }
     }
@@ -160,6 +214,10 @@ impl Distro {
         match self {
             Self::Fedora { dnf, .. } => format!("sudo {dnf} remove -y {}", quote_all(pkgs)),
             Self::Arch { .. } => format!("sudo pacman -Rs --noconfirm {}", quote_all(pkgs)),
+            // Config files stay (`remove`, not `purge`), and nothing else
+            // goes: `autoremove` would also sweep up packages orphaned
+            // earlier, which the card never said.
+            Self::Debian { .. } => format!("sudo apt-get remove -y {}", quote_all(pkgs)),
             Self::Other(_) => String::new(),
         }
     }
@@ -172,6 +230,16 @@ impl Distro {
                 .to_string(),
             Self::Arch { .. } if pkgs.is_empty() => "sudo pacman -Syu --noconfirm".into(),
             Self::Arch { .. } => format!("sudo pacman -S --noconfirm {}", quote_all(pkgs)),
+            // `upgrade --with-new-pkgs` (what `apt upgrade` does): new
+            // dependencies and new kernel packages come in, nothing is
+            // removed. What would need a removal is held back and listed.
+            Self::Debian { .. } if pkgs.is_empty() => {
+                format!("{APT_UPDATE} sudo apt-get upgrade -y --with-new-pkgs {APT_CONFOLD}")
+            }
+            Self::Debian { .. } => format!(
+                "{APT_UPDATE} sudo apt-get install -y --only-upgrade {APT_CONFOLD} {}",
+                quote_all(pkgs)
+            ),
             Self::Other(_) => String::new(),
         }
     }
@@ -198,14 +266,24 @@ impl Distro {
             Self::Arch { .. } => format!(
                 "grep -E '\\[ALPM\\] (installed|removed|upgraded)' /var/log/pacman.log | tail -n {limit}"
             ),
+            // apt's history: one block per run (command, what it installed,
+            // upgraded, removed), the last `limit` of them.
+            Self::Debian { .. } => format!(
+                "awk -v RS= -v n={limit} '{{b[NR]=$0}} END {{for (i=(NR>n?NR-n+1:1); i<=NR; i++) print b[i] \"\\n\"}}' \
+                 /var/log/apt/history.log 2>/dev/null \
+                 | grep -E '^(Start-Date|Commandline|Requested-By|Install|Upgrade|Remove|Purge|Downgrade|Error):|^$'; true"
+            ),
             Self::Other(_) => String::new(),
         }
     }
 
-    /// Package changes can be undone: dnf by transaction id, pacman from
-    /// its log and cache (`crate::pacman`).
+    /// Package changes can be undone: dnf by transaction id, pacman and apt
+    /// from their logs and caches (`crate::pacman`, `crate::apt`).
     pub fn can_undo_packages(&self) -> bool {
-        matches!(self, Self::Fedora { .. } | Self::Arch { .. })
+        matches!(
+            self,
+            Self::Fedora { .. } | Self::Arch { .. } | Self::Debian { .. }
+        )
     }
 
     /// The newest transaction id (for undo), as a command whose stdout is the id.
@@ -290,6 +368,73 @@ mod tests {
                 .package_block()
                 .is_some()
         );
+        let debian =
+            "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nID=debian\nVERSION_ID=\"12\"\n";
+        let d = Distro::from_os_release(debian, |_| false, false);
+        assert_eq!(
+            d,
+            Distro::Debian {
+                id: "debian".into()
+            }
+        );
+        assert_eq!(d.name(), "Debian");
+        assert!(d.package_block().is_none() && d.can_undo_packages());
+        let ubuntu = "ID=ubuntu\nID_LIKE=debian\nVERSION_ID=\"24.04\"\n";
+        let u = Distro::from_os_release(ubuntu, |_| false, false);
+        assert_eq!(
+            u,
+            Distro::Debian {
+                id: "ubuntu".into()
+            }
+        );
+        assert_eq!(u.name(), "Ubuntu (Debian-based)");
+        let mint = "ID=linuxmint\nID_LIKE=\"ubuntu debian\"\n";
+        assert!(matches!(
+            Distro::from_os_release(mint, |_| false, false),
+            Distro::Debian { .. }
+        ));
+        let pi = "ID=raspbian\nID_LIKE=debian\n";
+        assert!(matches!(
+            Distro::from_os_release(pi, |_| false, false),
+            Distro::Debian { .. }
+        ));
+    }
+
+    #[test]
+    fn debian_speaks_apt() {
+        let d = Distro::Debian {
+            id: "debian".into(),
+        };
+        // Installs and upgrades refresh the lists first and never stop at
+        // a conffile prompt; removals keep config files and touch nothing else.
+        assert_eq!(
+            d.install(&["htop".into()]),
+            "sudo apt-get update -qq; sudo apt-get install -y -o Dpkg::Options::=--force-confold htop"
+        );
+        assert_eq!(d.remove(&["htop".into()]), "sudo apt-get remove -y htop");
+        assert_eq!(
+            d.upgrade(&[]),
+            "sudo apt-get update -qq; sudo apt-get upgrade -y --with-new-pkgs -o Dpkg::Options::=--force-confold"
+        );
+        assert_eq!(
+            d.upgrade(&["htop".into()]),
+            "sudo apt-get update -qq; sudo apt-get install -y --only-upgrade -o Dpkg::Options::=--force-confold htop"
+        );
+        assert_eq!(d.search("it's"), "apt-cache search 'it'\\''s'");
+        assert!(
+            d.info("htop")
+                .starts_with("apt-cache policy htop; apt-cache show htop")
+        );
+        assert!(
+            d.list("installed", Some("lib"))
+                .ends_with("| sort | grep -i -- lib")
+        );
+        assert!(d.list("updates", None).contains("apt list --upgradable"));
+        assert_eq!(d.list("user", None), "apt-mark showmanual | sort");
+        assert!(d.list("leaves", None).starts_with("apt-get -s autoremove"));
+        assert!(d.history(5).contains("-v n=5") && d.history(5).contains("history.log"));
+        assert!(d.last_transaction().is_none() && d.undo_transaction(1).is_none());
+        assert!(d.aur_install(&["x".into()]).is_none());
     }
 
     #[test]
