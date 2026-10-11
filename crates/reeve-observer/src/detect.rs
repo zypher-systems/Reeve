@@ -325,6 +325,63 @@ pub fn kernel_replaced(running: &str, modules_present: bool) -> Option<Signal> {
     })
 }
 
+/// Debian and Ubuntu: the running kernel's package was upgraded under the
+/// same name (a security build with the same ABI), so `/proc/version`'s
+/// build no longer matches the installed version. Debian's `proc_version`
+/// ends `… #1 SMP PREEMPT_DYNAMIC Debian 6.1.140-1 (2025-05-22)`, and the
+/// package version is that `6.1.140-1`. Ubuntu's carries `#45-Ubuntu`
+/// (or `#45~22.04.1-Ubuntu`), the upload part of a package version like
+/// `6.8.0-45.45` (`6.8.0-45.45~22.04.1`).
+pub fn kernel_rebuilt(running: &str, installed: &str, proc_version: &str) -> Option<Signal> {
+    if running.is_empty() || installed.is_empty() {
+        return None;
+    }
+    let (build, installed_build) = if let Some((_, rest)) = proc_version.split_once(" Debian ") {
+        (rest.split_whitespace().next()?, installed)
+    } else if let Some(upload) = proc_version
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix('#')?.strip_suffix("-Ubuntu"))
+    {
+        (upload, installed.rsplit_once('-')?.1.split_once('.')?.1)
+    } else {
+        return None;
+    };
+    (installed_build != build).then(|| {
+        sig(
+            "reboot-pending".into(),
+            Severity::Info,
+            "The running kernel was updated in place: reboot to use the new build".into(),
+            format!("Running {running} build {build}; installed is {installed}."),
+            vec![],
+        )
+    })
+}
+
+/// Debian and Ubuntu: a package's postinst left `/var/run/reboot-required`.
+/// `pkgs` is `/var/run/reboot-required.pkgs` (one package a line, maybe
+/// empty), or empty when the flag file isn't there.
+pub fn reboot_required(pkgs: &str) -> Option<Signal> {
+    let names: Vec<&str> = pkgs
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    (!pkgs.is_empty()).then(|| {
+        let detail = if names.is_empty() {
+            "/var/run/reboot-required is set.".to_string()
+        } else {
+            format!("/var/run/reboot-required is set, by {}.", names.join(", "))
+        };
+        sig(
+            "reboot-pending".into(),
+            Severity::Info,
+            "A reboot is required: an update asked for one".into(),
+            detail,
+            vec![],
+        )
+    })
+}
+
 /// Security updates waiting.
 pub fn security_updates(n: usize, sample: &[String]) -> Option<Signal> {
     (n > 0).then(|| {
@@ -474,6 +531,38 @@ mod tests {
     fn reboot_and_updates() {
         assert!(reboot_pending("6.17.4-200.fc44.x86_64", "6.17.5-200.fc44.x86_64").is_some());
         assert!(reboot_pending("a", "a").is_none());
+        // Debian: a new ABI is a new package name…
+        assert!(reboot_pending("6.1.0-37-amd64", "6.1.0-38-amd64").is_some());
+        // …and a rebuild under the same name shows in /proc/version.
+        let proc = "Linux version 6.1.0-37-amd64 (debian-kernel@lists.debian.org) (gcc-12 (Debian 12.2.0-14+deb12u1) 12.2.0, GNU ld (GNU Binutils for Debian) 2.40) #1 SMP PREEMPT_DYNAMIC Debian 6.1.140-1 (2025-05-22)\n";
+        assert!(kernel_rebuilt("6.1.0-37-amd64", "6.1.140-1", proc).is_none());
+        let s = kernel_rebuilt("6.1.0-37-amd64", "6.1.147-1", proc).unwrap();
+        assert_eq!(s.id, "reboot-pending");
+        assert!(s.detail.contains("6.1.140-1") && s.detail.contains("6.1.147-1"));
+        assert!(kernel_rebuilt("6.1.0-37-amd64", "", proc).is_none());
+        // Ubuntu: the upload number after `#`, against the package version's.
+        let ubuntu = "Linux version 6.8.0-45-generic (buildd@lcy02-amd64-033) (x86_64-linux-gnu-gcc-13 (Ubuntu 13.2.0-23ubuntu4) 13.2.0, GNU ld (GNU Binutils for Ubuntu) 2.42) #45-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 30 12:02:04 UTC 2024\n";
+        assert!(kernel_rebuilt("6.8.0-45-generic", "6.8.0-45.45", ubuntu).is_none());
+        assert!(kernel_rebuilt("6.8.0-45-generic", "6.8.0-45.45.1", ubuntu).is_some());
+        let hwe = "Linux version 6.8.0-45-generic (buildd@x) (gcc) #45~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Tue Sep 10 2024\n";
+        assert!(kernel_rebuilt("6.8.0-45-generic", "6.8.0-45.45~22.04.1", hwe).is_none());
+        assert!(kernel_rebuilt("6.8.0-45-generic", "6.8.0-45.45~22.04.2", hwe).is_some());
+        assert!(
+            kernel_rebuilt(
+                "7.2.8-200.fc44.x86_64",
+                "x",
+                "Linux version 7.2.8 (mockbuild) #1 SMP"
+            )
+            .is_none()
+        );
+        assert!(reboot_required("").is_none());
+        assert!(reboot_required("\n").unwrap().detail.ends_with("is set."));
+        assert!(
+            reboot_required("linux-image-6.1.0-38-amd64\nlibc6\n")
+                .unwrap()
+                .detail
+                .contains("linux-image-6.1.0-38-amd64, libc6")
+        );
         assert!(security_updates(0, &[]).is_none());
     }
 }

@@ -390,7 +390,7 @@ pub async fn undo_receipt_by(
     let root_files = matches!(&undo, Undo::Files { changes } if changes.iter().any(|c| c.root));
     use crate::receipts::UndoFailed;
     let result = match &undo {
-        Undo::Packages { .. } | Undo::Pacman { .. } | Undo::Unit { .. } => {
+        Undo::Packages { .. } | Undo::Pacman { .. } | Undo::Apt { .. } | Undo::Unit { .. } => {
             sys::revert(ctx, &undo).await
         }
         _ if root_files => fs::root_revert(ctx, &undo).await.map_err(UndoFailed::from),
@@ -492,7 +492,7 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "sys_info",
-            "A summary of the machine: OS, kernel (and newer installed kernels), memory and swap, disks, failed units, SELinux, snapper.",
+            "A summary of the machine: OS, kernel (and newer installed kernels), memory and swap, disks, failed units, SELinux or AppArmor, snapper.",
             json!({}),
             &[],
         ),
@@ -510,13 +510,13 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "pkg_list",
-            "List packages: installed (name, version, size), user (explicitly installed), leaves (nothing depends on them), or updates (pending; on Arch, AUR updates start with aur:).",
+            "List packages: installed (name, version, size), user (explicitly installed), leaves (nothing depends on them), or updates (pending; on Arch, AUR updates start with aur:; on Debian, as of the last apt-get update, which pkg_upgrade and pkg_install run first).",
             json!({"which": {"type": "string", "enum": ["installed", "user", "leaves", "updates"]}, "filter": {"type": "string", "description": "Case-insensitive substring"}}),
             &[],
         ),
         spec(
             "pkg_install",
-            "Install packages (needs root). On Arch, packages the repos don't have are built from the AUR with paru or yay: the owner reads each PKGBUILD on the card and says yes every time. The transaction is recorded so it can be rolled back.",
+            "Install packages (needs root). On Arch, packages the repos don't have are built from the AUR with paru or yay: the owner reads each PKGBUILD on the card and says yes every time. On Debian the lists are refreshed first. The transaction is recorded so it can be rolled back.",
             json!({"packages": {"type": "array", "items": {"type": "string"}}}),
             &["packages"],
         ),
@@ -528,13 +528,13 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "pkg_upgrade",
-            "Upgrade the named packages, or everything when the list is empty (needs root). On Arch an empty list upgrades repo packages only (pacman -Syu); name AUR packages to rebuild them from the AUR. Recorded for rollback.",
+            "Upgrade the named packages, or everything when the list is empty (needs root). On Arch an empty list upgrades repo packages only (pacman -Syu); name AUR packages to rebuild them from the AUR. On Debian an empty list is apt-get upgrade --with-new-pkgs: nothing is removed, and what would need a removal is held back and listed. Recorded for rollback.",
             json!({"packages": {"type": "array", "items": {"type": "string"}}}),
             &[],
         ),
         spec(
             "pkg_history",
-            "Recent package transactions.",
+            "Recent package transactions (on Debian, apt's history: the command, and what it installed, upgraded, or removed).",
             json!({"limit": {"type": "integer"}}),
             &[],
         ),

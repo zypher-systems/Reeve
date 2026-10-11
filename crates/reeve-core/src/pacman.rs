@@ -23,10 +23,11 @@ pub const LOG: &str = "/var/log/pacman.log";
 /// Where pacman keeps downloaded packages, unless pacman.conf says otherwise.
 pub const CACHE: &str = "/var/cache/pacman/pkg";
 
-/// One package change pacman logged.
+/// One package change a package manager logged: pacman's log, or dpkg's
+/// (`crate::apt`), which records the same four facts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PkgChange {
-    /// Package name.
+    /// Package name (`name:arch` from dpkg).
     pub name: String,
     /// `installed`, `removed`, `upgraded`, `downgraded`, or `reinstalled`.
     pub action: String,
@@ -100,7 +101,7 @@ fn started(text: &str) -> bool {
     text.lines().any(|l| l.contains("] [PACMAN] Running '"))
 }
 
-fn text_since(log: &Path, mark: u64) -> String {
+pub(crate) fn text_since(log: &Path, mark: u64) -> String {
     let Ok(mut f) = fs::File::open(log) else {
         return String::new();
     };

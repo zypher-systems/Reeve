@@ -10,7 +10,7 @@
 %global __brp_mangle_shebangs_exclude_from ^/usr/src/debug/.*$
 
 Name:           reeve
-Version:        0.6.1
+Version:        0.7.0
 Release:        1%{?dist}
 Summary:        An operator agent that manages this computer, with receipts
 
@@ -77,6 +77,10 @@ install -Dpm 0644 packaging/systemd/reeved.service %{buildroot}%{_userunitdir}/r
 %{_userunitdir}/reeved.service
 
 %changelog
+* Fri Oct 10 2026 Zypher Systems <zypher@zyphersystems.com> - 0.7.0-1
+- Debian and Ubuntu: the package tools speak apt-get, and package changes are undone from dpkg's log and apt's cache.
+- ctrl+n (or /new) starts a fresh session without closing Reeve, connected or not.
+
 * Thu Oct 01 2026 Zypher Systems <zypher@zyphersystems.com> - 0.6.1-1
 - Arch: a warning from sudo no longer stops a package undo from trying its other order.
 

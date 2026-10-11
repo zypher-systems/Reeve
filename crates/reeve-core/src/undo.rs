@@ -62,6 +62,12 @@ pub enum Undo {
         /// What the transaction changed, as pacman logged it.
         changes: Vec<crate::pacman::PkgChange>,
     },
+    /// Put apt's changes back from its package cache, as one `apt-get`
+    /// (see `crate::apt`).
+    Apt {
+        /// What the run changed, as dpkg logged it.
+        changes: Vec<crate::pacman::PkgChange>,
+    },
     /// Roll a package transaction back (`dnf history undo`).
     Packages {
         /// `dnf5` or `dnf`.
@@ -264,7 +270,8 @@ impl UndoStore {
                 };
                 Ok((Undo::Files { changes: inverse }, summary))
             }
-            Undo::Packages { .. } | Undo::Pacman { .. } | Undo::Unit { .. } => Err(Error::Io(
+            Undo::Packages { .. } | Undo::Pacman { .. } | Undo::Apt { .. } | Undo::Unit { .. } => Err(Error::Io(
+
                 "package and service changes are undone through their own tools, not the file store".into(),
             )),
             Undo::Move { from, to, replaced } => {

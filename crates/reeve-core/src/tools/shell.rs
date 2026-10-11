@@ -137,6 +137,11 @@ pub(crate) async fn run_command(ctx: &ToolCtx, spec: RunSpec<'_>) -> RunOut {
         ("SYSTEMD_COLORS", "0"),
         ("TERM", "dumb"),
         ("DEBIAN_FRONTEND", "noninteractive"),
+        // Debian's apt hooks: no changelog pager, and needrestart lists
+        // the services an upgrade left on old libraries rather than
+        // restarting them on its own (a restart is an action of its own).
+        ("APT_LISTCHANGES_FRONTEND", "none"),
+        ("NEEDRESTART_MODE", "l"),
     ] {
         cmd.env(k, v);
     }

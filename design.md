@@ -176,7 +176,7 @@ This is the bare minimum that prevents destroying the system. It applies in ever
 - Partition-table writers: `fdisk`, `sfdisk`, `gdisk`/`sgdisk`, `parted` (non-print), `cryptsetup luksFormat|erase`
 - Recursive `rm`/`chmod`/`chown` whose target resolves to `/`, a top-level system dir (`/usr /etc /boot /var /bin /lib*`), or `$HOME` itself
 - Bootloader and EFI changes: `grub2-install`, `efibootmgr` writes, `bootctl remove`, deleting from `/boot` or `/boot/efi`
-- Removing the running kernel, the last installed kernel, or a protected package (`glibc`, `systemd`, `dnf`/`pacman`, `sudo`, `kernel-core`), plus dependency-ignoring forms (`rpm -e --nodeps`, `pacman -Rdd`)
+- Removing the running kernel, the last installed kernel, or a protected package (`glibc`/`libc6`, `systemd`, `dnf`/`pacman`/`apt`/`dpkg`, `sudo`, `kernel-core`, `linux-image-*`), plus dependency-ignoring forms (`rpm -e --nodeps`, `pacman -Rdd`, `dpkg -r --force-depends`, `apt-get --allow-remove-essential`)
 - Writing `/etc/sudoers*`, `/etc/fstab`, `/etc/crypttab`, or `/etc/passwd|shadow|group` without the validator. Reeve runs `visudo -c` / `findmnt --verify` on the new content first, and a failed check blocks the write outright.
 - Disabling or masking units the session depends on (`sshd` over SSH, the display manager, `NetworkManager`)
 - Fork bombs and `kill -9 -1`
@@ -385,12 +385,12 @@ light or dark theme; a small inline script adds a hover readout. Sources:
 - **Disks:** a least-squares slope over hourly means gives growth per day and a days-to-full
   estimate. It needs 20 h of history; below 0.01% a day, a disk counts as steady.
 - **What changed:**
-  - packages from rpm's `INSTALLTIME` (Fedora) or `/var/log/pacman.log` (Arch);
+  - packages from rpm's `INSTALLTIME` (Fedora), `/var/log/pacman.log` (Arch), or `/var/log/dpkg.log` (Debian);
   - removals and unit changes from the daily snapshot reeved writes to
     `observer/state/<day>.json` (60 days kept);
   - `/etc` from file modification times, matched against receipts to mark Reeve's own edits;
-  - a pending reboot from the newest `kernel-core` against `uname -r`, or on Arch, the running
-    kernel's missing modules.
+  - a pending reboot from the newest `kernel-core` against `uname -r`; on Arch, the running
+    kernel's missing modules; on Debian, the newest `linux-image-*` against `uname -r`.
 - **Findings, receipts, spend, memory:** the usual stores.
 - **Headlines:** rules over the above (a disk full within 90 days, swap full ≥ 50% of the time,
   temperature past `temp_warn`, critical findings, fixes verified or rolled back, a pending
@@ -478,6 +478,77 @@ trait Distro {
   - **snap-pac** (§6) and **reeved**: a reboot is pending when the running kernel's modules are gone
     from `/usr/lib/modules`; security updates come from `arch-audit -u` when it's installed.
   - **Omarchy:** the theme follows Omarchy's (§11).
+- **Debian** and its family (Ubuntu, Mint, Raspberry Pi OS, by `ID` or `ID_LIKE`): `apt-get` and `dpkg`, with
+  undo from dpkg's log and apt's cache. Reeve records what its command changed as dpkg logged it
+  (`/var/log/dpkg.log`: `install`, `upgrade`, `remove`, with versions; a downgrade is logged as an upgrade
+  with the versions reversed, and a `purge` of an installed package logs `remove` first, so `purge` alone is
+  config files going). Undo is one transaction: `apt-get install` with the old versions' files from
+  `/var/cache/apt/archives` and `name-` for what was new. `apt-get -s` runs first (no root, nothing
+  changes): if apt can't resolve it, or would remove a package the change didn't install, or would change
+  the version of one it didn't touch (every undo allows downgrades), the undo is refused. Names are compared
+  with their architecture: apt prints the native one bare, so `Remv libfoo:i386` never stands for
+  `libfoo`. A version the cache lost (`apt-get
+  clean`, or an install through `apt` rather than `apt-get`, which deletes downloads) is asked for as
+  `name=version`; if the repos no longer carry it, apt says so and nothing changes. A failed command still
+  records what dpkg did before it stopped, and so does a failed undo (`UndoFailed.partial`).
+  - **Commands:** installs and upgrades run `apt-get update -qq` first and pass
+    `-o Dpkg::Options::=--force-confold`, so a conffile the owner edited is kept instead of stopping at a
+    prompt no one can answer. An empty `pkg_upgrade` is `apt-get upgrade --with-new-pkgs` (what `apt
+    upgrade` does): new dependencies and kernel packages come in, nothing is removed, and what would need a
+    removal is held back and listed. `pkg_remove` is `apt-get remove`: config files stay, and no
+    `--autoremove`, which would also sweep up packages orphaned earlier. `pkg_list updates` reads the lists
+    as they are and says so (only root can refresh them). `pkg_history` is apt's `history.log`, a block per
+    run.
+  - **Environment:** `DEBIAN_FRONTEND=noninteractive`, `APT_LISTCHANGES_FRONTEND=none`, and
+    `NEEDRESTART_MODE=l`: needrestart lists the services an upgrade left on old libraries rather than
+    restarting them on its own; a restart is an action with its own approval and undo.
+  - **The floor:** `libc6`, `dpkg`, `apt`, `systemd-sysv`, `grub-*`, `shim-signed`, `initramfs-tools`,
+    `linux-image-amd64`, and the rest of the Debian list in `protected_packages`; `install foo-` is a
+    removal, and a `/release` or `=version` suffix comes off before the name is read (`libc6/now`);
+    a package argument that isn't a name is read the way apt reads it (`policy/apt_syntax.rs`:
+    a case-folded glob, apt's unanchored case-insensitive regex, or an apt pattern parsed with
+    apt-patterns(7)'s grammar, a `:arch` suffix split off first) and is the floor when it can take the
+    running kernel's image or a protected name (`linux*`, `LINUX*`, `~nlinux~i`, `?not(~nhtop)`,
+    `~ramd64`, `lib*`) or when apt itself couldn't parse it; the running kernel's
+    `linux-image-$(uname -r)`; `--allow-remove-essential` and `--force-yes` as flags or as the config
+    items they set, with any value apt's `StringToBool` reads as true (`1`, `0x1`, `+1`, `enable`);
+    dpkg's `--force-depends`, `--force-all`, `--force-remove-essential` when removing, as a flag, in a
+    comma list, in `-o Dpkg::Options::=…`, or in `DPKG_FORCE=` (on the command, `+=`-appended,
+    `export`ed earlier on the line, which includes a later bare assignment to an exported name and
+    `declare`/`readonly` or any assignment under `set -a`, `set -o allexport` or `shopt -os allexport`,
+    behind `command`/`builtin` too, while `export -n`/`declare +x` undo it and a subshell or a pipeline
+    stage changes nothing after itself; inherited by a `bash -c` script, an `eval` of literal words, or
+    a `$(…)`; or through `env`, which is read as getopt_long reads it: clusters,
+    abbreviated long options, a bare `-`, and `-S` strings env re-reads as its own command line); an
+    apt config file Reeve hasn't read (`-c FILE`, `-cFILE`, `APT_CONFIG=`) with a removal. apt's command
+    line is read by apt's rules throughout, so `-s 0` and `--no-simulate` are not simulations. The
+    floor doesn't rest on that model of bash, though: `forced_by_env` reads the text of the whole line,
+    and a line that gives `DPKG_FORCE` a force word or `APT_CONFIG` any value by any route (an assignment
+    in any scope, exported or not, `${NAME:=…}`, `printf -v`, `read`, `for`, a nameref), or a value Reeve
+    can't read (`$(…)`, `$VAR`), and removes a package, asks. Only a read (`$NAME`), an unset, and
+    `export NAME` without a value are nothing. The scan runs over the raw text and over the tokenized
+    words at every level a line nests (quotes joined, `$'…'` decoded, braces expanded in values, so
+    `DPKG_FOR''CE`, `{confold,remove-essential}` and `$'\x44PKG_FORCE'` read as what bash runs); an
+    expansion where the environment is set (`export $(…)`, `declare $(…)`, `env $(…)`, `sudo $(…)`),
+    where the program is named, or where a removed package is named can't be read and is the floor on a
+    removal; an alias defined on the line runs in place of the command word; `$NAME` is filled in where
+    the line gave NAME a literal. Brace expansion happens in the tokenizer, on unquoted text, before
+    anything else, as bash does it (`{a,b}`, `{1..9}`, nested; past 512 words the word is unreadable),
+    so `DPKG_F{ORCE,}=…`, `--force-{remove-essential,confold}` and `{dpkg,--force-remove-essential,-r,sed}`
+    read as the words bash runs. A function defined on the line is read at each call with the call's
+    arguments in `$@`/`$1`…/`${N}` (the last definition before the call; `shift` and `set --` move the
+    positionals; a body calling another function the line defines runs it too; a call behind `if`,
+    `{`, `time` counts), so `dpkg() { command dpkg "$@"; }; dpkg --force-remove-essential -r sed` is the
+    command it forwards. Two rules close what the models don't follow: an expansion left in a
+    removal's arguments (`--force-${1:-remove-essential}`) is the floor, and a brace Reeve stopped
+    expanding (more than 4096 words) is the floor wherever it stands. Over-asking there is by design;
+    the model above only makes the common cases precise.
+  - **reeved:** a reboot is pending when the newest installed `linux-image-<abi>` isn't `uname -r`, when
+    the running kernel's package version no longer matches the build in `/proc/version` (a security
+    rebuild under the same name), or when `/var/run/reboot-required` is set. Security updates are the
+    `Inst` lines of `apt-get -s upgrade` from a security suite, as of the last `apt-get update`.
+  - **Not yet:** a `.deb` package (the installer's static binaries run on any release), `snap`, and
+    `do-release-upgrade`.
 
 ---
 
@@ -573,6 +644,7 @@ $XDG_RUNTIME_DIR/reeve/  # reeved.sock, askpass-<pid>.sock
 | **M4** ✓ | Observer | `reeved` with samplers, journal, detectors, baselines, notifications, and the Findings inbox with proposals. |
 | **M5** ✓ | Standing orders | Scheduler, scoped autonomous runs, day and month budgets enforced across TUI and daemon. |
 | **M6** ✓ | Arch | pacman undo from its log and cache, the AUR with the PKGBUILD on the card, snap-pac, Arch checks in reeved, Omarchy themes. |
+| **M7** ✓ | Debian | apt-get and dpkg through the same tools, undo from dpkg's log and apt's cache in one simulated-first transaction, the Debian floor, Debian reboot and security checks in reeved, dpkg's log in the drift report. |
 
 ---
 

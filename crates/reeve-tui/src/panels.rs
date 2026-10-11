@@ -1054,6 +1054,7 @@ fn help(f: &mut Frame, r: Rect, t: &Theme) {
         ("ctrl+l", "redraw the screen (after the terminal clears it)"),
         ("$", "the spend statement (empty composer)"),
         ("^r", "activity: every receipt, undo, verify the chain"),
+        ("^n", "a fresh session: the chat clears, the board stays"),
         ("^y", "YOLO on/off"),
         ("pgup pgdn", "scroll the chat"),
         ("^c", "stop, clear, then quit"),

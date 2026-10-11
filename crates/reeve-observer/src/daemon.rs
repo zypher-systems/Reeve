@@ -455,21 +455,58 @@ impl Observer {
         let now = Utc::now();
         let mut signals = Vec::new();
         let running = run("uname -r").await;
-        let adv = if matches!(
-            reeve_core::distro::Distro::detect(),
-            reeve_core::distro::Distro::Arch { .. }
-        ) {
-            let present = run("test -d \"/usr/lib/modules/$(uname -r)\" && echo yes").await;
-            signals.extend(detect::kernel_replaced(
-                running.trim(),
-                present.trim() == "yes",
-            ));
-            // arch-audit (when installed) knows the advisories with a fix out.
-            run("command -v arch-audit >/dev/null && timeout 120 arch-audit -u 2>/dev/null").await
-        } else {
-            let newest = run("rpm -q kernel-core --last 2>/dev/null | head -n 1 | awk '{print $1}' | sed 's/^kernel-core-//'").await;
-            signals.extend(detect::reboot_pending(running.trim(), newest.trim()));
-            run("command -v dnf5 >/dev/null && timeout 120 dnf5 -q advisory list --security --updates 2>/dev/null | tail -n +2").await
+        use reeve_core::distro::Distro;
+        let adv = match Distro::detect() {
+            Distro::Arch { .. } => {
+                let present = run("test -d \"/usr/lib/modules/$(uname -r)\" && echo yes").await;
+                signals.extend(detect::kernel_replaced(
+                    running.trim(),
+                    present.trim() == "yes",
+                ));
+                // arch-audit (when installed) knows the advisories with a fix out.
+                run("command -v arch-audit >/dev/null && timeout 120 arch-audit -u 2>/dev/null")
+                    .await
+            }
+            Distro::Debian { .. } => {
+                // A newer kernel package (a new ABI is a new name; debug
+                // symbols aren't kernels, and the unsigned build is the same
+                // ABI), or the running one rebuilt under the same name (its
+                // package version no longer matches /proc/version's build),
+                // or the flag the kernel's postinst leaves.
+                let newest = run(
+                    "dpkg-query -W -f='${db:Status-Status} ${Package}\\n' 'linux-image-[0-9]*' 2>/dev/null \
+                     | awk '$1==\"installed\" && $2 !~ /-dbg(sym)?$/ {sub(/-unsigned$/, \"\", $2); print substr($2, 13)}' | sort -V | tail -n 1",
+                )
+                .await;
+                signals.extend(detect::reboot_pending(running.trim(), newest.trim()));
+                let installed =
+                    run("dpkg-query -W -f='${Version}' \"linux-image-$(uname -r)\" 2>/dev/null")
+                        .await;
+                let proc = run("cat /proc/version").await;
+                signals.extend(detect::kernel_rebuilt(
+                    running.trim(),
+                    installed.trim(),
+                    &proc,
+                ));
+                let flagged = run(
+                    "test -f /var/run/reboot-required && cat /var/run/reboot-required.pkgs 2>/dev/null; \
+                     test -f /var/run/reboot-required && echo",
+                )
+                .await;
+                signals.extend(detect::reboot_required(&flagged));
+                // Updates from a security suite, as of the last apt-get
+                // update: the archive in the parentheses says, not the name.
+                run(
+                    "timeout 120 apt-get -s -q upgrade --with-new-pkgs 2>/dev/null \
+                     | awk '/^Inst / {s=$0; sub(/^[^(]*\\(/, \"\", s); if (s ~ /[Ss]ecurity/) print $2}'",
+                )
+                .await
+            }
+            Distro::Fedora { .. } | Distro::Other(_) => {
+                let newest = run("rpm -q kernel-core --last 2>/dev/null | head -n 1 | awk '{print $1}' | sed 's/^kernel-core-//'").await;
+                signals.extend(detect::reboot_pending(running.trim(), newest.trim()));
+                run("command -v dnf5 >/dev/null && timeout 120 dnf5 -q advisory list --security --updates 2>/dev/null | tail -n +2").await
+            }
         };
         let lines: Vec<String> = adv
             .lines()

@@ -48,8 +48,9 @@ pub struct Outcome {
 pub struct UndoFailed {
     /// Why it failed.
     pub why: String,
-    /// The inverse of whatever it changed before failing (a pacman undo is
-    /// two transactions; the first can go through and the second not).
+    /// The inverse of whatever it changed before failing: a pacman undo is
+    /// two transactions and the first can go through and the second not,
+    /// and apt's one transaction can stop partway through dpkg.
     pub partial: Option<Undo>,
 }
 

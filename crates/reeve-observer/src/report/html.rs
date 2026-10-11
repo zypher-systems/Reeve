@@ -841,7 +841,7 @@ pub fn render(r: &Report) -> String {
 {drift}
 <div class="grid">{findings}{work}</div>
 <div class="grid">{spend}{memory}</div>
-<footer>Drawn by Reeve {ver} on this machine from <code>~/.reeve</code>: reeved's minute readings ({cov:.0}% of the window), findings, receipts, the spend ledger, memory, rpm/pacman, systemd, and /etc. No model was asked and nothing on this page left the machine.</footer>
+<footer>Drawn by Reeve {ver} on this machine from <code>~/.reeve</code>: reeved's minute readings ({cov:.0}% of the window), findings, receipts, the spend ledger, memory, rpm/pacman/dpkg, systemd, and /etc. No model was asked and nothing on this page left the machine.</footer>
 </main>
 <script>{JS}</script>
 </body></html>"##,

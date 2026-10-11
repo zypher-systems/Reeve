@@ -13,7 +13,7 @@ const CHECKS: &[(&str, &str, &[&str], &str)] = &[
         "survey-os",
         "Operating system",
         &["os", "distro", "kernel"],
-        "grep -E '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '\"'; echo \"kernel $(uname -r) ($(uname -m))\"; getenforce 2>/dev/null | sed 's/^/SELinux: /'; test -e /run/ostree-booted && echo 'image-based (rpm-ostree)'",
+        "grep -E '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '\"'; echo \"kernel $(uname -r) ($(uname -m))\"; getenforce 2>/dev/null | sed 's/^/SELinux: /'; aa-enabled 2>/dev/null | sed 's/^/AppArmor: /'; test -e /run/ostree-booted && echo 'image-based (rpm-ostree)'",
     ),
     (
         "survey-cpu-memory",
@@ -48,8 +48,8 @@ const CHECKS: &[(&str, &str, &[&str], &str)] = &[
     (
         "survey-packages",
         "Packages",
-        &["packages", "dnf", "pacman", "flatpak", "repos"],
-        "command -v rpm >/dev/null && echo \"rpm packages: $(rpm -qa | wc -l)\"; command -v pacman >/dev/null && echo \"pacman packages: $(pacman -Q | wc -l)\"; command -v flatpak >/dev/null && echo \"flatpak apps: $(flatpak list --app 2>/dev/null | wc -l)\"; command -v dnf5 >/dev/null && dnf5 -q repolist 2>/dev/null | tail -n +2 | awk '{print \"repo \" $1}' | head -n 15",
+        &["packages", "dnf", "pacman", "apt", "flatpak", "repos"],
+        "command -v rpm >/dev/null && echo \"rpm packages: $(rpm -qa | wc -l)\"; command -v pacman >/dev/null && echo \"pacman packages: $(pacman -Q | wc -l)\"; command -v dpkg-query >/dev/null && echo \"deb packages: $(dpkg-query -W -f='${db:Status-Status}\\n' 2>/dev/null | grep -c '^installed')\"; command -v flatpak >/dev/null && echo \"flatpak apps: $(flatpak list --app 2>/dev/null | wc -l)\"; command -v dnf5 >/dev/null && dnf5 -q repolist 2>/dev/null | tail -n +2 | awk '{print \"repo \" $1}' | head -n 15; test -d /etc/apt && grep -hE '^(deb |URIs:)' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null | sed 's/^/repo /' | head -n 15",
     ),
     (
         "survey-services",

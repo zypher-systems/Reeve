@@ -10,6 +10,7 @@
 //! Some actions are refused outright ([`Assessment::deny`]): reading Reeve's
 //! own keys, or rewriting its receipts.
 
+mod apt_syntax;
 pub mod paths;
 pub mod shell;
 
@@ -83,6 +84,16 @@ pub struct Assessment {
     /// packages): where snap-pac is installed, that snapshots itself.
     #[serde(default)]
     pub pacman: bool,
+    /// It removes packages (`dpkg -r`/`-P`, `apt remove`/`purge`/
+    /// `autoremove`, `install foo-`): the floor then reads what the line
+    /// did to dpkg's and apt's force variables.
+    #[serde(default)]
+    pub removes_packages: bool,
+    /// Why the line's force variables make a removal the floor, found below
+    /// the top level (a nested script, an `export $(…)`, an `eval` Reeve
+    /// can't read). Applied when the line removes packages.
+    #[serde(default)]
+    pub force_env: Option<String>,
 }
 
 impl Assessment {
@@ -98,6 +109,8 @@ impl Assessment {
             quiet_write: false,
             owner_only: false,
             pacman: false,
+            removes_packages: false,
+            force_env: None,
         }
     }
 
@@ -171,6 +184,10 @@ impl Assessment {
         self.quiet_write |= other.quiet_write;
         self.owner_only |= other.owner_only;
         self.pacman |= other.pacman;
+        self.removes_packages |= other.removes_packages;
+        if self.force_env.is_none() {
+            self.force_env = other.force_env;
+        }
         self.tier = self.tier.max(other.tier);
         self.sudo |= other.sudo;
         if self.deny.is_none() {
