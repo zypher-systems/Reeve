@@ -69,6 +69,10 @@ fn assess_at(ctx: &PathCtx, command: &str, depth: usize) -> Assessment {
         })
         .collect();
     let mut prev: Option<&Segment> = None;
+    // What `export` put in the environment so far: later commands on the
+    // line run with it (`export DPKG_FORCE=…; sudo -E dpkg -r sed`).
+    let mut vars: Vec<(String, String)> = Vec::new();
+    let mut exported: Vec<(String, String)> = Vec::new();
     for seg in &parsed.segments {
         if seg.pattern || seg.func_def {
             prev = Some(seg);
@@ -85,11 +89,65 @@ fn assess_at(ctx: &PathCtx, command: &str, depth: usize) -> Assessment {
             };
             a.merge(assess_segment(ctx, &only, prev, depth));
         } else {
-            a.merge(assess_segment(ctx, seg, prev, depth));
+            let mut with_env = seg.clone();
+            with_env.words = exported
+                .iter()
+                .map(|(n, v)| format!("{n}={v}"))
+                .chain(seg.words.iter().cloned())
+                .collect();
+            a.merge(assess_segment(ctx, &with_env, prev, depth));
         }
+        note_exports(&seg.words, &mut vars, &mut exported);
         prev = Some(seg);
     }
     a
+}
+
+/// Track `A=b`, `export A=b`, `export A` (after an `A=b`), and
+/// `declare -x`/`typeset -x`, so what a later command's environment holds
+/// is known. `exported` is (name, value).
+fn note_exports(
+    words: &[String],
+    vars: &mut Vec<(String, String)>,
+    exported: &mut Vec<(String, String)>,
+) {
+    let set = |list: &mut Vec<(String, String)>, name: &str, value: &str| {
+        list.retain(|(n, _)| n != name);
+        list.push((name.to_string(), value.to_string()));
+    };
+    let leading: Vec<&String> = words.iter().take_while(|w| is_assignment(w)).collect();
+    let Some(prog) = words.get(leading.len()) else {
+        // A bare `A=b`: a shell variable, not yet in the environment.
+        for w in leading {
+            if let Some((n, v)) = w.split_once('=') {
+                set(vars, n, v);
+            }
+        }
+        return;
+    };
+    let exports = prog == "export"
+        || (matches!(prog.as_str(), "declare" | "typeset")
+            && words.iter().any(|w| w.starts_with('-') && w.contains('x')));
+    if !exports {
+        return;
+    }
+    for w in &words[leading.len() + 1..] {
+        if w.starts_with('-') {
+            continue;
+        }
+        match w.split_once('=') {
+            Some((n, v)) => {
+                set(vars, n, v);
+                set(exported, n, v);
+            }
+            None => {
+                if let Some((_, v)) = vars.iter().find(|(n, _)| n == w) {
+                    let v = v.clone();
+                    set(exported, w, &v);
+                }
+            }
+        }
+    }
 }
 
 /// One simple command: its words joined by single spaces, and its
@@ -472,6 +530,130 @@ fn base(prog: &str) -> &str {
     prog.rsplit('/').next().unwrap_or(prog)
 }
 
+/// Split a string the way GNU env's `-S` does: on unquoted spaces and
+/// tabs; single and double quotes group; `\_` is a separator outside
+/// quotes and a space inside; `\c` ends the string; `\#`, `\$`, `\"`,
+/// `\'`, `\\` are literal, `\t` `\n` `\r` `\v` `\f` are those
+/// characters; a `#` starting a word begins a comment; `${NAME}` (outside
+/// single quotes) is looked up. A variable `lookup` doesn't know, or an
+/// escape env doesn't, is an error: the command can't be read.
+fn env_split(s: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (None, ' ' | '\t') => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            (None, '#') if !in_word => break,
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (Some(q), ch) if ch == q => quote = None,
+            (_, '\\') => {
+                let Some(e) = chars.next() else {
+                    return Err("a backslash at the end".into());
+                };
+                match e {
+                    '_' if quote.is_none() => {
+                        if in_word {
+                            words.push(std::mem::take(&mut cur));
+                            in_word = false;
+                        }
+                        continue;
+                    }
+                    '_' => cur.push(' '),
+                    'c' => break,
+                    't' => cur.push('\t'),
+                    'n' => cur.push('\n'),
+                    'r' => cur.push('\r'),
+                    'v' => cur.push('\x0b'),
+                    'f' => cur.push('\x0c'),
+                    '#' | '$' | '"' | '\'' | '\\' => cur.push(e),
+                    other => return Err(format!("the escape \\{other}")),
+                }
+                in_word = true;
+            }
+            (q, '$') if q != Some('\'') && chars.peek() == Some(&'{') => {
+                chars.next();
+                let mut name = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some(ch) => name.push(ch),
+                        None => return Err(format!("an unclosed ${{{name}")),
+                    }
+                }
+                match lookup(&name) {
+                    Some(v) => cur.push_str(&v),
+                    None => {
+                        return Err(format!("the variable ${{{name}}}, which Reeve can't read"));
+                    }
+                }
+                in_word = true;
+            }
+            (_, ch) => {
+                cur.push(ch);
+                in_word = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return Err("an unclosed quote".into());
+    }
+    if in_word {
+        words.push(cur);
+    }
+    Ok(words)
+}
+
+/// Shell-style glob: `*`, `?`, and `[set]` (ranges, `!`/`^` negation).
+fn glob_match(pat: &str, text: &str) -> bool {
+    fn go(p: &[char], t: &[char]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some('*') => (0..=t.len()).any(|k| go(&p[1..], &t[k..])),
+            Some('?') => !t.is_empty() && go(&p[1..], &t[1..]),
+            Some('[') => {
+                let Some(close) = p.iter().skip(2).position(|c| *c == ']').map(|i| i + 2) else {
+                    return t.first() == Some(&'[') && go(&p[1..], &t[1..]);
+                };
+                let Some(&c) = t.first() else {
+                    return false;
+                };
+                let set = &p[1..close];
+                let (negate, set) = match set.first() {
+                    Some('!' | '^') => (true, &set[1..]),
+                    _ => (false, set),
+                };
+                let mut hit = false;
+                let mut i = 0;
+                while i < set.len() {
+                    if i + 2 < set.len() && set[i + 1] == '-' {
+                        hit |= set[i] <= c && c <= set[i + 2];
+                        i += 3;
+                    } else {
+                        hit |= set[i] == c;
+                        i += 1;
+                    }
+                }
+                hit != negate && go(&p[close + 1..], &t[1..])
+            }
+            Some(&c) => t.first() == Some(&c) && go(&p[1..], &t[1..]),
+        }
+    }
+    let p: Vec<char> = pat.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    go(&p, &t)
+}
+
 /// Positional (non-option) arguments; everything after `--` counts.
 fn positional(args: &[String]) -> Vec<&str> {
     let mut out = Vec::new();
@@ -759,59 +941,94 @@ fn assess_words(
         | "stdbuf" | "setsid" => {
             // `env DPKG_FORCE=… dpkg -r sed`: the assignments env sets stay
             // on the command it runs. An option that takes an argument
-            // (`-u NAME`, `-C DIR`, `-a NAME`) doesn't give it up as the
-            // command, and `-S STRING` is split into the command itself.
-            let mut assigns_here = Vec::new();
+            // (`-u NAME`, `-C DIR`, `stdbuf -o L`, `exec -a NAME`) is read
+            // with it, attached or clustered (`-iC /tmp`, `-oL`), and env's
+            // `-S STRING` is split the way env splits it.
+            let (short_args, long_args): (&[char], &[&str]) = match prog {
+                "env" => (
+                    &['u', 'C', 'a', 'S'],
+                    &["--unset", "--chdir", "--argv0", "--split-string"],
+                ),
+                "stdbuf" => (&['i', 'o', 'e'], &["--input", "--output", "--error"]),
+                "exec" => (&['a'], &[]),
+                "time" => (&['f', 'o'], &["--format", "--output"]),
+                _ => (&[], &[]),
+            };
+            let mut assigns_here: Vec<String> = Vec::new();
             let mut split: Option<String> = None;
             let mut i = 0;
             while i < args.len() {
                 let w = args[i].as_str();
                 if is_assignment(w) {
                     assigns_here.push(args[i].clone());
-                } else if !w.starts_with('-') {
+                    i += 1;
+                } else if w == "--" {
+                    i += 1;
                     break;
-                } else if matches!(w, "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0") {
+                } else if let Some(long) = w.strip_prefix("--") {
+                    let (name, value) = match long.split_once('=') {
+                        Some((n, v)) => (n, Some(v.to_string())),
+                        None => (long, None),
+                    };
+                    let flag = format!("--{name}");
                     i += 1;
-                } else if matches!(w, "-S" | "--split-string") {
-                    split = args.get(i + 1).cloned();
+                    if long_args.contains(&flag.as_str()) {
+                        let value = value.or_else(|| {
+                            i += 1;
+                            args.get(i - 1).cloned()
+                        });
+                        if flag == "--split-string" {
+                            split = value;
+                        }
+                    }
+                } else if let Some(cluster) = w.strip_prefix('-').filter(|c| !c.is_empty()) {
                     i += 1;
-                } else if let Some(v) = w
-                    .strip_prefix("--split-string=")
-                    .or_else(|| w.strip_prefix("-S").filter(|v| !v.is_empty()))
-                {
-                    split = Some(v.to_string());
+                    for (pos, c) in cluster.char_indices() {
+                        if short_args.contains(&c) {
+                            let attached = &cluster[pos + c.len_utf8()..];
+                            let value = if attached.is_empty() {
+                                i += 1;
+                                args.get(i - 1).cloned()
+                            } else {
+                                Some(attached.to_string())
+                            };
+                            if prog == "env" && c == 'S' {
+                                split = value;
+                            }
+                            break;
+                        }
+                    }
+                } else {
+                    break;
                 }
-                i += 1;
             }
             let rest = &args[i.min(args.len())..];
             if let Some(line) = split {
-                // What env splits is a command line of its own; the words
-                // after `-S` follow its last command.
-                match tokenize(&line) {
-                    Ok(parsed) => {
-                        for sub in &parsed.substitutions {
-                            a.merge(assess_at(ctx, sub, depth + 1));
-                        }
-                        let n = parsed.segments.len();
-                        for (k, seg) in parsed.segments.iter().enumerate() {
-                            for (target, writes) in &seg.redirects {
-                                if *writes {
-                                    if !is_harmless_sink(target) {
-                                        a.merge(write(ctx, target));
-                                    }
-                                } else {
-                                    a.merge(read(ctx, target));
-                                }
-                            }
-                            let mut words = assigns_here.clone();
-                            words.extend(seg.words.iter().cloned());
-                            if k + 1 == n {
-                                words.extend(rest.iter().cloned());
-                            }
-                            look_through(&mut a, &words, sudo);
+                // `${NAME}` comes from the environment env starts with: the
+                // assignments on this line.
+                let lookup = |name: &str| {
+                    assigns_here
+                        .iter()
+                        .chain(assigns.iter())
+                        .rev()
+                        .find_map(|v| v.split_once('=').filter(|(n, _)| *n == name))
+                        .map(|(_, v)| v.to_string())
+                };
+                match env_split(&line, &lookup) {
+                    Ok(words) => {
+                        let mut all = assigns_here.clone();
+                        all.extend(words);
+                        all.extend(rest.iter().cloned());
+                        if !all.is_empty() {
+                            look_through(&mut a, &all, sudo);
                         }
                     }
-                    Err(why) => a.raise(Tier::T1, format!("couldn't be parsed ({why})")),
+                    Err(why) => a.raise(
+                        Tier::T3,
+                        format!(
+                            "runs a command through env -S that Reeve can't split ({why}), so what runs can't be checked"
+                        ),
+                    ),
                 }
             } else if rest.is_empty() {
                 return a;
@@ -2429,7 +2646,8 @@ fn apt_switch_on(low: &str, key: &str) -> bool {
         after.strip_prefix('=').is_some_and(|v| {
             let v = v.trim_start_matches(['"', '\'']);
             let v = v.split([' ', ',', '"', '\'']).next().unwrap_or("");
-            matches!(v, "true" | "yes" | "1" | "on")
+            // What apt's StringToBool takes for true.
+            matches!(v, "true" | "yes" | "1" | "on" | "with" | "enable")
         })
     })
 }
@@ -2482,6 +2700,31 @@ fn assess_apt(ctx: &PathCtx, args: &[String], assigns: &[String], a: &mut Assess
         a.raise(
             Tier::T3,
             "allows removing essential packages, which the system can't run without",
+        );
+    }
+    // Options from a file Reeve hasn't read can turn those switches on.
+    let removes = matches!(
+        verb,
+        "remove"
+            | "purge"
+            | "autoremove"
+            | "auto-remove"
+            | "autopurge"
+            | "dist-upgrade"
+            | "full-upgrade"
+            | "dselect-upgrade"
+    ) || pos[1..].iter().any(|p| p.ends_with('-'));
+    let unseen_config = assigns.iter().any(|v| v.starts_with("APT_CONFIG="))
+        || args.iter().any(|x| {
+            x == "-c"
+                || x.starts_with("-c=")
+                || x == "--config-file"
+                || x.starts_with("--config-file=")
+        });
+    if removes && unseen_config {
+        a.raise(
+            Tier::T3,
+            "removes packages with apt options read from a file Reeve hasn't checked",
         );
     }
     match verb {
@@ -2639,7 +2882,10 @@ fn protected_packages(ctx: &PathCtx, pkgs: &[&str], a: &mut Assessment) {
         // running kernel can be in it.
         let marker = raw.contains(['*', '?', '[', '^', '~', '$']);
         let about_kernels = raw.contains("kernel") || raw.contains("linux-image");
-        if marker && about_kernels || broad_apt_pattern(raw) {
+        if marker && about_kernels
+            || broad_apt_pattern(raw)
+            || pattern_hits_running_kernel(raw, &ctx.kernel)
+        {
             a.raise(
                 Tier::T3,
                 format!(
@@ -2672,6 +2918,39 @@ fn deb_kernel_image(name: &str) -> Option<&str> {
         return None;
     }
     Some(rest.strip_suffix("-unsigned").unwrap_or(rest))
+}
+
+/// Whether a removal argument, read as the pattern a package manager reads
+/// it as (a glob; apt's unanchored regex, which it falls back to for any
+/// name with `.`, `?`, or `*` that isn't a package; an apt name pattern
+/// `~n…` or `?name(…)`), selects the running kernel's image package.
+/// `linux*`, `*6.1.0-37-amd64`, `~nlinux`, `?name(linux)`,
+/// `~nl[i]nux-image`, `linux-image-6\.1\.0-37-amd64`, and
+/// `linux-image-6.1.0-37-amd64|htop` all do; another kernel's exact name
+/// doesn't.
+fn pattern_hits_running_kernel(raw: &str, kernel: &str) -> bool {
+    if kernel.is_empty() {
+        return false;
+    }
+    let images = [
+        format!("linux-image-{kernel}"),
+        format!("linux-image-{kernel}-unsigned"),
+        format!("kernel-core-{kernel}"),
+        format!("kernel-{kernel}"),
+    ];
+    let re_hits = |re: &str| Regex::new(re).is_ok_and(|r| images.iter().any(|i| r.is_match(i)));
+    if let Some(re) = raw.strip_prefix("~n") {
+        return re_hits(re);
+    }
+    if let Some(re) = raw.strip_prefix("?name(").and_then(|r| r.strip_suffix(')')) {
+        return re_hits(re);
+    }
+    if raw.starts_with(['~', '?']) {
+        return false;
+    }
+    let glob = raw.contains(['*', '?', '[']) && images.iter().any(|i| glob_match(raw, i));
+    let regex = raw.contains(['.', '*', '?', '[', '^', '$', '|', '\\', '(', '+']) && re_hits(raw);
+    glob || regex
 }
 
 /// apt patterns that select by state rather than name, which take
@@ -2925,6 +3204,9 @@ mod tests {
             "env -u LANG printenv",
             "env -C /tmp ls",
             "env -S 'ls -la /etc'",
+            "env -i0 printenv",
+            "stdbuf -oL cat /etc/hostname",
+            "env -S 'ls\\_-la # the rest'",
         ] {
             assert_eq!(
                 tier(cmd),
@@ -3004,6 +3286,15 @@ mod tests {
             "sudo apt-get -o APT::Get::force-yes=false remove htop",
             "sudo apt-get remove '?name(^htop$)'",
             "sudo apt-get remove '~nhtop'",
+            "sudo stdbuf -oL dpkg -r htop",
+            "sudo env -iu LANG dpkg -r htop",
+            "export FOO=bar; sudo dpkg -r htop",
+            "FOO=dpkg; sudo -E dpkg -r htop",
+            "sudo apt-get -o APT::Get::allow-remove-essential=disable remove htop",
+            "sudo apt-get -c /tmp/apt.conf install htop",
+            "sudo apt-get remove 'libfoo.*'",
+            "sudo apt-get remove python3.11",
+            "VAL=x sudo env -S 'dpkg -r ${VAL}'",
         ] {
             assert_eq!(
                 tier(cmd),
@@ -3070,6 +3361,10 @@ mod tests {
             "sudo apt purge -y linux-image-6.1.0-37-amd64",
             "sudo dpkg -P linux-image-6.1.0-37-amd64",
             "sudo apt-get install -y linux-image-6.1.0-37-amd64-",
+            "sudo apt-get remove '*6.1.0-37-amd64'",
+            "sudo apt-get remove 'linux-image-6\\.1\\.0-37-amd64'",
+            "sudo apt-get remove 'linux-image-6.1.0-37-amd64|htop'",
+            "sudo apt-get remove 'linux-image-6.1.0-3?-amd64'",
         ] {
             assert_eq!(assess(&ctx, cmd).tier, Tier::T3, "{cmd}");
         }
@@ -3087,6 +3382,52 @@ mod tests {
             apt_positional(&["-y", "-o", "X=1", "install", "a", "--", "-b"].map(String::from)),
             ["install", "a", "-b"]
         );
+    }
+
+    #[test]
+    fn env_splits_like_env_and_globs_match() {
+        let none = |_: &str| None;
+        let split = |s: &str| env_split(s, &none).unwrap();
+        assert_eq!(split("a  b\t'c d' \"e f\""), ["a", "b", "c d", "e f"]);
+        assert_eq!(
+            split("a\\_b 'c\\_d' x\\\\y \\#z"),
+            ["a", "b", "c d", "x\\y", "#z"]
+        );
+        assert_eq!(split("ls -la # the rest"), ["ls", "-la"]);
+        assert_eq!(split("a\\cb c"), ["a"]);
+        let val = |n: &str| (n == "V").then(|| "dpkg".to_string());
+        assert_eq!(
+            env_split("${V} -r x '${V}'", &val).unwrap(),
+            ["dpkg", "-r", "x", "${V}"]
+        );
+        assert!(env_split("${NOPE} x", &none).is_err());
+        assert!(env_split("a\\qb", &none).is_err());
+        assert!(env_split("'open", &none).is_err());
+        assert!(glob_match("linux*", "linux-image-6.1.0-37-amd64"));
+        assert!(glob_match("*6.1.0-37-amd64", "linux-image-6.1.0-37-amd64"));
+        assert!(glob_match(
+            "linux-image-6.1.0-3?-amd64",
+            "linux-image-6.1.0-37-amd64"
+        ));
+        assert!(glob_match(
+            "l[a-m]nux-image-*",
+            "linux-image-6.1.0-37-amd64"
+        ));
+        assert!(!glob_match("l[!i]nux*", "linux-image-6.1.0-37-amd64"));
+        assert!(!glob_match(
+            "linux-image-6.1.0-36-*",
+            "linux-image-6.1.0-37-amd64"
+        ));
+        assert!(pattern_hits_running_kernel(
+            "~nl[i]nux-image",
+            "6.1.0-37-amd64"
+        ));
+        assert!(!pattern_hits_running_kernel("~nhtop", "6.1.0-37-amd64"));
+        assert!(!pattern_hits_running_kernel(
+            "linux-image-6.1.0-36-amd64",
+            "6.1.0-37-amd64"
+        ));
+        assert!(!pattern_hits_running_kernel("linux*", ""));
     }
 
     #[test]
@@ -3168,6 +3509,28 @@ mod tests {
             "env -S 'DPKG_FORCE=remove-essential,depends dpkg -r sed'",
             "sudo env --split-string='DPKG_FORCE=all dpkg -r gzip'",
             "sudo env -S 'DPKG_FORCE=all dpkg' -r tar",
+            "sudo env -iC /tmp DPKG_FORCE=remove-essential,depends dpkg -r sed",
+            "sudo env -iu LANG DPKG_FORCE=remove-essential,depends dpkg -r sed",
+            "env -iS 'DPKG_FORCE=remove-essential,depends dpkg -r sed'",
+            "sudo env -vS'DPKG_FORCE=all dpkg -r gzip'",
+            "env -S 'DPKG_FORCE=remove-essential,depends\\_dpkg\\_-r\\_sed'",
+            "VAL=remove-essential,depends sudo env -S 'DPKG_FORCE=${VAL} dpkg -r sed'",
+            "CMD=dpkg sudo env -S '${CMD} -r libc6'",
+            "sudo env -S '${NOPE} -r libc6'",
+            "export DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "DPKG_FORCE=remove-essential; export DPKG_FORCE; sudo --preserve-env=DPKG_FORCE dpkg -r sed",
+            "sudo stdbuf -o L dpkg -r libc6",
+            "sudo exec -a x dpkg -r libc6",
+            "sudo apt-get remove 'linux*'",
+            "sudo apt-get remove '~nlinux'",
+            "sudo apt remove '?name(linux)'",
+            "sudo apt-get remove '~nl[i]nux-image'",
+            "sudo apt-get install 'linux*-'",
+            "sudo apt-get -o APT::Get::allow-remove-essential=enable remove sed",
+            "sudo apt-get -o APT::Get::force-yes=with remove grep",
+            "sudo apt-get -c /tmp/apt.conf remove sed",
+            "APT_CONFIG=/tmp/x sudo apt-get purge grep",
+            "sudo apt-get --config-file=/tmp/x install -y sed-",
             "sudo apt-get remove '^linux-image-.*'",
             "sudo apt-get remove '~n^linux-image-'",
             "sudo apt remove '?name(^linux-image-)'",

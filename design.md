@@ -504,11 +504,14 @@ trait Distro {
     restarting them on its own; a restart is an action with its own approval and undo.
   - **The floor:** `libc6`, `dpkg`, `apt`, `systemd-sysv`, `grub-*`, `shim-signed`, `initramfs-tools`,
     `linux-image-amd64`, and the rest of the Debian list in `protected_packages`; `install foo-` is a
-    removal; kernel packages named by a pattern (`linux-image-6.1*`, `linux-image-*-amd64`); the running
-    kernel's `linux-image-$(uname -r)`; `--allow-remove-essential` and `--force-yes` as flags or as the
+    removal; kernel packages named by a pattern, read as the glob, apt regex, or apt pattern it is and
+    matched against the running kernel's image (`linux*`, `~nlinux`, `?name(linux)`, `linux-image-6\.1\.0-37-amd64`),
+    and patterns that select by state (`~i`, `?installed`); the running kernel's `linux-image-$(uname -r)`; `--allow-remove-essential` and `--force-yes` as flags or as the
     config items they set (`-o APT::Get::allow-remove-essential=true`); dpkg's `--force-depends`,
     `--force-all`, `--force-remove-essential` when removing, as a flag, in a comma list, in
-    `-o Dpkg::Options::=…`, or in `DPKG_FORCE=`.
+    `-o Dpkg::Options::=…`, or in `DPKG_FORCE=` (on the command, through `env` and its option clusters and
+    `-S` strings, or `export`ed earlier on the line); an apt config file Reeve hasn't read (`-c`, `APT_CONFIG=`)
+    with a removal.
   - **reeved:** a reboot is pending when the newest installed `linux-image-<abi>` isn't `uname -r`, when
     the running kernel's package version no longer matches the build in `/proc/version` (a security
     rebuild under the same name), or when `/var/run/reboot-required` is set. Security updates are the
