@@ -504,14 +504,19 @@ trait Distro {
     restarting them on its own; a restart is an action with its own approval and undo.
   - **The floor:** `libc6`, `dpkg`, `apt`, `systemd-sysv`, `grub-*`, `shim-signed`, `initramfs-tools`,
     `linux-image-amd64`, and the rest of the Debian list in `protected_packages`; `install foo-` is a
-    removal; kernel packages named by a pattern, read as the glob, apt regex, or apt pattern it is and
-    matched against the running kernel's image (`linux*`, `~nlinux`, `?name(linux)`, `linux-image-6\.1\.0-37-amd64`),
-    and patterns that select by state (`~i`, `?installed`); the running kernel's `linux-image-$(uname -r)`; `--allow-remove-essential` and `--force-yes` as flags or as the
-    config items they set (`-o APT::Get::allow-remove-essential=true`); dpkg's `--force-depends`,
-    `--force-all`, `--force-remove-essential` when removing, as a flag, in a comma list, in
-    `-o Dpkg::Options::=…`, or in `DPKG_FORCE=` (on the command, through `env` and its option clusters and
-    `-S` strings, or `export`ed earlier on the line); an apt config file Reeve hasn't read (`-c`, `APT_CONFIG=`)
-    with a removal.
+    removal; a package argument that isn't a name is read the way apt reads it (`policy/apt_syntax.rs`:
+    a case-folded glob, apt's unanchored case-insensitive regex, or an apt pattern parsed with
+    apt-patterns(7)'s grammar, a `:arch` suffix split off first) and is the floor when it can take the
+    running kernel's image or a protected name (`linux*`, `LINUX*`, `~nlinux~i`, `?not(~nhtop)`,
+    `~ramd64`, `lib*`) or when apt itself couldn't parse it; the running kernel's
+    `linux-image-$(uname -r)`; `--allow-remove-essential` and `--force-yes` as flags or as the config
+    items they set, with any value apt's `StringToBool` reads as true (`1`, `0x1`, `+1`, `enable`);
+    dpkg's `--force-depends`, `--force-all`, `--force-remove-essential` when removing, as a flag, in a
+    comma list, in `-o Dpkg::Options::=…`, or in `DPKG_FORCE=` (on the command, `+=`-appended,
+    `export`ed earlier on the line, or through `env`, which is read as getopt_long reads it: clusters,
+    abbreviated long options, a bare `-`, and `-S` strings env re-reads as its own command line); an
+    apt config file Reeve hasn't read (`-c FILE`, `-cFILE`, `APT_CONFIG=`) with a removal. apt's command
+    line is read by apt's rules throughout, so `-s 0` and `--no-simulate` are not simulations.
   - **reeved:** a reboot is pending when the newest installed `linux-image-<abi>` isn't `uname -r`, when
     the running kernel's package version no longer matches the build in `/proc/version` (a security
     rebuild under the same name), or when `/var/run/reboot-required` is set. Security updates are the

@@ -10,6 +10,7 @@
 //! Some actions are refused outright ([`Assessment::deny`]): reading Reeve's
 //! own keys, or rewriting its receipts.
 
+mod apt_syntax;
 pub mod paths;
 pub mod shell;
 

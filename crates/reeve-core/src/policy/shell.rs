@@ -18,10 +18,13 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use super::apt_syntax::{self, AptLine};
 use super::{Assessment, PathCtx, Tier, read, recursive, write};
 
 /// How deep `bash -c "…$(…)"` nesting is followed before giving up.
 const MAX_DEPTH: usize = 4;
+/// How many times env's `-S` may re-read its command line (`-S '-S …'`).
+const MAX_RESTARTS: usize = 8;
 
 /// Assess a command line.
 pub fn assess(ctx: &PathCtx, command: &str) -> Assessment {
@@ -103,24 +106,40 @@ fn assess_at(ctx: &PathCtx, command: &str, depth: usize) -> Assessment {
     a
 }
 
-/// Track `A=b`, `export A=b`, `export A` (after an `A=b`), and
+/// Track `A=b`, `A+=b`, `export A=b`, `export A` (after an `A=b`), and
 /// `declare -x`/`typeset -x`, so what a later command's environment holds
-/// is known. `exported` is (name, value).
+/// is known. `exported` is (name, value). `+=` appends to what the shell
+/// variable holds so far, or to nothing.
 fn note_exports(
     words: &[String],
     vars: &mut Vec<(String, String)>,
     exported: &mut Vec<(String, String)>,
 ) {
-    let set = |list: &mut Vec<(String, String)>, name: &str, value: &str| {
+    fn set(list: &mut Vec<(String, String)>, name: &str, value: &str) {
         list.retain(|(n, _)| n != name);
         list.push((name.to_string(), value.to_string()));
-    };
+    }
+    fn value_of(list: &[(String, String)], name: &str) -> Option<String> {
+        list.iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+    }
+    fn resolve(vars: &[(String, String)], w: &str) -> Option<(String, String)> {
+        let (name, appends, value) = assignment(w)?;
+        let before = if appends {
+            value_of(vars, name).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Some((name.to_string(), format!("{before}{value}")))
+    }
     let leading: Vec<&String> = words.iter().take_while(|w| is_assignment(w)).collect();
     let Some(prog) = words.get(leading.len()) else {
         // A bare `A=b`: a shell variable, not yet in the environment.
         for w in leading {
-            if let Some((n, v)) = w.split_once('=') {
-                set(vars, n, v);
+            if let Some((n, v)) = resolve(vars, w) {
+                set(vars, &n, &v);
             }
         }
         return;
@@ -135,14 +154,13 @@ fn note_exports(
         if w.starts_with('-') {
             continue;
         }
-        match w.split_once('=') {
+        match resolve(vars, w) {
             Some((n, v)) => {
-                set(vars, n, v);
-                set(exported, n, v);
+                set(vars, &n, &v);
+                set(exported, &n, &v);
             }
             None => {
-                if let Some((_, v)) = vars.iter().find(|(n, _)| n == w) {
-                    let v = v.clone();
+                if let Some(v) = value_of(vars, w) {
                     set(exported, w, &v);
                 }
             }
@@ -516,22 +534,46 @@ fn command_words(words: &[String]) -> Option<(bool, Vec<String>)> {
 }
 
 fn is_assignment(w: &str) -> bool {
-    match w.split_once('=') {
-        Some((k, _)) => {
-            !k.is_empty()
-                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && !k.starts_with(|c: char| c.is_ascii_digit())
-        }
-        None => false,
-    }
+    assignment(w).is_some()
+}
+
+/// `NAME=value` or `NAME+=value` with a shell-legal name: (name, appends?, value).
+fn assignment(w: &str) -> Option<(&str, bool, &str)> {
+    let (k, v) = w.split_once('=')?;
+    let (name, appends) = match k.strip_suffix('+') {
+        Some(n) => (n, true),
+        None => (k, false),
+    };
+    let legal = !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !name.starts_with(|c: char| c.is_ascii_digit());
+    legal.then_some((name, appends, v))
+}
+
+/// The `NAME=value` an assignment word amounts to: `+=` appends to what an
+/// earlier word in `known` gave the name, or to nothing.
+fn resolve_assign(w: &str, known: &[String]) -> Option<String> {
+    let (name, appends, value) = assignment(w)?;
+    let before = if appends {
+        known
+            .iter()
+            .rev()
+            .find_map(|k| k.split_once('=').filter(|(n, _)| *n == name))
+            .map(|(_, v)| v)
+            .unwrap_or("")
+    } else {
+        ""
+    };
+    Some(format!("{name}={before}{value}"))
 }
 
 fn base(prog: &str) -> &str {
     prog.rsplit('/').next().unwrap_or(prog)
 }
 
-/// Split a string the way GNU env's `-S` does: on unquoted spaces and
-/// tabs; single and double quotes group; `\_` is a separator outside
+/// Split a string the way GNU env's `-S` does: on unquoted whitespace
+/// (space, tab, newline, vertical tab, form feed, return); single and
+/// double quotes group; `\_` is a separator outside
 /// quotes and a space inside; `\c` ends the string; `\#`, `\$`, `\"`,
 /// `\'`, `\\` are literal, `\t` `\n` `\r` `\v` `\f` are those
 /// characters; a `#` starting a word begins a comment; `${NAME}` (outside
@@ -545,7 +587,7 @@ fn env_split(s: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Str
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         match (quote, c) {
-            (None, ' ' | '\t') => {
+            (None, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r') => {
                 if in_word {
                     words.push(std::mem::take(&mut cur));
                     in_word = false;
@@ -557,6 +599,12 @@ fn env_split(s: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Str
                 in_word = true;
             }
             (Some(q), ch) if ch == q => quote = None,
+            // In single quotes a backslash is itself, unless it escapes a
+            // backslash or a quote.
+            (Some('\''), '\\') if !matches!(chars.peek(), Some('\\' | '\'')) => {
+                cur.push('\\');
+                in_word = true;
+            }
             (_, '\\') => {
                 let Some(e) = chars.next() else {
                     return Err("a backslash at the end".into());
@@ -614,44 +662,206 @@ fn env_split(s: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Str
     Ok(words)
 }
 
-/// Shell-style glob: `*`, `?`, and `[set]` (ranges, `!`/`^` negation).
-fn glob_match(pat: &str, text: &str) -> bool {
-    fn go(p: &[char], t: &[char]) -> bool {
-        match p.first() {
-            None => t.is_empty(),
-            Some('*') => (0..=t.len()).any(|k| go(&p[1..], &t[k..])),
-            Some('?') => !t.is_empty() && go(&p[1..], &t[1..]),
-            Some('[') => {
-                let Some(close) = p.iter().skip(2).position(|c| *c == ']').map(|i| i + 2) else {
-                    return t.first() == Some(&'[') && go(&p[1..], &t[1..]);
-                };
-                let Some(&c) = t.first() else {
-                    return false;
-                };
-                let set = &p[1..close];
-                let (negate, set) = match set.first() {
-                    Some('!' | '^') => (true, &set[1..]),
-                    _ => (false, set),
-                };
-                let mut hit = false;
-                let mut i = 0;
-                while i < set.len() {
-                    if i + 2 < set.len() && set[i + 1] == '-' {
-                        hit |= set[i] <= c && c <= set[i + 2];
-                        i += 3;
-                    } else {
-                        hit |= set[i] == c;
-                        i += 1;
-                    }
-                }
-                hit != negate && go(&p[close + 1..], &t[1..])
-            }
-            Some(&c) => t.first() == Some(&c) && go(&p[1..], &t[1..]),
-        }
+/// Whether a wrapper's option takes an argument, as its getopt_long table says.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OptArg {
+    No,
+    Required,
+    Optional,
+}
+
+/// A wrapper's getopt_long tables: the short options that take an
+/// argument, and its long options.
+fn wrapper_grammar(prog: &str) -> (&'static [char], &'static [(&'static str, OptArg)]) {
+    use OptArg::{No, Optional, Required};
+    match prog {
+        // GNU env 9.x: "+a:C:iS:u:v0" and its long options.
+        "env" => (
+            &['a', 'C', 'S', 'u'],
+            &[
+                ("argv0", Required),
+                ("ignore-environment", No),
+                ("env0-from", Required),
+                ("null", No),
+                ("unset", Required),
+                ("chdir", Required),
+                ("default-signal", Optional),
+                ("ignore-signal", Optional),
+                ("block-signal", Optional),
+                ("list-signal-handling", No),
+                ("debug", No),
+                ("quoting-style", Required),
+                ("split-string", Required),
+                ("help", No),
+                ("version", No),
+            ],
+        ),
+        "stdbuf" => (
+            &['i', 'o', 'e'],
+            &[
+                ("input", Required),
+                ("output", Required),
+                ("error", Required),
+                ("help", No),
+                ("version", No),
+            ],
+        ),
+        "exec" => (&['a'], &[]),
+        // GNU time; bash's keyword takes only -p.
+        "time" => (
+            &['f', 'o'],
+            &[
+                ("format", Required),
+                ("output", Required),
+                ("append", No),
+                ("portability", No),
+                ("quiet", No),
+                ("verbose", No),
+                ("help", No),
+                ("version", No),
+            ],
+        ),
+        "setsid" => (
+            &[],
+            &[
+                ("ctty", No),
+                ("fork", No),
+                ("wait", No),
+                ("help", No),
+                ("version", No),
+            ],
+        ),
+        "nohup" => (&[], &[("help", No), ("version", No)]),
+        _ => (&[], &[]),
     }
-    let p: Vec<char> = pat.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    go(&p, &t)
+}
+
+/// A long option as getopt_long resolves it: the exact name, else the one
+/// option it's a prefix of (`--u` is `--unset`, `--s` is `--split-string`).
+/// Ambiguous or unknown is None: the program would stop, and Reeve reads
+/// on as if the word took nothing, which can only over-ask.
+fn resolve_long(table: &[(&'static str, OptArg)], name: &str) -> Option<(&'static str, OptArg)> {
+    if let Some(hit) = table.iter().find(|(n, _)| *n == name) {
+        return Some(*hit);
+    }
+    let mut hits = table.iter().filter(|(n, _)| n.starts_with(name));
+    match (hits.next(), hits.next()) {
+        (Some(hit), None) => Some(*hit),
+        _ => None,
+    }
+}
+
+/// The command a wrapper (`env`, `stdbuf`, `exec -a`, …) runs, read the
+/// way getopt_long reads the wrapper's own options: clusters (`-iC /tmp`),
+/// arguments attached or separate, unique abbreviations of long options,
+/// `--`. For env: a bare `-` is `-i`; `-S STRING` is split the way env
+/// splits it, and env then re-reads the split words followed by the
+/// remaining arguments as its command line; every word with `=` before the
+/// program is an assignment. Ok(None): the wrapper runs nothing. Err: what
+/// runs can't be read.
+fn wrapper_command(
+    prog: &str,
+    args: &[String],
+    lookup: &dyn Fn(&str) -> Option<String>,
+    restarts: usize,
+) -> Result<Option<Vec<String>>, String> {
+    if restarts > MAX_RESTARTS {
+        return Err("nests -S too deeply".into());
+    }
+    let restart = |string: &str, remaining: &[String]| {
+        let mut words = env_split(string, lookup)?;
+        words.extend(remaining.iter().cloned());
+        wrapper_command(prog, &words, lookup, restarts + 1)
+    };
+    let (short_args, long) = wrapper_grammar(prog);
+    let mut i = 0;
+    while i < args.len() {
+        let w = args[i].as_str();
+        if w == "--" {
+            i += 1;
+            break;
+        }
+        if let Some(name) = w.strip_prefix("--") {
+            let (name, attached) = match name.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (name, None),
+            };
+            i += 1;
+            let Some((full, takes)) = resolve_long(long, name) else {
+                continue;
+            };
+            let value = match takes {
+                OptArg::Required => attached.or_else(|| {
+                    i += 1;
+                    args.get(i - 1).cloned()
+                }),
+                _ => attached,
+            };
+            if prog == "env" && full == "split-string" {
+                return match value {
+                    Some(s) => restart(&s, &args[i.min(args.len())..]),
+                    None => Ok(None),
+                };
+            }
+            continue;
+        }
+        if w.len() > 1 && w.starts_with('-') {
+            i += 1;
+            let cluster = &w[1..];
+            for (pos, c) in cluster.char_indices() {
+                if !short_args.contains(&c) {
+                    continue;
+                }
+                let attached = &cluster[pos + c.len_utf8()..];
+                let value = if attached.is_empty() {
+                    i += 1;
+                    args.get(i - 1).cloned()
+                } else {
+                    Some(attached.to_string())
+                };
+                if prog == "env" && c == 'S' {
+                    return match value {
+                        Some(s) => restart(&s, &args[i.min(args.len())..]),
+                        None => Ok(None),
+                    };
+                }
+                break;
+            }
+            continue;
+        }
+        break;
+    }
+    let mut rest = &args[i.min(args.len())..];
+    let env = prog == "env";
+    if env && rest.first().is_some_and(|w| w == "-") {
+        rest = &rest[1..];
+    }
+    let n = rest
+        .iter()
+        .take_while(|w| {
+            if env {
+                w.contains('=')
+            } else {
+                is_assignment(w)
+            }
+        })
+        .count();
+    if n == rest.len() {
+        return Ok(None);
+    }
+    let mut words: Vec<String> = Vec::new();
+    for w in &rest[..n] {
+        // env sets whatever stands before the first `=`; only a shell-legal
+        // name is one a program reads (`FOO+=x` sets `FOO+`, not `FOO`).
+        let plain = match assignment(w) {
+            Some((_, false, _)) => Some(w.clone()),
+            Some((_, true, _)) if !env => resolve_assign(w, &words),
+            _ => None,
+        };
+        words.extend(plain);
+    }
+    words.extend(rest[n..].iter().cloned());
+    Ok(Some(words))
 }
 
 /// Positional (non-option) arguments; everything after `--` counts.
@@ -852,12 +1062,14 @@ fn assess_words(
     depth: usize,
 ) -> Assessment {
     let mut a = Assessment::new(Tier::T0);
-    // `DPKG_FORCE=… dpkg …`: the assignments reach the program.
-    let assigns: Vec<String> = words
-        .iter()
-        .take_while(|w| is_assignment(w))
-        .cloned()
-        .collect();
+    // `DPKG_FORCE=… dpkg …`: the assignments reach the program, `+=`
+    // resolved against what came before it.
+    let mut assigns: Vec<String> = Vec::new();
+    for w in words.iter().take_while(|w| is_assignment(w)) {
+        if let Some(plain) = resolve_assign(w, &assigns) {
+            assigns.push(plain);
+        }
+    }
     let Some((_, words)) = command_words(words) else {
         return a;
     };
@@ -940,102 +1152,26 @@ fn assess_words(
         "env" | "nohup" | "time" | "command" | "exec" | "builtin" | "chronic" | "unbuffer"
         | "stdbuf" | "setsid" => {
             // `env DPKG_FORCE=… dpkg -r sed`: the assignments env sets stay
-            // on the command it runs. An option that takes an argument
-            // (`-u NAME`, `-C DIR`, `stdbuf -o L`, `exec -a NAME`) is read
-            // with it, attached or clustered (`-iC /tmp`, `-oL`), and env's
-            // `-S STRING` is split the way env splits it.
-            let (short_args, long_args): (&[char], &[&str]) = match prog {
-                "env" => (
-                    &['u', 'C', 'a', 'S'],
-                    &["--unset", "--chdir", "--argv0", "--split-string"],
-                ),
-                "stdbuf" => (&['i', 'o', 'e'], &["--input", "--output", "--error"]),
-                "exec" => (&['a'], &[]),
-                "time" => (&['f', 'o'], &["--format", "--output"]),
-                _ => (&[], &[]),
+            // on the command it runs, and the wrapper's own options are read
+            // the way getopt_long reads them (`wrapper_command`). `${NAME}`
+            // in env's `-S` comes from the environment env starts with: the
+            // assignments on this line.
+            let lookup = |name: &str| {
+                assigns
+                    .iter()
+                    .rev()
+                    .find_map(|v| v.split_once('=').filter(|(n, _)| *n == name))
+                    .map(|(_, v)| v.to_string())
             };
-            let mut assigns_here: Vec<String> = Vec::new();
-            let mut split: Option<String> = None;
-            let mut i = 0;
-            while i < args.len() {
-                let w = args[i].as_str();
-                if is_assignment(w) {
-                    assigns_here.push(args[i].clone());
-                    i += 1;
-                } else if w == "--" {
-                    i += 1;
-                    break;
-                } else if let Some(long) = w.strip_prefix("--") {
-                    let (name, value) = match long.split_once('=') {
-                        Some((n, v)) => (n, Some(v.to_string())),
-                        None => (long, None),
-                    };
-                    let flag = format!("--{name}");
-                    i += 1;
-                    if long_args.contains(&flag.as_str()) {
-                        let value = value.or_else(|| {
-                            i += 1;
-                            args.get(i - 1).cloned()
-                        });
-                        if flag == "--split-string" {
-                            split = value;
-                        }
-                    }
-                } else if let Some(cluster) = w.strip_prefix('-').filter(|c| !c.is_empty()) {
-                    i += 1;
-                    for (pos, c) in cluster.char_indices() {
-                        if short_args.contains(&c) {
-                            let attached = &cluster[pos + c.len_utf8()..];
-                            let value = if attached.is_empty() {
-                                i += 1;
-                                args.get(i - 1).cloned()
-                            } else {
-                                Some(attached.to_string())
-                            };
-                            if prog == "env" && c == 'S' {
-                                split = value;
-                            }
-                            break;
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
-            let rest = &args[i.min(args.len())..];
-            if let Some(line) = split {
-                // `${NAME}` comes from the environment env starts with: the
-                // assignments on this line.
-                let lookup = |name: &str| {
-                    assigns_here
-                        .iter()
-                        .chain(assigns.iter())
-                        .rev()
-                        .find_map(|v| v.split_once('=').filter(|(n, _)| *n == name))
-                        .map(|(_, v)| v.to_string())
-                };
-                match env_split(&line, &lookup) {
-                    Ok(words) => {
-                        let mut all = assigns_here.clone();
-                        all.extend(words);
-                        all.extend(rest.iter().cloned());
-                        if !all.is_empty() {
-                            look_through(&mut a, &all, sudo);
-                        }
-                    }
-                    Err(why) => a.raise(
-                        Tier::T3,
-                        format!(
-                            "runs a command through env -S that Reeve can't split ({why}), so what runs can't be checked"
-                        ),
+            match wrapper_command(prog, args, &lookup, 0) {
+                Ok(Some(words)) => look_through(&mut a, &words, sudo),
+                Ok(None) => {}
+                Err(why) => a.raise(
+                    Tier::T3,
+                    format!(
+                        "runs a command through env -S that Reeve can't split ({why}), so what runs can't be checked"
                     ),
-                }
-            } else if rest.is_empty() {
-                return a;
-            } else {
-                let mut words = assigns_here;
-                words.extend(rest.iter().cloned());
-                look_through(&mut a, &words, sudo);
+                ),
             }
         }
         "nice" | "ionice" | "timeout" | "watch" | "flock" => {
@@ -2540,42 +2676,6 @@ fn assess_dnf(ctx: &PathCtx, args: &[String], a: &mut Assessment) {
     }
 }
 
-/// apt's positionals: the verb and the packages. Options that take a value
-/// (`-o Dpkg::Options::=…`, `-t bookworm-backports`) don't give one up.
-fn apt_positional(args: &[String]) -> Vec<&str> {
-    const TAKES_VALUE: &[&str] = &[
-        "-o",
-        "--option",
-        "-c",
-        "--config-file",
-        "-t",
-        "--target-release",
-        "--default-release",
-        "-a",
-        "--host-architecture",
-        "-P",
-        "--build-profiles",
-        "-S",
-        "--snapshot",
-    ];
-    let mut out = Vec::new();
-    let (mut skip, mut rest) = (false, false);
-    for a in args {
-        if rest {
-            out.push(a.as_str());
-        } else if skip {
-            skip = false;
-        } else if a == "--" {
-            rest = true;
-        } else if TAKES_VALUE.contains(&a.as_str()) {
-            skip = true;
-        } else if !a.starts_with('-') {
-            out.push(a.as_str());
-        }
-    }
-    out
-}
-
 /// The words of dpkg's force options: `--force-depends`,
 /// `--force-depends,remove-essential`, `--force-all`, and the same list in
 /// `DPKG_FORCE=` (dpkg 1.19.5+), which apt passes on to dpkg too.
@@ -2612,64 +2712,27 @@ fn forces_past_essential(words: &[String]) -> bool {
 
 /// apt's switches past essential packages, as flags or as the config
 /// items they set: `--allow-remove-essential`, `--force-yes`,
-/// `-o APT::Get::allow-remove-essential=true`, `--option=APT::Get::force-yes=true`,
-/// and `-o Dpkg::Options::=--force-remove-essential` (or `--force-all`,
-/// `--force-depends`), wherever they are on the line. Config names are
-/// case-insensitive.
-fn apt_removes_essential(args: &[String], assigns: &[String]) -> bool {
-    let dpkg_opts: Vec<String> = args
-        .iter()
-        .filter_map(|x| {
-            let low = x.to_ascii_lowercase();
-            let at = low.find("dpkg::options::=")?;
-            Some(x[at + "dpkg::options::=".len()..].to_string())
-        })
-        .collect();
+/// `-o APT::Get::allow-remove-essential=VALUE` with any value apt reads as
+/// true (`1`, `0x1`, `enable`, …), and `-o Dpkg::Options::=--force-remove-essential`
+/// (or `--force-all`, `--force-depends`), wherever they are on the line.
+fn apt_removes_essential(line: &AptLine, assigns: &[String]) -> bool {
+    let mut dpkg_opts = line.config_values("dpkg::options::");
+    dpkg_opts.extend(line.config_values("dpkg::options"));
     let forced = dpkg_force_words(&dpkg_opts, assigns);
-    args.iter().any(|x| {
-        let low = x.to_ascii_lowercase();
-        apt_switch_on(&low, "allow-remove-essential") || apt_switch_on(&low, "force-yes")
-    }) || forces_past_essential(&forced)
+    line.on("allow-remove-essential")
+        || line.on("force-yes")
+        || line.config_on("apt::get::allow-remove-essential")
+        || line.config_on("apt::get::force-yes")
+        || forces_past_essential(&forced)
         || forces_past_depends(&forced)
-}
-
-/// Whether a lower-cased argument turns an apt switch on: the long flag
-/// itself (`--force-yes`), or a config item with an affirmative value
-/// (`-o APT::Get::force-yes=true`, `--allow-remove-essential=yes`). Not
-/// `--no-force-yes`, not `=false`, and not a package that happens to be
-/// named like the flag.
-fn apt_switch_on(low: &str, key: &str) -> bool {
-    if low == format!("--{key}") {
-        return true;
-    }
-    low.split(key).skip(1).any(|after| {
-        after.strip_prefix('=').is_some_and(|v| {
-            let v = v.trim_start_matches(['"', '\'']);
-            let v = v.split([' ', ',', '"', '\'']).next().unwrap_or("");
-            // What apt's StringToBool takes for true.
-            matches!(v, "true" | "yes" | "1" | "on" | "with" | "enable")
-        })
-    })
 }
 
 /// apt-get, apt, aptitude: queries and simulations (`-s`) are reads;
 /// everything else changes packages, the lists, or the cache. `install
 /// foo-` removes foo, so it meets the floor like `remove foo`.
 fn assess_apt(ctx: &PathCtx, args: &[String], assigns: &[String], a: &mut Assessment) {
-    let pos = apt_positional(args);
-    let verb = pos.first().copied().unwrap_or("");
-    // `-s`, alone or in a cluster of letters (`-ys`); a glued value
-    // (`-oDpkg::Options::=…`) isn't a cluster.
-    let simulate = args.iter().any(|x| {
-        matches!(
-            x.as_str(),
-            "--simulate" | "--just-print" | "--dry-run" | "--recon" | "--no-act"
-        ) || (x.starts_with('-')
-            && !x.starts_with("--")
-            && x.len() > 1
-            && x[1..].chars().all(|c| c.is_ascii_alphabetic())
-            && x.contains('s'))
-    });
+    let line = AptLine::parse(args);
+    let verb = line.positional.first().map(String::as_str).unwrap_or("");
     let read_verbs = [
         "list",
         "show",
@@ -2693,15 +2756,16 @@ fn assess_apt(ctx: &PathCtx, args: &[String], assigns: &[String], a: &mut Assess
         "versions",
         "moo",
     ];
-    if verb.is_empty() || read_verbs.contains(&verb) || simulate {
+    if verb.is_empty() || read_verbs.contains(&verb) || line.on("simulate") {
         return;
     }
-    if apt_removes_essential(args, assigns) {
+    if apt_removes_essential(&line, assigns) {
         a.raise(
             Tier::T3,
             "allows removing essential packages, which the system can't run without",
         );
     }
+    let packages: Vec<&str> = line.positional[1..].iter().map(String::as_str).collect();
     // Options from a file Reeve hasn't read can turn those switches on.
     let removes = matches!(
         verb,
@@ -2713,14 +2777,9 @@ fn assess_apt(ctx: &PathCtx, args: &[String], assigns: &[String], a: &mut Assess
             | "dist-upgrade"
             | "full-upgrade"
             | "dselect-upgrade"
-    ) || pos[1..].iter().any(|p| p.ends_with('-'));
-    let unseen_config = assigns.iter().any(|v| v.starts_with("APT_CONFIG="))
-        || args.iter().any(|x| {
-            x == "-c"
-                || x.starts_with("-c=")
-                || x == "--config-file"
-                || x.starts_with("--config-file=")
-        });
+    ) || packages.iter().any(|p| p.ends_with('-'));
+    let unseen_config =
+        assigns.iter().any(|v| v.starts_with("APT_CONFIG=")) || !line.config_files.is_empty();
     if removes && unseen_config {
         a.raise(
             Tier::T3,
@@ -2739,13 +2798,13 @@ fn assess_apt(ctx: &PathCtx, args: &[String], assigns: &[String], a: &mut Assess
         "clean" | "autoclean" | "auto-clean" => a.raise(Tier::T2, "changes the package cache"),
         "edit-sources" => a.raise(Tier::T2, "changes package sources"),
         "remove" | "purge" | "autoremove" | "auto-remove" | "autopurge" => {
-            let names: Vec<&str> = pos[1..].iter().map(|p| p.trim_end_matches('+')).collect();
+            let names: Vec<&str> = packages.iter().map(|p| p.trim_end_matches('+')).collect();
             protected_packages(ctx, &names, a);
             a.raise(Tier::T2, "changes installed packages");
         }
         _ => {
             // `install` and the rest: a trailing `-` removes that package.
-            let removed: Vec<&str> = pos[1..]
+            let removed: Vec<&str> = packages
                 .iter()
                 .filter_map(|p| p.strip_suffix('-'))
                 .collect();
@@ -2871,37 +2930,61 @@ fn protected_packages(ctx: &PathCtx, pkgs: &[&str], a: &mut Assessment) {
         "libpam-modules",
         "libpam-runtime",
     ];
+    let images = kernel_images(&ctx.kernel);
+    let mut candidates: Vec<&str> = images.iter().map(String::as_str).collect();
+    candidates.extend(PROTECTED);
     for p in pkgs {
         // `libc6:amd64`, `htop=3.2.2-2`: the name is what's before.
         let raw = p.trim();
         let name = raw.split_once(['=', ':']).map_or(raw, |(n, _)| n);
-        // A pattern over kernel packages (a glob `linux-image-6.1*`, apt's
-        // regex `^linux-image-.*`, an apt pattern `~n^linux-image-` or
-        // `?name(^linux-image-)`), or one broad enough to take them (`~i`,
-        // everything installed): the package manager expands it, and the
-        // running kernel can be in it.
-        let marker = raw.contains(['*', '?', '[', '^', '~', '$']);
-        let about_kernels = raw.contains("kernel") || raw.contains("linux-image");
-        if marker && about_kernels
-            || broad_apt_pattern(raw)
-            || pattern_hits_running_kernel(raw, &ctx.kernel)
+        if PROTECTED.contains(&name) {
+            a.raise(
+                Tier::T3,
+                format!("removes {name}, which the system can't run without"),
+            );
+            continue;
+        }
+        if !ctx.kernel.is_empty()
+            && (name.starts_with("kernel") && name.contains(&ctx.kernel)
+                || deb_kernel_image(name) == Some(ctx.kernel.as_str()))
         {
+            a.raise(Tier::T3, "removes the running kernel");
+            continue;
+        }
+        // Not a name: what the package manager expands it to. A glob over
+        // kernel packages (`kernel-core-6.*`, `linux-image-6.1*`) takes
+        // kernels whichever it hits. Anything else is read as apt reads it
+        // (a case-folded glob, an unanchored regex, an apt pattern) and
+        // held against the running kernel's image names and the protected
+        // names. A pattern apt itself can't read is the floor too: what it
+        // would take is unknown.
+        let low = raw.to_ascii_lowercase();
+        let marker = low.contains(['*', '?', '[', '^', '~', '$']);
+        let about_kernels = low.contains("kernel") || low.contains("linux-image");
+        let hit = match apt_syntax::selects(raw, &candidates) {
+            Ok(hit) => hit,
+            Err(why) => {
+                a.raise(
+                    Tier::T3,
+                    format!("removes packages by a pattern ({raw}) Reeve can't read: {why}"),
+                );
+                continue;
+            }
+        };
+        if marker && about_kernels || hit.is_some_and(|h| images.iter().any(|i| i == h)) {
             a.raise(
                 Tier::T3,
                 format!(
                     "removes packages by a pattern ({raw}) that can include the running kernel"
                 ),
             );
-        } else if PROTECTED.contains(&name) {
+        } else if let Some(h) = hit {
             a.raise(
                 Tier::T3,
-                format!("removes {name}, which the system can't run without"),
+                format!(
+                    "removes packages by a pattern ({raw}) that can include {h}, which the system can't run without"
+                ),
             );
-        } else if !ctx.kernel.is_empty()
-            && (name.starts_with("kernel") && name.contains(&ctx.kernel)
-                || deb_kernel_image(name) == Some(ctx.kernel.as_str()))
-        {
-            a.raise(Tier::T3, "removes the running kernel");
         }
     }
 }
@@ -2920,58 +3003,18 @@ fn deb_kernel_image(name: &str) -> Option<&str> {
     Some(rest.strip_suffix("-unsigned").unwrap_or(rest))
 }
 
-/// Whether a removal argument, read as the pattern a package manager reads
-/// it as (a glob; apt's unanchored regex, which it falls back to for any
-/// name with `.`, `?`, or `*` that isn't a package; an apt name pattern
-/// `~n…` or `?name(…)`), selects the running kernel's image package.
-/// `linux*`, `*6.1.0-37-amd64`, `~nlinux`, `?name(linux)`,
-/// `~nl[i]nux-image`, `linux-image-6\.1\.0-37-amd64`, and
-/// `linux-image-6.1.0-37-amd64|htop` all do; another kernel's exact name
-/// doesn't.
-fn pattern_hits_running_kernel(raw: &str, kernel: &str) -> bool {
+/// The package names the running kernel goes by: Debian's image (and its
+/// unsigned build), Fedora's kernel-core and kernel.
+fn kernel_images(kernel: &str) -> Vec<String> {
     if kernel.is_empty() {
-        return false;
+        return Vec::new();
     }
-    let images = [
+    vec![
         format!("linux-image-{kernel}"),
         format!("linux-image-{kernel}-unsigned"),
         format!("kernel-core-{kernel}"),
         format!("kernel-{kernel}"),
-    ];
-    let re_hits = |re: &str| Regex::new(re).is_ok_and(|r| images.iter().any(|i| r.is_match(i)));
-    if let Some(re) = raw.strip_prefix("~n") {
-        return re_hits(re);
-    }
-    if let Some(re) = raw.strip_prefix("?name(").and_then(|r| r.strip_suffix(')')) {
-        return re_hits(re);
-    }
-    if raw.starts_with(['~', '?']) {
-        return false;
-    }
-    let glob = raw.contains(['*', '?', '[']) && images.iter().any(|i| glob_match(raw, i));
-    let regex = raw.contains(['.', '*', '?', '[', '^', '$', '|', '\\', '(', '+']) && re_hits(raw);
-    glob || regex
-}
-
-/// apt patterns that select by state rather than name, which take
-/// kernels along: `~i`/`?installed`, `~E`/`?essential`, `~T`/`?true`,
-/// `~U`/`?upgradable`, `~b`/`?broken`. `~nfoo` and `?name(foo)` are by name.
-fn broad_apt_pattern(raw: &str) -> bool {
-    let Some(rest) = raw.strip_prefix(['~', '?']) else {
-        return false;
-    };
-    let word: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .collect();
-    if raw.starts_with('~') {
-        word.len() == 1 && matches!(word.as_str(), "i" | "E" | "T" | "U" | "b")
-    } else {
-        matches!(
-            word.as_str(),
-            "installed" | "essential" | "true" | "upgradable" | "broken"
-        )
-    }
+    ]
 }
 
 #[cfg(test)]
@@ -3295,6 +3338,23 @@ mod tests {
             "sudo apt-get remove 'libfoo.*'",
             "sudo apt-get remove python3.11",
             "VAL=x sudo env -S 'dpkg -r ${VAL}'",
+            "sudo apt-get -o APT::Get::allow-remove-essential=0 remove htop",
+            "sudo apt-get -o APT::Get::allow-remove-essential=2 remove htop",
+            "sudo apt-get -o APT::Get::allow-remove-essential=-1 remove htop",
+            "sudo apt-get -o APT::Get::allow-remove-essential= remove htop",
+            "sudo apt-get --allow-remove-essential=false remove htop",
+            "sudo apt-get -s remove libc6",
+            "sudo apt-get -c /tmp/apt.conf install -y htop",
+            "sudo env -S 'dpkg -l'",
+            "sudo env FOO+=bar dpkg -r htop",
+            "sudo env --u LANG dpkg -r htop",
+            "sudo env - dpkg -r htop",
+            "sudo env -S 'dpkg' -r htop",
+            "sudo stdbuf --out L dpkg -r htop",
+            "sudo apt-get remove 'htop*'",
+            "sudo apt-get remove '~nhtop~i'",
+            "sudo apt-get remove '?exact-name(htop)'",
+            "sudo apt-get remove libstdc++6",
         ] {
             assert_eq!(
                 tier(cmd),
@@ -3365,33 +3425,71 @@ mod tests {
             "sudo apt-get remove 'linux-image-6\\.1\\.0-37-amd64'",
             "sudo apt-get remove 'linux-image-6.1.0-37-amd64|htop'",
             "sudo apt-get remove 'linux-image-6.1.0-3?-amd64'",
+            // apt folds case in globs and name regexes, and splits an
+            // `:arch` suffix off before matching.
+            "sudo apt-get remove 'LINUX*'",
+            "sudo apt-get remove '~nLINUX'",
+            "sudo apt remove '?name(LINUX)'",
+            "sudo apt-get remove LINUX-IMAGE-6.1.0-37-amd64",
+            "sudo apt-get remove '*6.1.0-37-AMD64'",
+            "sudo apt-get install 'LINUX*-'",
+            "sudo apt-get remove 'linux*:amd64'",
+            "sudo apt-get remove '^linux-image-.*:amd64'",
+            "sudo apt-get remove '6.1.0-37*'",
+            // Combined patterns: juxtaposition and ?and, ?not, |, groups,
+            // and terms about state or architecture that take the image.
+            "sudo apt-get remove '~nlinux~i'",
+            "sudo apt-get remove '~nlinux ~i'",
+            "sudo apt-get remove '?and(~nlinux,~i)'",
+            "sudo apt-get remove '?and(~nlinux, ~i)'",
+            "sudo apt-get remove '~ramd64'",
+            "sudo apt-get remove '?architecture(amd64)'",
+            "sudo apt-get remove '?not(?name(^htop$))'",
+            "sudo apt-get remove '?installed !~nhtop'",
+            "sudo apt-get remove '~nlinux|~nhtop'",
+            "sudo apt-get remove '~i (~nlinux)'",
+            "sudo apt-get remove '~nlinux~V6'",
+            // What apt would refuse to parse: what it takes is unknown.
+            "sudo apt-get remove '?nope(x)'",
+            "sudo apt-get remove '~nlinux htop'",
+            "sudo apt-get remove '?name(linux):amd64'",
         ] {
             assert_eq!(assess(&ctx, cmd).tier, Tier::T3, "{cmd}");
         }
-        // Another kernel can go, and so can the running one's debug
-        // symbols; `-o`'s value isn't a package.
+        // Another kernel can go, in any case, and so can the running one's
+        // debug symbols; `-o`'s value isn't a package; patterns that can't
+        // take the image or a protected name stay T2.
         for cmd in [
             "sudo apt-get remove -y linux-image-6.1.0-36-amd64",
+            "sudo apt-get remove -y LINUX-IMAGE-6.1.0-36-AMD64",
             "sudo apt-get remove -y linux-image-6.1.0-37-amd64-dbg",
             "sudo apt-get -o Dpkg::Options::=--force-confold remove -y linux-image-6.1.0-36-amd64",
             "sudo apt-get -t bookworm-backports install linux-image-amd64",
+            "sudo apt-get remove '~nhtop'",
+            "sudo apt-get remove '?name(^htop$)'",
+            "sudo apt-get remove '?exact-name(htop)'",
+            "sudo apt-get remove '~nhtop~i'",
+            "sudo apt-get remove '?not(~i)'",
+            "sudo apt-get remove 'htop*'",
+            "sudo apt-get remove libstdc++6",
+            "sudo apt-get remove python3.11",
         ] {
             assert_eq!(assess(&ctx, cmd).tier, Tier::T2, "{cmd}");
         }
-        assert_eq!(
-            apt_positional(&["-y", "-o", "X=1", "install", "a", "--", "-b"].map(String::from)),
-            ["install", "a", "-b"]
-        );
     }
 
     #[test]
-    fn env_splits_like_env_and_globs_match() {
+    fn env_splits_like_env() {
         let none = |_: &str| None;
         let split = |s: &str| env_split(s, &none).unwrap();
         assert_eq!(split("a  b\t'c d' \"e f\""), ["a", "b", "c d", "e f"]);
+        // Every C-locale space separates.
+        assert_eq!(split("a\nb\x0bc\x0cd\re"), ["a", "b", "c", "d", "e"]);
+        // `\_` separates outside quotes and is a space in double quotes; in
+        // single quotes a backslash is itself unless before `\` or `'`.
         assert_eq!(
-            split("a\\_b 'c\\_d' x\\\\y \\#z"),
-            ["a", "b", "c d", "x\\y", "#z"]
+            split("a\\_b \"c\\_d\" 'e\\_f' 'g\\'h' x\\\\y \\#z"),
+            ["a", "b", "c d", "e\\_f", "g'h", "x\\y", "#z"]
         );
         assert_eq!(split("ls -la # the rest"), ["ls", "-la"]);
         assert_eq!(split("a\\cb c"), ["a"]);
@@ -3403,31 +3501,38 @@ mod tests {
         assert!(env_split("${NOPE} x", &none).is_err());
         assert!(env_split("a\\qb", &none).is_err());
         assert!(env_split("'open", &none).is_err());
-        assert!(glob_match("linux*", "linux-image-6.1.0-37-amd64"));
-        assert!(glob_match("*6.1.0-37-amd64", "linux-image-6.1.0-37-amd64"));
-        assert!(glob_match(
-            "linux-image-6.1.0-3?-amd64",
-            "linux-image-6.1.0-37-amd64"
-        ));
-        assert!(glob_match(
-            "l[a-m]nux-image-*",
-            "linux-image-6.1.0-37-amd64"
-        ));
-        assert!(!glob_match("l[!i]nux*", "linux-image-6.1.0-37-amd64"));
-        assert!(!glob_match(
-            "linux-image-6.1.0-36-*",
-            "linux-image-6.1.0-37-amd64"
-        ));
-        assert!(pattern_hits_running_kernel(
-            "~nl[i]nux-image",
-            "6.1.0-37-amd64"
-        ));
-        assert!(!pattern_hits_running_kernel("~nhtop", "6.1.0-37-amd64"));
-        assert!(!pattern_hits_running_kernel(
-            "linux-image-6.1.0-36-amd64",
-            "6.1.0-37-amd64"
-        ));
-        assert!(!pattern_hits_running_kernel("linux*", ""));
+        // The wrapper walker: env's restart after -S, a bare `-`, and
+        // abbreviated long options.
+        let run = |args: &[&str]| {
+            wrapper_command(
+                "env",
+                &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                &none,
+                0,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            run(&["-S", "-i A=1 dpkg", "-r", "x"]).unwrap(),
+            ["A=1", "dpkg", "-r", "x"]
+        );
+        assert_eq!(
+            run(&["-S", "dpkg", "-r", "x"]).unwrap(),
+            ["dpkg", "-r", "x"]
+        );
+        assert_eq!(run(&["-", "A=1", "ls"]).unwrap(), ["A=1", "ls"]);
+        assert_eq!(run(&["--", "-", "ls"]).unwrap(), ["ls"]);
+        assert_eq!(run(&["--u", "LANG", "A=1", "ls"]).unwrap(), ["A=1", "ls"]);
+        assert_eq!(run(&["--ch=/tmp", "--s", "A=1 ls"]).unwrap(), ["A=1", "ls"]);
+        assert_eq!(run(&["FOO+=x", "=y", "ls"]).unwrap(), ["ls"]);
+        assert_eq!(run(&["-i"]), None);
+        assert_eq!(run(&["-u"]), None);
+        assert_eq!(
+            run(&["-S", "-S '-S \"dpkg -r x\"'"]).unwrap(),
+            ["dpkg", "-r", "x"]
+        );
+        let a = AptLine::parse(&["-y", "-o", "X=1", "install", "a", "--", "-b"].map(String::from));
+        assert_eq!(a.positional, ["install", "a", "-b"]);
     }
 
     #[test]
@@ -3521,6 +3626,51 @@ mod tests {
             "DPKG_FORCE=remove-essential; export DPKG_FORCE; sudo --preserve-env=DPKG_FORCE dpkg -r sed",
             "sudo stdbuf -o L dpkg -r libc6",
             "sudo exec -a x dpkg -r libc6",
+            // bash's `+=` sets and exports the name without the `+`.
+            "export DPKG_FORCE+=remove-essential; sudo -E dpkg -r sed",
+            "export FOO+=bar; sudo dpkg -r libc6",
+            "declare -x FOO+=bar; sudo dpkg -r libc6",
+            "FOO+=bar sudo dpkg -r libc6",
+            "DPKG_FORCE+=remove-essential sudo -E dpkg -r sed",
+            "DPKG_FORCE=confold; export DPKG_FORCE+=,remove-essential; sudo -E dpkg -r sed",
+            "DPKG_FORCE=confold DPKG_FORCE+=,all sudo dpkg -r tar",
+            // env re-reads the -S words and the remaining arguments as its
+            // own command line; `-` is `-i`; long options abbreviate.
+            "sudo env -S '-i DPKG_FORCE=remove-essential dpkg -r sed'",
+            "sudo env -S 'dpkg' -r libc6",
+            "sudo env -S '-u LANG' DPKG_FORCE=all dpkg -r gzip",
+            "sudo env - DPKG_FORCE=remove-essential dpkg -r sed",
+            "sudo env -- - dpkg -r libc6",
+            "sudo env -i - DPKG_FORCE=remove-essential dpkg -r sed",
+            "sudo env --u LANG DPKG_FORCE=remove-essential dpkg -r sed",
+            "sudo env --s 'DPKG_FORCE=remove-essential dpkg -r sed'",
+            "sudo env --split 'dpkg -r libc6'",
+            "sudo env --ch /tmp dpkg -r libc6",
+            "sudo env --c /tmp dpkg -r libc6",
+            "sudo env --a x dpkg -r libc6",
+            "sudo env --unset=LANG --chdir=/tmp dpkg -r libc6",
+            "sudo env -S 'dpkg\n-r\nlibc6'",
+            "sudo env -S 'dpkg\x0b-r\x0clibc6'",
+            "sudo stdbuf --out L dpkg -r libc6",
+            // apt's attached -c, every value StringToBool reads as true,
+            // and a boolean whose sense comes from the next word.
+            "sudo apt-get -c/tmp/apt.conf remove sed",
+            "sudo apt-get -yc/tmp/apt.conf remove sed",
+            "sudo apt-get -o APT::Get::allow-remove-essential=0x1 remove sed",
+            "sudo apt-get -o APT::Get::allow-remove-essential=+1 remove sed",
+            "sudo apt-get -o APT::Get::allow-remove-essential=01 remove sed",
+            "sudo apt-get -o 'APT::Get::allow-remove-essential= 1' remove sed",
+            "sudo apt-get --allow-remove-essential=0x1 remove sed",
+            "sudo apt-get --Force-Yes remove grep",
+            "sudo apt-get -yoDpkg::Options::=--force-all remove gzip",
+            "sudo apt-get -s 0 remove libc6",
+            "sudo apt-get --simulate no remove libc6",
+            "sudo apt-get --no-simulate remove libc6",
+            "sudo apt-get --dry-run=false remove libc6",
+            // Patterns that take a protected name.
+            "sudo apt-get remove '~nlib|~nhtop'",
+            "sudo apt-get remove 'lib*'",
+            "sudo apt-get remove '?not(~nhtop)'",
             "sudo apt-get remove 'linux*'",
             "sudo apt-get remove '~nlinux'",
             "sudo apt remove '?name(linux)'",
