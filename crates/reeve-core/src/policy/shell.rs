@@ -32,6 +32,13 @@ pub fn assess(ctx: &PathCtx, command: &str) -> Assessment {
 }
 
 fn assess_at(ctx: &PathCtx, command: &str, depth: usize) -> Assessment {
+    assess_in(ctx, command, depth, ShellEnv::default())
+}
+
+/// Assess a command line that starts out with `env` in its environment: a
+/// `bash -c` script or an `eval` inherits the exports of the line that
+/// runs it.
+fn assess_in(ctx: &PathCtx, command: &str, depth: usize, env: ShellEnv) -> Assessment {
     let mut a = Assessment::new(Tier::T0);
     if depth > MAX_DEPTH {
         a.raise(Tier::T1, "nested too deeply to read");
@@ -53,9 +60,7 @@ fn assess_at(ctx: &PathCtx, command: &str, depth: usize) -> Assessment {
             return a;
         }
     };
-    for sub in &parsed.substitutions {
-        a.merge(assess_at(ctx, sub, depth + 1));
-    }
+
     // Functions defined in this line: their bodies are checked where they're
     // written, so a call to one is not an unknown program.
     let funcs: Vec<&str> = parsed
@@ -73,13 +78,21 @@ fn assess_at(ctx: &PathCtx, command: &str, depth: usize) -> Assessment {
         .collect();
     let mut prev: Option<&Segment> = None;
     // What the line has put in the environment so far: later commands on
-    // the line run with it (`export DPKG_FORCE=…; sudo -E dpkg -r sed`).
-    let mut env = ShellEnv::default();
-    for seg in &parsed.segments {
+    // the line run with it (`export DPKG_FORCE=…; sudo -E dpkg -r sed`). A
+    // subshell `( … )` works on a copy that ends with it, and a pipeline
+    // stage runs in one too, so it changes nothing after itself.
+    let mut envs: Vec<ShellEnv> = vec![env];
+    for (at, seg) in parsed.segments.iter().enumerate() {
         if seg.pattern || seg.func_def {
             prev = Some(seg);
             continue;
         }
+        while envs.len() <= seg.depth {
+            let inner = envs.last().cloned().unwrap_or_default();
+            envs.push(inner);
+        }
+        envs.truncate(seg.depth + 1);
+        let env = envs.last_mut().expect("the outer environment");
         let calls_func = command_words(&seg.words)
             .and_then(|(_, w)| w.first().cloned())
             .is_some_and(|p| funcs.contains(&p.as_str()));
@@ -100,14 +113,23 @@ fn assess_at(ctx: &PathCtx, command: &str, depth: usize) -> Assessment {
                 .collect();
             a.merge(assess_segment(ctx, &with_env, prev, depth));
         }
-        env.note(&seg.words);
+        let staged = seg.piped || parsed.segments.get(at + 1).is_some_and(|n| n.piped);
+        if !staged {
+            env.note(&seg.words);
+        }
         prev = Some(seg);
+    }
+    // `$(…)` runs with the line's environment; where in the line it ran
+    // isn't tracked, so it gets everything the line exported.
+    let outer = envs.into_iter().next().unwrap_or_default();
+    for sub in &parsed.substitutions {
+        a.merge(assess_in(ctx, sub, depth + 1, outer.clone()));
     }
     a
 }
 
 /// What a line has put in the shell's environment so far.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ShellEnv {
     /// Shell variables, exported or not: (name, value).
     vars: Vec<(String, String)>,
@@ -129,79 +151,173 @@ fn var_value(list: &[(String, String)], name: &str) -> Option<String> {
         .map(|(_, v)| v.clone())
 }
 
+/// What a command does to a name's export attribute.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Export {
+    /// `export`, `declare -x`: exported from now on.
+    On,
+    /// `export -n`, `declare +x`: a shell variable only.
+    Off,
+    /// A bare assignment, `declare`, `readonly`: exported if the name is
+    /// already, or everything is (`set -a`).
+    Keep,
+}
+
+/// The letters of a command's `-x`-style options (`-os` → `os`).
+fn option_letters(args: &[String]) -> String {
+    args.iter()
+        .filter(|w| w.starts_with('-') && *w != "--")
+        .flat_map(|w| w[1..].chars())
+        .collect()
+}
+
 impl ShellEnv {
-    /// Track `A=b`, `A+=b`, `export A=b`, `export A` (after an `A=b`),
-    /// `declare -x`/`typeset -x`, and `set -a`. An exported name stays
-    /// exported, so a later bare assignment reaches children too; `+=`
+    /// The environment a child shell starts with: the `NAME=value` words in
+    /// front of it, exported.
+    fn inherited(assigns: &[String]) -> Self {
+        let mut env = Self::default();
+        for w in assigns {
+            env.assign(w, Export::On);
+        }
+        env
+    }
+
+    /// Track what one simple command does to the environment: a bare
+    /// `A=b`/`A+=b`; `export`, `declare -x`/`typeset -x`, and their undoing
+    /// (`export -n`, `declare +x`); `declare`/`typeset`/`readonly`
+    /// assignments; `set -a`/`set -o allexport` and `shopt -os allexport`;
+    /// each of them behind `command` or `builtin` too. An exported name
+    /// stays exported, so a later bare assignment reaches children; `+=`
     /// appends to what the variable holds so far, or to nothing.
     fn note(&mut self, words: &[String]) {
-        let leading: Vec<&String> = words.iter().take_while(|w| is_assignment(w)).collect();
-        let Some(prog) = words.get(leading.len()) else {
-            // A bare `A=b`: a shell variable, in the environment when the
-            // name is exported already or everything is.
-            for w in leading {
-                if let Some((n, v)) = self.resolve(w) {
-                    let exported = self.allexport || self.exported.iter().any(|(e, _)| *e == n);
-                    set_var(&mut self.vars, &n, &v);
-                    if exported {
-                        set_var(&mut self.exported, &n, &v);
-                    }
-                }
+        let leading = words.iter().take_while(|w| is_assignment(w)).count();
+        if leading == words.len() {
+            for w in words {
+                self.assign(w, Export::Keep);
             }
+            return;
+        }
+        // `command set -a`, `builtin declare …`: the builtin behind it.
+        let mut at = leading;
+        while matches!(words[at].as_str(), "command" | "builtin") {
+            at += 1;
+            while words.get(at).is_some_and(|w| w.starts_with('-')) {
+                at += 1;
+            }
+            if at >= words.len() {
+                return;
+            }
+        }
+        let args = &words[at + 1..];
+        match words[at].as_str() {
+            "set" => self.note_set(args),
+            "shopt" => self.note_shopt(args),
+            "export" => {
+                let mode = if option_letters(args).contains('n') {
+                    Export::Off
+                } else {
+                    Export::On
+                };
+                self.note_declare(args, mode);
+            }
+            "declare" | "typeset" => {
+                let mode = if args.iter().any(|w| w.starts_with('+') && w.contains('x')) {
+                    Export::Off
+                } else if option_letters(args).contains('x') {
+                    Export::On
+                } else {
+                    Export::Keep
+                };
+                self.note_declare(args, mode);
+            }
+            "readonly" => self.note_declare(args, Export::Keep),
+            _ => {}
+        }
+    }
+
+    /// One assignment word, with what it does to the export attribute.
+    fn assign(&mut self, w: &str, mode: Export) {
+        let Some((n, v)) = self.resolve(w) else {
             return;
         };
-        if prog == "set" {
-            self.note_set(&words[leading.len() + 1..]);
-            return;
+        let exported = match mode {
+            Export::On => true,
+            Export::Off => false,
+            Export::Keep => self.allexport || self.exported.iter().any(|(e, _)| *e == n),
+        };
+        set_var(&mut self.vars, &n, &v);
+        if exported {
+            set_var(&mut self.exported, &n, &v);
+        } else {
+            self.exported.retain(|(e, _)| *e != n);
         }
-        let exports = prog == "export"
-            || (matches!(prog.as_str(), "declare" | "typeset")
-                && words.iter().any(|w| w.starts_with('-') && w.contains('x')));
-        if !exports {
-            return;
-        }
-        for w in &words[leading.len() + 1..] {
-            if w.starts_with('-') {
+    }
+
+    /// `export`/`declare`/`readonly` arguments: assignments, and bare
+    /// names, which `export NAME` marks (with the value so far, or none
+    /// yet) and `export -n NAME`/`declare +x NAME` unmark.
+    fn note_declare(&mut self, args: &[String], mode: Export) {
+        for w in args {
+            if w.starts_with(['-', '+']) {
                 continue;
             }
-            match self.resolve(w) {
-                Some((n, v)) => {
-                    set_var(&mut self.vars, &n, &v);
-                    set_var(&mut self.exported, &n, &v);
+            if is_assignment(w) {
+                self.assign(w, mode);
+                continue;
+            }
+            match mode {
+                Export::On => {
+                    let v = var_value(&self.vars, w).unwrap_or_default();
+                    set_var(&mut self.exported, w, &v);
                 }
-                None => {
-                    if let Some(v) = var_value(&self.vars, w) {
-                        set_var(&mut self.exported, w, &v);
-                    }
-                }
+                Export::Off => self.exported.retain(|(e, _)| e != w),
+                Export::Keep => {}
             }
         }
     }
 
-    /// `set -a`, `set -o allexport`, `set +a`, `set +o allexport`, in
-    /// clusters too (`set -ax`, `set -eo allexport`).
+    /// `set -a` / `set +a` and `set -o allexport` / `set +o allexport`,
+    /// read as bash reads a cluster: every letter counts, and each `o`
+    /// takes the next word as its option name when that word doesn't
+    /// start with `-` or `+` (`set -oe allexport`, `set -o -a`).
     fn note_set(&mut self, args: &[String]) {
         let mut i = 0;
         while i < args.len() {
             let w = args[i].as_str();
             i += 1;
             let on = match w.chars().next() {
-                Some('-') if w != "--" => true,
-                Some('+') => false,
+                Some('-') if w.len() > 1 && w != "--" => true,
+                Some('+') if w.len() > 1 => false,
                 _ => break,
             };
-            let letters = &w[1..];
-            if letters.contains('a') {
-                self.allexport = on;
-            }
-            if letters.ends_with('o') {
-                if let Some(opt) = args.get(i) {
-                    i += 1;
-                    if opt == "allexport" {
-                        self.allexport = on;
+            for c in w[1..].chars() {
+                match c {
+                    'a' => self.allexport = on,
+                    'o' => {
+                        if let Some(opt) = args.get(i).filter(|o| !o.starts_with(['-', '+'])) {
+                            i += 1;
+                            if opt == "allexport" {
+                                self.allexport = on;
+                            }
+                        }
                     }
+                    _ => {}
                 }
             }
+        }
+    }
+
+    /// `shopt -o -s allexport` (and `-os`, `-so`, `-s -o`) is `set -o
+    /// allexport`; `-u` turns it off. Without `-o` the name isn't a shopt.
+    fn note_shopt(&mut self, args: &[String]) {
+        let letters = option_letters(args);
+        let (o, s, u) = (
+            letters.contains('o'),
+            letters.contains('s'),
+            letters.contains('u'),
+        );
+        if o && s != u && args.iter().any(|w| w == "allexport") {
+            self.allexport = s;
         }
     }
 
@@ -257,6 +373,8 @@ struct Segment {
     pattern: bool,
     /// `name()`: a function's name being defined.
     func_def: bool,
+    /// How many `( … )` subshells it is inside.
+    depth: usize,
 }
 
 #[derive(Debug, Default)]
@@ -299,7 +417,8 @@ fn tokenize(src: &str) -> Result<Parsed, &'static str> {
     macro_rules! end_segment {
         ($piped_next:expr) => {
             end_word!();
-            let done = std::mem::take(&mut seg);
+            let mut done = std::mem::take(&mut seg);
+            done.depth = paren_depth;
             if !done.words.is_empty() || !done.redirects.is_empty() {
                 out.segments.push(done);
             }
@@ -418,17 +537,18 @@ fn tokenize(src: &str) -> Result<Parsed, &'static str> {
                 i += 1;
             }
             '(' => {
-                paren_depth += 1;
                 end_segment!(false);
+                paren_depth += 1;
             }
             ')' => {
                 if paren_depth > 0 {
+                    end_segment!(false);
                     paren_depth -= 1;
                 } else {
                     end_word!();
                     seg.pattern = true;
+                    end_segment!(false);
                 }
-                end_segment!(false);
             }
             ';' => {
                 end_segment!(false);
@@ -1264,7 +1384,13 @@ fn assess_words(
                 x == "-c" || (x.starts_with('-') && !x.starts_with("--") && x.contains('c'))
             }) {
                 if let Some(script) = args.get(pos + 1) {
-                    a.merge(assess_at(ctx, script, depth + 1));
+                    // The script starts with this line's exports.
+                    a.merge(assess_in(
+                        ctx,
+                        script,
+                        depth + 1,
+                        ShellEnv::inherited(&assigns),
+                    ));
                 }
             } else if positional(args).is_empty() && piped {
                 let from_net = matches!(prev_prog.map(base), Some("curl" | "wget"));
@@ -1296,7 +1422,22 @@ fn assess_words(
                 writes_all(ctx, &args[1..], &mut a);
             }
         }
-        "eval" | "source" | "." => a.raise(Tier::T1, "runs code built at run time"),
+        "eval" => {
+            // `eval 'sudo dpkg -r libc6'`: the words, joined, are the
+            // command line. One built from a variable or a substitution
+            // can't be read.
+            if args.is_empty() || args.iter().any(|x| x.contains('$')) {
+                a.raise(Tier::T1, "runs code built at run time");
+            } else {
+                a.merge(assess_in(
+                    ctx,
+                    &args.join(" "),
+                    depth + 1,
+                    ShellEnv::inherited(&assigns),
+                ));
+            }
+        }
+        "source" | "." => a.raise(Tier::T1, "runs code built at run time"),
 
         // ── shell builtins: they change only the shell running the command ──
         "cd" | "pushd" | "popd" | "dirs" | "export" | "unset" | "local" | "declare" | "typeset"
@@ -3413,6 +3554,18 @@ mod tests {
             "DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
             "set -a; set +a; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
             "set -o allexport; set +o allexport; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "(set -a; DPKG_FORCE=remove-essential); sudo -E dpkg -r sed",
+            "set -a | true; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "true | set -a; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "export DPKG_FORCE=remove-essential; export -n DPKG_FORCE; sudo -E dpkg -r sed",
+            "export DPKG_FORCE=remove-essential; declare +x DPKG_FORCE; sudo -E dpkg -r sed",
+            "declare DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "readonly DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "shopt -s allexport; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -o; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -e; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "eval 'sudo dpkg -r htop'",
+            "sudo DPKG_FORCE=confold bash -c 'dpkg -r htop'",
         ] {
             assert_eq!(
                 tier(cmd),
@@ -3751,6 +3904,39 @@ mod tests {
             "set -o allexport; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
             "set -ex -a; DPKG_FORCE=all; sudo -E dpkg -r tar",
             "set -eo allexport; DPKG_FORCE=all; sudo -E dpkg -r tar",
+            // bash's set clusters, shopt -o, command/builtin, declare and
+            // readonly under allexport, export of a name set later.
+            "set -o -a; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -eo -a; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -oe allexport; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -eob allexport; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -boe allexport; DPKG_FORCE=all; sudo -E dpkg -r tar",
+            "shopt -os allexport; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "shopt -s -o allexport; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "shopt -so allexport; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "shopt -o -s allexport; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "command set -a; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "builtin set -a; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "command set -o allexport; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -a; declare DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -a; typeset DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -a; readonly DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -a; declare -r DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -a; declare -- DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -a; builtin declare DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "command declare -x DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "export DPKG_FORCE; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "(set -a; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed)",
+            // A child shell or an eval starts with the line's environment.
+            "sudo DPKG_FORCE=remove-essential bash -c 'dpkg -r sed'",
+            "export DPKG_FORCE=remove-essential; sudo -E bash -c 'dpkg -r sed'",
+            "set -a; DPKG_FORCE=remove-essential; sudo -E bash -c 'dpkg -r sed'",
+            "DPKG_FORCE=remove-essential bash -c 'sudo -E dpkg -r sed'",
+            "DPKG_FORCE=remove-essential sh -ec 'sudo -E dpkg -r sed'",
+            "eval 'sudo dpkg -r libc6'",
+            "eval sudo dpkg -r libc6",
+            "export DPKG_FORCE=remove-essential; eval 'sudo -E dpkg -r sed'",
+            "export DPKG_FORCE=remove-essential; echo $(sudo -E dpkg -r sed)",
             "sudo apt-get remove 'linux*'",
             "sudo apt-get remove '~nlinux'",
             "sudo apt remove '?name(linux)'",

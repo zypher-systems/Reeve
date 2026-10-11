@@ -514,8 +514,11 @@ trait Distro {
     items they set, with any value apt's `StringToBool` reads as true (`1`, `0x1`, `+1`, `enable`);
     dpkg's `--force-depends`, `--force-all`, `--force-remove-essential` when removing, as a flag, in a
     comma list, in `-o Dpkg::Options::=…`, or in `DPKG_FORCE=` (on the command, `+=`-appended,
-    `export`ed earlier on the line including a later bare assignment to an exported name or any
-    assignment under `set -a`, or through `env`, which is read as getopt_long reads it: clusters,
+    `export`ed earlier on the line, which includes a later bare assignment to an exported name and
+    `declare`/`readonly` or any assignment under `set -a`, `set -o allexport` or `shopt -os allexport`,
+    behind `command`/`builtin` too, while `export -n`/`declare +x` undo it and a subshell or a pipeline
+    stage changes nothing after itself; inherited by a `bash -c` script, an `eval` of literal words, or
+    a `$(…)`; or through `env`, which is read as getopt_long reads it: clusters,
     abbreviated long options, a bare `-`, and `-S` strings env re-reads as its own command line); an
     apt config file Reeve hasn't read (`-c FILE`, `-cFILE`, `APT_CONFIG=`) with a removal. apt's command
     line is read by apt's rules throughout, so `-s 0` and `--no-simulate` are not simulations.
