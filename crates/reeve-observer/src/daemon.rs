@@ -468,13 +468,14 @@ impl Observer {
                     .await
             }
             Distro::Debian { .. } => {
-                // A newer kernel package (a new ABI is a new name), or the
-                // running one rebuilt under the same name (its package
-                // version no longer matches /proc/version's build), or the
-                // flag the kernel's postinst leaves.
+                // A newer kernel package (a new ABI is a new name; debug
+                // symbols aren't kernels, and the unsigned build is the same
+                // ABI), or the running one rebuilt under the same name (its
+                // package version no longer matches /proc/version's build),
+                // or the flag the kernel's postinst leaves.
                 let newest = run(
                     "dpkg-query -W -f='${db:Status-Status} ${Package}\\n' 'linux-image-[0-9]*' 2>/dev/null \
-                     | awk '$1==\"installed\" {print substr($2, 13)}' | sort -V | tail -n 1",
+                     | awk '$1==\"installed\" && $2 !~ /-dbg(sym)?$/ {sub(/-unsigned$/, \"\", $2); print substr($2, 13)}' | sort -V | tail -n 1",
                 )
                 .await;
                 signals.extend(detect::reboot_pending(running.trim(), newest.trim()));
@@ -493,10 +494,11 @@ impl Observer {
                 )
                 .await;
                 signals.extend(detect::reboot_required(&flagged));
-                // Updates from a security suite, as of the last apt-get update.
+                // Updates from a security suite, as of the last apt-get
+                // update: the archive in the parentheses says, not the name.
                 run(
                     "timeout 120 apt-get -s -q upgrade --with-new-pkgs 2>/dev/null \
-                     | awk '/^Inst / && /[Ss]ecurity/ {print $2}'",
+                     | awk '/^Inst / {s=$0; sub(/^[^(]*\\(/, \"\", s); if (s ~ /[Ss]ecurity/) print $2}'",
                 )
                 .await
             }

@@ -152,11 +152,6 @@ fn bare_if_all(name: &str) -> &str {
     name.strip_suffix(":all").unwrap_or(name)
 }
 
-/// `name:arch` → `name`.
-fn bare(name: &str) -> &str {
-    name.split_once(':').map_or(name, |(n, _)| n)
-}
-
 /// How to undo some changes: one `apt-get install` that puts old versions
 /// back and takes new packages out.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -255,12 +250,14 @@ fn cached(names: &[String], name: &str, version: &str) -> Option<String> {
     names.iter().find(|f| **f == want).cloned()
 }
 
-/// What `apt-get -s` said it would do.
+/// What `apt-get -s` said it would do. Names are as apt prints them: bare
+/// for the native architecture (and `Architecture: all`), `name:arch` for
+/// a foreign one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Simulation {
-    /// Packages it would install or change (`Inst`), bare names.
+    /// Packages it would install, upgrade, or downgrade (`Inst`).
     pub inst: Vec<String>,
-    /// Packages it would remove (`Remv`), bare names.
+    /// Packages it would remove (`Remv`).
     pub remv: Vec<String>,
     /// Its `E:` lines, when it refused.
     pub errors: Vec<String>,
@@ -269,14 +266,13 @@ pub struct Simulation {
 /// Read a simulation's output.
 pub fn simulated(out: &str) -> Simulation {
     let mut s = Simulation::default();
+    let first = |rest: &str| rest.split_whitespace().next().unwrap_or("").to_string();
     for l in out.lines() {
         let l = l.trim();
         if let Some(rest) = l.strip_prefix("Inst ") {
-            s.inst
-                .push(bare(rest.split_whitespace().next().unwrap_or("")).to_string());
+            s.inst.push(first(rest));
         } else if let Some(rest) = l.strip_prefix("Remv ") {
-            s.remv
-                .push(bare(rest.split_whitespace().next().unwrap_or("")).to_string());
+            s.remv.push(first(rest));
         } else if let Some(e) = l.strip_prefix("E: ") {
             s.errors.push(e.to_string());
         }
@@ -284,19 +280,75 @@ pub fn simulated(out: &str) -> Simulation {
     s
 }
 
-/// Removals the simulation shows that the plan didn't ask for: apt would
-/// take them along to satisfy the rest.
-pub fn unplanned_removals(plan: &UndoPlan, sim: &Simulation) -> Vec<String> {
-    let planned: Vec<&str> = plan.remove.iter().map(|n| bare(n)).collect();
-    let mut extra: Vec<String> = sim
-        .remv
-        .iter()
-        .filter(|n| !planned.contains(&n.as_str()))
-        .cloned()
-        .collect();
-    extra.sort();
-    extra.dedup();
-    extra
+/// Whether a name apt printed is one of `planned` (dpkg's `name:arch`).
+/// apt leaves the native architecture off, and an `Architecture: all`
+/// package takes the native one, so a bare name covers those two; a
+/// `name:arch` has to match exactly (removing `libfoo:i386` isn't
+/// removing `libfoo`). With `native` unknown, a bare name covers any.
+fn covers(planned: &[String], printed: &str, native: &str) -> bool {
+    if printed.contains(':') {
+        return planned.iter().any(|p| p == printed);
+    }
+    planned.iter().any(|p| {
+        let (name, arch) = p.split_once(':').unwrap_or((p, ""));
+        name == printed && (arch == "all" || arch == native || native.is_empty())
+    })
+}
+
+/// What the simulation would do beyond the plan, which apt would do to
+/// satisfy the rest: packages it would remove that the change didn't
+/// install, and packages whose version it would change that the change
+/// didn't touch (every undo allows downgrades). Either stops the undo.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unplanned {
+    /// Would be removed.
+    pub removed: Vec<String>,
+    /// Would be installed, upgraded, or downgraded.
+    pub changed: Vec<String>,
+}
+
+impl Unplanned {
+    /// Nothing beyond the plan.
+    pub fn is_empty(&self) -> bool {
+        self.removed.is_empty() && self.changed.is_empty()
+    }
+
+    /// `remove a, b and change c`, for the refusal.
+    pub fn words(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.removed.is_empty() {
+            parts.push(format!("remove {}", self.removed.join(", ")));
+        }
+        if !self.changed.is_empty() {
+            parts.push(format!("change {}", self.changed.join(", ")));
+        }
+        parts.join(" and ")
+    }
+}
+
+/// Compare a simulation with the plan. `native` is `dpkg
+/// --print-architecture` (empty when unknown).
+pub fn unplanned(plan: &UndoPlan, sim: &Simulation, native: &str) -> Unplanned {
+    let restore: Vec<String> = plan.restore.iter().map(|r| r.name.clone()).collect();
+    let mut u = Unplanned {
+        removed: sim
+            .remv
+            .iter()
+            .filter(|n| !covers(&plan.remove, n, native))
+            .cloned()
+            .collect(),
+        changed: sim
+            .inst
+            .iter()
+            .filter(|n| !covers(&restore, n, native))
+            .cloned()
+            .collect(),
+    };
+    for list in [&mut u.removed, &mut u.changed] {
+        list.sort();
+        list.dedup();
+    }
+    u
 }
 
 /// A directory's file names.
@@ -460,13 +512,44 @@ Conf reeve-t-lib (2 local-deb [all])
 ";
         let s = simulated(out);
         assert_eq!(s.inst, ["reeve-t-lib"]);
-        assert_eq!(s.remv, ["reeve-t-user", "reeve-t-dep", "libfoo"]);
+        assert_eq!(s.remv, ["reeve-t-user", "reeve-t-dep", "libfoo:i386"]);
         assert!(s.errors.is_empty());
+        let restore = |name: &str| Restore {
+            name: name.into(),
+            version: "2".into(),
+            file: None,
+        };
         let plan = UndoPlan {
-            restore: vec![],
+            restore: vec![restore("reeve-t-lib:all")],
             remove: vec!["reeve-t-dep:all".into(), "libfoo:i386".into()],
         };
-        assert_eq!(unplanned_removals(&plan, &s), ["reeve-t-user"]);
+        let u = unplanned(&plan, &s, "amd64");
+        assert_eq!(u.removed, ["reeve-t-user"]);
+        assert!(u.changed.is_empty(), "{u:?}");
+        assert_eq!(u.words(), "remove reeve-t-user");
+        // apt prints the native arch bare and a foreign one qualified:
+        // removing libfoo:i386 doesn't cover libfoo (amd64), nor the other
+        // way round, and a version change of a package the plan didn't
+        // touch counts too.
+        let other = simulated(
+            "Remv libfoo [1]\nInst libbar [1] (2 Debian:12/stable [amd64])\nInst libbaz:i386 [1] (2 Debian:12/stable [i386])\n",
+        );
+        let plan = UndoPlan {
+            restore: vec![restore("libbaz:amd64")],
+            remove: vec!["libfoo:i386".into()],
+        };
+        let u = unplanned(&plan, &other, "amd64");
+        assert_eq!(u.removed, ["libfoo"]);
+        assert_eq!(u.changed, ["libbar", "libbaz:i386"]);
+        assert_eq!(u.words(), "remove libfoo and change libbar, libbaz:i386");
+        let plan = UndoPlan {
+            restore: vec![restore("libbar:amd64"), restore("libbaz:i386")],
+            remove: vec!["libfoo:amd64".into()],
+        };
+        assert!(unplanned(&plan, &other, "amd64").is_empty());
+        // Native arch unknown: a bare name covers any planned arch.
+        assert!(unplanned(&plan, &other, "").is_empty());
+        assert!(!covers(&["libfoo:amd64".to_string()], "libfoo:i386", ""));
         let refused =
             simulated("Reading package lists...\nE: Version '2' for 'reeve-t-lib' was not found\n");
         assert_eq!(

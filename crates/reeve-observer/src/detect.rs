@@ -325,16 +325,28 @@ pub fn kernel_replaced(running: &str, modules_present: bool) -> Option<Signal> {
     })
 }
 
-/// Debian: the running kernel's package was upgraded under the same name
-/// (a security build with the same ABI), so `/proc/version`'s build no
-/// longer matches the installed version. `proc_version` is
-/// `Linux version 6.1.0-37-amd64 (…) #1 SMP PREEMPT_DYNAMIC Debian 6.1.140-1 (2025-05-22)`.
+/// Debian and Ubuntu: the running kernel's package was upgraded under the
+/// same name (a security build with the same ABI), so `/proc/version`'s
+/// build no longer matches the installed version. Debian's `proc_version`
+/// ends `… #1 SMP PREEMPT_DYNAMIC Debian 6.1.140-1 (2025-05-22)`, and the
+/// package version is that `6.1.140-1`. Ubuntu's carries `#45-Ubuntu`
+/// (or `#45~22.04.1-Ubuntu`), the upload part of a package version like
+/// `6.8.0-45.45` (`6.8.0-45.45~22.04.1`).
 pub fn kernel_rebuilt(running: &str, installed: &str, proc_version: &str) -> Option<Signal> {
-    let build = proc_version
-        .split_once(" Debian ")
-        .or_else(|| proc_version.split_once(" Ubuntu "))
-        .and_then(|(_, rest)| rest.split_whitespace().next())?;
-    (!running.is_empty() && !installed.is_empty() && installed != build).then(|| {
+    if running.is_empty() || installed.is_empty() {
+        return None;
+    }
+    let (build, installed_build) = if let Some((_, rest)) = proc_version.split_once(" Debian ") {
+        (rest.split_whitespace().next()?, installed)
+    } else if let Some(upload) = proc_version
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix('#')?.strip_suffix("-Ubuntu"))
+    {
+        (upload, installed.rsplit_once('-')?.1.split_once('.')?.1)
+    } else {
+        return None;
+    };
+    (installed_build != build).then(|| {
         sig(
             "reboot-pending".into(),
             Severity::Info,
@@ -528,6 +540,13 @@ mod tests {
         assert_eq!(s.id, "reboot-pending");
         assert!(s.detail.contains("6.1.140-1") && s.detail.contains("6.1.147-1"));
         assert!(kernel_rebuilt("6.1.0-37-amd64", "", proc).is_none());
+        // Ubuntu: the upload number after `#`, against the package version's.
+        let ubuntu = "Linux version 6.8.0-45-generic (buildd@lcy02-amd64-033) (x86_64-linux-gnu-gcc-13 (Ubuntu 13.2.0-23ubuntu4) 13.2.0, GNU ld (GNU Binutils for Ubuntu) 2.42) #45-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 30 12:02:04 UTC 2024\n";
+        assert!(kernel_rebuilt("6.8.0-45-generic", "6.8.0-45.45", ubuntu).is_none());
+        assert!(kernel_rebuilt("6.8.0-45-generic", "6.8.0-45.45.1", ubuntu).is_some());
+        let hwe = "Linux version 6.8.0-45-generic (buildd@x) (gcc) #45~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Tue Sep 10 2024\n";
+        assert!(kernel_rebuilt("6.8.0-45-generic", "6.8.0-45.45~22.04.1", hwe).is_none());
+        assert!(kernel_rebuilt("6.8.0-45-generic", "6.8.0-45.45~22.04.2", hwe).is_some());
         assert!(
             kernel_rebuilt(
                 "7.2.8-200.fc44.x86_64",

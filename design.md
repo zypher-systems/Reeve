@@ -484,8 +484,10 @@ trait Distro {
   with the versions reversed, and a `purge` of an installed package logs `remove` first, so `purge` alone is
   config files going). Undo is one transaction: `apt-get install` with the old versions' files from
   `/var/cache/apt/archives` and `name-` for what was new. `apt-get -s` runs first (no root, nothing
-  changes): if apt can't resolve it, or would remove a package the change didn't install to get there
-  (something installed since needs what would go), the undo is refused. A version the cache lost (`apt-get
+  changes): if apt can't resolve it, or would remove a package the change didn't install, or would change
+  the version of one it didn't touch (every undo allows downgrades), the undo is refused. Names are compared
+  with their architecture: apt prints the native one bare, so `Remv libfoo:i386` never stands for
+  `libfoo`. A version the cache lost (`apt-get
   clean`, or an install through `apt` rather than `apt-get`, which deletes downloads) is asked for as
   `name=version`; if the repos no longer carry it, apt says so and nothing changes. A failed command still
   records what dpkg did before it stopped, and so does a failed undo (`UndoFailed.partial`).
@@ -502,8 +504,11 @@ trait Distro {
     restarting them on its own; a restart is an action with its own approval and undo.
   - **The floor:** `libc6`, `dpkg`, `apt`, `systemd-sysv`, `grub-*`, `shim-signed`, `initramfs-tools`,
     `linux-image-amd64`, and the rest of the Debian list in `protected_packages`; `install foo-` is a
-    removal; `--allow-remove-essential`, `--force-yes`, `dpkg --force-depends/--force-all/
-    --force-remove-essential` when removing; the running kernel's `linux-image-$(uname -r)`.
+    removal; kernel packages named by a pattern (`linux-image-6.1*`, `linux-image-*-amd64`); the running
+    kernel's `linux-image-$(uname -r)`; `--allow-remove-essential` and `--force-yes` as flags or as the
+    config items they set (`-o APT::Get::allow-remove-essential=true`); dpkg's `--force-depends`,
+    `--force-all`, `--force-remove-essential` when removing, as a flag, in a comma list, in
+    `-o Dpkg::Options::=…`, or in `DPKG_FORCE=`.
   - **reeved:** a reboot is pending when the newest installed `linux-image-<abi>` isn't `uname -r`, when
     the running kernel's package version no longer matches the build in `/proc/version` (a security
     rebuild under the same name), or when `/var/run/reboot-required` is set. Security updates are the

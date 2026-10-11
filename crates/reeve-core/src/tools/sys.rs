@@ -427,7 +427,7 @@ fn sys_info_command(d: &Distro) -> String {
         Distro::Arch { .. } => "pacman -Q linux linux-lts linux-zen 2>/dev/null",
         Distro::Debian { .. } => {
             "dpkg-query -W -f='${db:Status-Status} ${Package} ${Version}\\n' 'linux-image-[0-9]*' 2>/dev/null \
-             | awk '$1==\"installed\" {print $2, $3}' | sort -V -r | head -n 3"
+             | awk '$1==\"installed\" && $2 !~ /-dbg(sym)?$/ {print $2, $3}' | sort -V -r | head -n 3"
         }
         Distro::Other(_) => "true",
     };
@@ -712,13 +712,16 @@ async fn revert_apt(
         };
         return Err(format!("apt can't undo this: {why}{cache}. Nothing was changed.").into());
     }
-    let extra = apt::unplanned_removals(&plan, &sim);
+    // apt prints native-arch packages without their arch; dpkg's log
+    // always has it.
+    let native = capture(ctx, "dpkg --print-architecture 2>/dev/null", false).await;
+    let extra = apt::unplanned(&plan, &sim, &native);
     if !extra.is_empty() {
         return Err(format!(
-            "undoing this would also remove {}, which the change didn't install (something \
-             installed since needs what would go). Nothing was changed. The receipt's snapshot \
+            "undoing this would also {}, which the change didn't touch (something installed \
+             since depends on what would go back). Nothing was changed. The receipt's snapshot \
              (snapper undochange) rolls it back, if there is one.",
-            extra.join(", ")
+            extra.words()
         )
         .into());
     }

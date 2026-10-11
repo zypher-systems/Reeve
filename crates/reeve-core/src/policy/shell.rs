@@ -670,6 +670,12 @@ fn assess_words(
     depth: usize,
 ) -> Assessment {
     let mut a = Assessment::new(Tier::T0);
+    // `DPKG_FORCE=… dpkg …`: the assignments reach the program.
+    let assigns: Vec<String> = words
+        .iter()
+        .take_while(|w| is_assignment(w))
+        .cloned()
+        .collect();
     let Some((_, words)) = command_words(words) else {
         return a;
     };
@@ -678,8 +684,10 @@ fn assess_words(
     };
     let prog = base(prog_raw);
     let args = &words[1..];
+    // A wrapper's command inherits the assignments (`DPKG_FORCE=… sudo dpkg`).
     let look_through = |a: &mut Assessment, rest: &[String], sudo: bool| {
-        a.merge(assess_words(ctx, rest, piped, prev_prog, sudo, depth + 1));
+        let inner: Vec<String> = assigns.iter().chain(rest).cloned().collect();
+        a.merge(assess_words(ctx, &inner, piped, prev_prog, sudo, depth + 1));
     };
 
     // Shell grammar, not programs: look past a keyword to the command it
@@ -1093,8 +1101,8 @@ fn assess_words(
                 protected_packages(ctx, &positional(args), &mut a);
             }
         }
-        "apt-get" | "apt" | "aptitude" => assess_apt(ctx, args, &mut a),
-        "dpkg" => assess_dpkg(ctx, args, &mut a),
+        "apt-get" | "apt" | "aptitude" => assess_apt(ctx, args, &assigns, &mut a),
+        "dpkg" => assess_dpkg(ctx, args, &assigns, &mut a),
         "apt-mark" => {
             let verb = positional(args).first().copied().unwrap_or("");
             if !verb.is_empty() && !verb.starts_with("show") {
@@ -1106,14 +1114,22 @@ fn assess_words(
         }
         "dpkg-reconfigure" => a.raise(Tier::T2, "changes a package's configuration"),
         "update-alternatives" => {
-            let reads = [
-                "--display",
-                "--list",
-                "--query",
-                "--get-selections",
+            // A read only when every mode is one: `--all` configures every
+            // alternative, and `--display x --set x y` sets.
+            let reads = ["--display", "--list", "--query", "--get-selections"];
+            let changes = [
+                "--install",
+                "--set",
+                "--remove",
+                "--remove-all",
+                "--auto",
+                "--config",
                 "--all",
+                "--set-selections",
             ];
-            if !args.iter().any(|x| reads.contains(&x.as_str())) {
+            let any_read = args.iter().any(|x| reads.contains(&x.as_str()));
+            let any_change = args.iter().any(|x| changes.contains(&x.as_str()));
+            if any_change || !any_read {
                 a.raise(Tier::T2, "changes which program a name runs");
             }
         }
@@ -2292,18 +2308,81 @@ fn apt_positional(args: &[String]) -> Vec<&str> {
     out
 }
 
+/// The words of dpkg's force options: `--force-depends`,
+/// `--force-depends,remove-essential`, `--force-all`, and the same list in
+/// `DPKG_FORCE=` (dpkg 1.19.5+), which apt passes on to dpkg too.
+fn dpkg_force_words(args: &[String], assigns: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for a in args {
+        if let Some(list) = a.strip_prefix("--force-") {
+            out.extend(list.split(',').map(|w| w.trim().to_string()));
+        }
+    }
+    for v in assigns {
+        if let Some(list) = v.strip_prefix("DPKG_FORCE=") {
+            out.extend(
+                list.trim_matches(['"', '\''])
+                    .split(',')
+                    .map(|w| w.trim().to_string()),
+            );
+        }
+    }
+    out
+}
+
+/// Whether force words let dpkg remove a package others depend on, or an
+/// essential one.
+fn forces_past_depends(words: &[String]) -> bool {
+    words.iter().any(|w| w == "all" || w == "depends")
+}
+
+fn forces_past_essential(words: &[String]) -> bool {
+    words
+        .iter()
+        .any(|w| w == "all" || w == "remove-essential" || w == "remove-protected")
+}
+
+/// apt's switches past essential packages, as flags or as the config
+/// items they set: `--allow-remove-essential`, `--force-yes`,
+/// `-o APT::Get::allow-remove-essential=true`, `--option=APT::Get::force-yes=true`,
+/// and `-o Dpkg::Options::=--force-remove-essential` (or `--force-all`,
+/// `--force-depends`), wherever they are on the line. Config names are
+/// case-insensitive.
+fn apt_removes_essential(args: &[String], assigns: &[String]) -> bool {
+    let dpkg_opts: Vec<String> = args
+        .iter()
+        .filter_map(|x| {
+            let low = x.to_ascii_lowercase();
+            let at = low.find("dpkg::options::=")?;
+            Some(x[at + "dpkg::options::=".len()..].to_string())
+        })
+        .collect();
+    let forced = dpkg_force_words(&dpkg_opts, assigns);
+    args.iter().any(|x| {
+        let low = x.to_ascii_lowercase();
+        low.contains("allow-remove-essential") || low.contains("force-yes")
+    }) || forces_past_essential(&forced)
+        || forces_past_depends(&forced)
+}
+
 /// apt-get, apt, aptitude: queries and simulations (`-s`) are reads;
 /// everything else changes packages, the lists, or the cache. `install
 /// foo-` removes foo, so it meets the floor like `remove foo`.
-fn assess_apt(ctx: &PathCtx, args: &[String], a: &mut Assessment) {
+fn assess_apt(ctx: &PathCtx, args: &[String], assigns: &[String], a: &mut Assessment) {
     let pos = apt_positional(args);
     let verb = pos.first().copied().unwrap_or("");
+    // `-s`, alone or in a cluster of letters (`-ys`); a glued value
+    // (`-oDpkg::Options::=…`) isn't a cluster.
     let simulate = args.iter().any(|x| {
         matches!(
             x.as_str(),
             "--simulate" | "--just-print" | "--dry-run" | "--recon" | "--no-act"
-        )
-    }) || has_flag(args, 's', "--simulate");
+        ) || (x.starts_with('-')
+            && !x.starts_with("--")
+            && x.len() > 1
+            && x[1..].chars().all(|c| c.is_ascii_alphabetic())
+            && x.contains('s'))
+    });
     let read_verbs = [
         "list",
         "show",
@@ -2330,10 +2409,7 @@ fn assess_apt(ctx: &PathCtx, args: &[String], a: &mut Assessment) {
     if verb.is_empty() || read_verbs.contains(&verb) || simulate {
         return;
     }
-    if args
-        .iter()
-        .any(|x| x == "--allow-remove-essential" || x == "--force-yes")
-    {
+    if apt_removes_essential(args, assigns) {
         a.raise(
             Tier::T3,
             "allows removing essential packages, which the system can't run without",
@@ -2370,13 +2446,11 @@ fn assess_apt(ctx: &PathCtx, args: &[String], a: &mut Assessment) {
 /// dpkg: listing, searching, and inspecting are reads; installing,
 /// removing, and configuring change packages. Removing while forcing past
 /// dependencies or essential status is the floor, like `rpm -e --nodeps`.
-fn assess_dpkg(ctx: &PathCtx, args: &[String], a: &mut Assessment) {
+fn assess_dpkg(ctx: &PathCtx, args: &[String], assigns: &[String], a: &mut Assessment) {
     let remove = has_flag(args, 'r', "--remove") || has_flag(args, 'P', "--purge");
-    let forced = |name: &str| args.iter().any(|x| x == name);
-    let past_essential = forced("--force-all")
-        || forced("--force-remove-essential")
-        || forced("--force-remove-protected");
-    if remove && (past_essential || forced("--force-depends")) {
+    let forced = dpkg_force_words(args, assigns);
+    let past_essential = forces_past_essential(&forced);
+    if remove && (past_essential || forces_past_depends(&forced)) {
         a.raise(
             Tier::T3,
             "removes a package while ignoring what depends on it",
@@ -2487,12 +2561,21 @@ fn protected_packages(ctx: &PathCtx, pkgs: &[&str], a: &mut Assessment) {
     ];
     for p in pkgs {
         // `libc6:amd64`, `htop=3.2.2-2`: the name is what's before.
-        let name = p.trim().split_once(['=', ':']).map_or(p.trim(), |(n, _)| n);
-        let kernel_glob = matches!(
-            name,
-            "kernel*" | "kernel-core*" | "linux-image*" | "linux-image-*"
-        );
-        if PROTECTED.contains(&name) || kernel_glob {
+        let raw = p.trim();
+        let name = raw.split_once(['=', ':']).map_or(raw, |(n, _)| n);
+        // A pattern over kernel packages (`kernel*`, `linux-image-6.1*`,
+        // `linux-image-*-amd64`): the package manager expands it, and the
+        // running kernel can be in it.
+        let kernel_glob = (name.starts_with("kernel") || name.starts_with("linux-image"))
+            && name.contains(['*', '?', '[']);
+        if kernel_glob {
+            a.raise(
+                Tier::T3,
+                format!(
+                    "removes kernel packages by pattern ({raw}), which can include the running one"
+                ),
+            );
+        } else if PROTECTED.contains(&name) {
             a.raise(
                 Tier::T3,
                 format!("removes {name}, which the system can't run without"),
@@ -2731,6 +2814,7 @@ mod tests {
             "apt-config dump",
             "needrestart -b",
             "update-alternatives --display editor",
+            "update-alternatives --query editor --quiet",
             "unattended-upgrade --dry-run",
         ] {
             assert_eq!(
@@ -2795,6 +2879,12 @@ mod tests {
             "sudo unattended-upgrade",
             "sudo add-apt-repository ppa:x/y",
             "apt-get clean",
+            "sudo update-alternatives --display editor --set editor /usr/bin/vim.basic",
+            "sudo update-alternatives --all",
+            "update-alternatives --config editor",
+            "sudo dpkg -r --force-confold,confnew htop",
+            "sudo apt-get -o Dpkg::Options::=--force-confold remove -y htop",
+            "sudo DPKG_FORCE=confold apt-get install -y htop",
         ] {
             assert_eq!(
                 tier(cmd),
@@ -2942,6 +3032,19 @@ mod tests {
             "sudo dpkg --purge --force-all bash",
             "sudo dpkg -r libc6:amd64",
             "sudo apt-get -o Dpkg::Options::=--force-confold remove apt",
+            "sudo apt-get remove 'linux-image-*-amd64'",
+            "apt-get remove 'linux-image-6.1*'",
+            "dnf remove 'kernel-core-6.*'",
+            "sudo dpkg -r --force-depends,remove-essential sed",
+            "sudo dpkg --purge --force-all,depends grep",
+            "sudo DPKG_FORCE=remove-essential dpkg -r perl-base",
+            "DPKG_FORCE=depends,confold sudo dpkg -r tar",
+            "sudo apt-get -o APT::Get::allow-remove-essential=true remove sed",
+            "sudo apt-get --option=apt::get::force-yes=true remove grep",
+            "sudo apt-get -o Dpkg::Options::=--force-remove-essential remove tar",
+            "sudo apt-get -oDpkg::Options::=--force-all,confold remove gzip",
+            "sudo DPKG_FORCE=remove-essential apt-get remove -y libc-bin",
+            "sudo update-alternatives --remove-all editor && sudo apt-get -y --allow-remove-essential remove dash",
             "echo 'x' | sudo tee /etc/sudoers.d/nopass",
             "sudo cp fstab.new /etc/fstab",
             "systemctl stop sshd",

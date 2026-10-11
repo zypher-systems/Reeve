@@ -257,9 +257,22 @@ fn is_kernel(name: &str) -> bool {
     matches!(
         base,
         "kernel" | "kernel-core" | "linux" | "linux-lts" | "linux-zen" | "linux-hardened"
-    ) || name
-        .strip_prefix("linux-image-")
-        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    ) || deb_kernel_abi(name).is_some()
+}
+
+/// The ABI a Debian kernel package boots: `linux-image-6.1.0-37-amd64:amd64`
+/// → `6.1.0-37-amd64`, the unsigned build the same. A metapackage
+/// (`linux-image-amd64`) and debug symbols (`-dbg`, `-dbgsym`) aren't kernels.
+fn deb_kernel_abi(name: &str) -> Option<&str> {
+    let name = name.split_once(':').map_or(name, |(n, _)| n);
+    let rest = name.strip_prefix("linux-image-")?;
+    if !rest.starts_with(|c: char| c.is_ascii_digit())
+        || rest.ends_with("-dbg")
+        || rest.ends_with("-dbgsym")
+    {
+        return None;
+    }
+    Some(rest.strip_suffix("-unsigned").unwrap_or(rest))
 }
 
 /// `6.1.0-37-amd64` against `6.1.0-38-amd64`: by numeric runs, like
@@ -484,9 +497,7 @@ pub fn gather(home: &Path, distro: &Distro, since: DateTime<Utc>, receipts: &[Re
             let newest = now
                 .packages
                 .keys()
-                .filter_map(|n| n.strip_prefix("linux-image-"))
-                .filter(|n| n.starts_with(|c: char| c.is_ascii_digit()))
-                .map(|n| n.split_once(':').map_or(n, |(a, _)| a))
+                .filter_map(|n| deb_kernel_abi(n))
                 .max_by(|a, b| version_order(a, b));
             if let Some(newest) = newest {
                 if !running.is_empty() && running != newest {
@@ -689,6 +700,16 @@ mod tests {
             !is_kernel("linux-image-amd64:amd64"),
             "the metapackage isn't a kernel"
         );
+        assert!(
+            !is_kernel("linux-image-6.1.0-37-amd64-dbg:amd64"),
+            "debug symbols aren't a kernel"
+        );
+        assert!(!is_kernel("linux-image-6.8.0-45-generic-dbgsym:amd64"));
+        assert_eq!(
+            deb_kernel_abi("linux-image-6.1.0-37-amd64-unsigned:amd64"),
+            Some("6.1.0-37-amd64")
+        );
+        assert_eq!(deb_kernel_abi("linux-image-6.1.0-37-amd64-dbg:amd64"), None);
         assert_eq!(
             version_order("6.1.0-9-amd64", "6.1.0-10-amd64"),
             std::cmp::Ordering::Less
