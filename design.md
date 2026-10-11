@@ -526,8 +526,14 @@ trait Distro {
     and a line that gives `DPKG_FORCE` a force word or `APT_CONFIG` any value by any route (an assignment
     in any scope, exported or not, `${NAME:=…}`, `printf -v`, `read`, `for`, a nameref), or a value Reeve
     can't read (`$(…)`, `$VAR`), and removes a package, asks. Only a read (`$NAME`), an unset, and
-    `export NAME` without a value are nothing. Over-asking there is by design; the model above only
-    makes the common cases precise.
+    `export NAME` without a value are nothing. The scan runs over the raw text and over the tokenized
+    words at every level a line nests (quotes joined, `$'…'` decoded, braces expanded in values, so
+    `DPKG_FOR''CE`, `{confold,remove-essential}` and `$'\x44PKG_FORCE'` read as what bash runs); an
+    expansion where the environment is set (`export $(…)`, `declare $(…)`, `env $(…)`, `sudo $(…)`),
+    where the program is named, or where a removed package is named can't be read and is the floor on a
+    removal; an alias defined on the line runs in place of the command word; `$NAME` is filled in where
+    the line gave NAME a literal. Over-asking there is by design; the model above only makes the
+    common cases precise.
   - **reeved:** a reboot is pending when the newest installed `linux-image-<abi>` isn't `uname -r`, when
     the running kernel's package version no longer matches the build in `/proc/version` (a security
     rebuild under the same name), or when `/var/run/reboot-required` is set. Security updates are the

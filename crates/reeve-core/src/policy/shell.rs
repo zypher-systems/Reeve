@@ -33,7 +33,7 @@ pub fn assess(ctx: &PathCtx, command: &str) -> Assessment {
     // gives dpkg's or apt's force variables a value by any route, or one
     // Reeve can't read, and removes a package, asks.
     if a.removes_packages {
-        if let Some(why) = forced_by_env(command) {
+        if let Some(why) = forced_by_env(command).or_else(|| a.force_env.clone()) {
             a.raise(Tier::T3, why);
         }
     }
@@ -69,6 +69,12 @@ fn assess_in(ctx: &PathCtx, command: &str, depth: usize, env: ShellEnv) -> Asses
             return a;
         }
     };
+    // The force variables, read from the words as bash joins them (quotes
+    // joined, `$'…'` decoded), at every level a line nests.
+    let joined: Vec<String> = parsed.segments.iter().map(|s| s.words.join(" ")).collect();
+    if let Some(why) = forced_by_env(&joined.join("\n")) {
+        a.force_env.get_or_insert(why);
+    }
 
     // Functions defined in this line: their bodies are checked where they're
     // written, so a call to one is not an unknown program.
@@ -91,6 +97,8 @@ fn assess_in(ctx: &PathCtx, command: &str, depth: usize, env: ShellEnv) -> Asses
     // subshell `( … )` works on a copy that ends with it, and a pipeline
     // stage runs in one too, so it changes nothing after itself.
     let mut envs: Vec<ShellEnv> = vec![env];
+    // `alias NAME=WORDS` earlier on the line: a later NAME runs WORDS.
+    let mut aliases: Vec<(String, Vec<String>)> = Vec::new();
     for (at, seg) in parsed.segments.iter().enumerate() {
         if seg.pattern || seg.func_def {
             prev = Some(seg);
@@ -102,7 +110,19 @@ fn assess_in(ctx: &PathCtx, command: &str, depth: usize, env: ShellEnv) -> Asses
         }
         envs.truncate(seg.depth + 1);
         let env = envs.last_mut().expect("the outer environment");
-        let calls_func = command_words(&seg.words)
+        // The words as bash runs them: `$NAME` filled in where the line gave
+        // NAME a value Reeve can read, and an alias in place of the command.
+        let mut words: Vec<String> = seg
+            .words
+            .iter()
+            .map(|w| expand_known(w, &env.vars))
+            .collect();
+        if let Some(k) = words.iter().position(|w| !is_assignment(w)) {
+            if let Some((_, body)) = aliases.iter().rev().find(|(n, _)| *n == words[k]) {
+                words.splice(k..k + 1, body.iter().cloned());
+            }
+        }
+        let calls_func = command_words(&words)
             .and_then(|(_, w)| w.first().cloned())
             .is_some_and(|p| funcs.contains(&p.as_str()));
         if calls_func {
@@ -118,13 +138,17 @@ fn assess_in(ctx: &PathCtx, command: &str, depth: usize, env: ShellEnv) -> Asses
                 .exported
                 .iter()
                 .map(|(n, v)| format!("{n}={v}"))
-                .chain(seg.words.iter().cloned())
+                .chain(words.iter().cloned())
                 .collect();
             a.merge(assess_segment(ctx, &with_env, prev, depth));
         }
         let staged = seg.piped || parsed.segments.get(at + 1).is_some_and(|n| n.piped);
         if !staged {
-            env.note(&seg.words);
+            env.note(&words);
+            if let Some(why) = env.unreadable.take() {
+                a.force_env.get_or_insert(why);
+            }
+            note_aliases(&words, &mut aliases);
         }
         prev = Some(seg);
     }
@@ -146,6 +170,9 @@ struct ShellEnv {
     exported: Vec<(String, String)>,
     /// `set -a` / `set -o allexport`: every assignment from here is exported.
     allexport: bool,
+    /// An `export`/`declare` argument Reeve couldn't read (`export $(…)`):
+    /// from here the environment may hold anything.
+    unreadable: Option<String>,
 }
 
 fn set_var(list: &mut Vec<(String, String)>, name: &str, value: &str) {
@@ -295,6 +322,18 @@ impl ShellEnv {
             }
             if is_assignment(w) {
                 self.assign(w, mode);
+                continue;
+            }
+            // `export $(…)`, `declare "$N=…"`: a name or an assignment Reeve
+            // can't read sets nothing here and is remembered as unread. A
+            // word that is no name at all sets nothing.
+            if has_expansion(w) {
+                self.unreadable.get_or_insert(format!(
+                    "sets the environment from an expansion Reeve can't read ({w})"
+                ));
+                continue;
+            }
+            if !is_identifier(w) {
                 continue;
             }
             match mode {
@@ -512,6 +551,24 @@ fn tokenize(src: &str) -> Result<Parsed, &'static str> {
                     i += 1;
                 }
             }
+            '$' if chars.get(i + 1) == Some(&'\'') => {
+                // `$'…'`: ANSI-C quoting, decoded (`\x44`, `\n`, `\\`, `\'`).
+                in_word = true;
+                i += 2;
+                while i < chars.len() && chars[i] != '\'' {
+                    if chars[i] == '\\' {
+                        let (ch, used) = ansi_c_escape(&chars[i + 1..]);
+                        word.push(ch);
+                        i += 1 + used;
+                    } else {
+                        word.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                if i >= chars.len() {
+                    return Err("unterminated quote");
+                }
+            }
             '$' if chars.get(i + 1) == Some(&'(') => {
                 let (inner, end) = balanced(&chars, i + 2)?;
                 // `$(( … ))` is arithmetic, not a command.
@@ -658,6 +715,49 @@ fn tokenize(src: &str) -> Result<Parsed, &'static str> {
 }
 
 /// Text inside `$(`…`)` starting at `from`, and the index of the closing paren.
+/// One escape of bash's `$'…'`, given the characters after the backslash:
+/// the character it stands for and how many characters it used (0 for an
+/// escape bash keeps as written, the backslash included).
+fn ansi_c_escape(rest: &[char]) -> (char, usize) {
+    let hex = |n: usize| -> Option<(char, usize)> {
+        let digits: String = rest[1..]
+            .iter()
+            .take(n)
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect();
+        let code = u32::from_str_radix(&digits, 16).ok()?;
+        Some((char::from_u32(code)?, 1 + digits.len()))
+    };
+    match rest.first() {
+        Some('n') => ('\n', 1),
+        Some('t') => ('\t', 1),
+        Some('r') => ('\r', 1),
+        Some('v') => ('\x0b', 1),
+        Some('f') => ('\x0c', 1),
+        Some('a') => ('\x07', 1),
+        Some('b') => ('\x08', 1),
+        Some('e' | 'E') => ('\x1b', 1),
+        Some('\\') => ('\\', 1),
+        Some('\'') => ('\'', 1),
+        Some('"') => ('"', 1),
+        Some('?') => ('?', 1),
+        Some('x') => hex(2).unwrap_or(('\\', 0)),
+        Some('u') => hex(4).unwrap_or(('\\', 0)),
+        Some('U') => hex(8).unwrap_or(('\\', 0)),
+        Some('0'..='7') => {
+            let digits: String = rest.iter().take(3).take_while(|c| c.is_digit(8)).collect();
+            match u32::from_str_radix(&digits, 8)
+                .ok()
+                .and_then(char::from_u32)
+            {
+                Some(ch) => (ch, digits.len()),
+                None => ('\\', 0),
+            }
+        }
+        _ => ('\\', 0),
+    }
+}
+
 fn balanced(chars: &[char], from: usize) -> Result<(String, usize), &'static str> {
     let mut depth = 1;
     let mut i = from;
@@ -953,6 +1053,10 @@ fn resolve_long(table: &[(&'static str, OptArg)], name: &str) -> Option<(&'stati
     }
 }
 
+/// What a wrapper runs: its command's words, and why its environment can't
+/// be read when it can't. None: it runs nothing.
+type WrapperRun = Option<(Vec<String>, Option<String>)>;
+
 /// The command a wrapper (`env`, `stdbuf`, `exec -a`, …) runs, read the
 /// way getopt_long reads the wrapper's own options: clusters (`-iC /tmp`),
 /// arguments attached or separate, unique abbreviations of long options,
@@ -966,7 +1070,7 @@ fn wrapper_command(
     args: &[String],
     lookup: &dyn Fn(&str) -> Option<String>,
     restarts: usize,
-) -> Result<Option<Vec<String>>, String> {
+) -> Result<WrapperRun, String> {
     if restarts > MAX_RESTARTS {
         return Err("nests -S too deeply".into());
     }
@@ -1052,6 +1156,9 @@ fn wrapper_command(
         return Ok(None);
     }
     let mut words: Vec<String> = Vec::new();
+    // `env $(…) dpkg -r sed`: an expansion where env reads assignments, or
+    // as the program, may be an assignment Reeve can't see.
+    let mut unread = None;
     for w in &rest[..n] {
         // env sets whatever stands before the first `=`; only a shell-legal
         // name is one a program reads (`FOO+=x` sets `FOO+`, not `FOO`).
@@ -1060,10 +1167,21 @@ fn wrapper_command(
             Some((_, true, _)) if !env => resolve_assign(w, &words),
             _ => None,
         };
+        if plain.is_none() && has_expansion(w) {
+            unread.get_or_insert(format!(
+                "gives a command an environment Reeve can't read ({w})"
+            ));
+        }
         words.extend(plain);
     }
+    if env && has_expansion(&rest[n]) {
+        unread.get_or_insert(format!(
+            "gives a command an environment Reeve can't read ({})",
+            rest[n]
+        ));
+    }
     words.extend(rest[n..].iter().cloned());
-    Ok(Some(words))
+    Ok(Some((words, unread)))
 }
 
 /// Positional (non-option) arguments; everything after `--` counts.
@@ -1286,6 +1404,23 @@ fn assess_words(
         a.merge(assess_words(ctx, &inner, piped, prev_prog, sudo, depth + 1));
     };
 
+    // An expansion as the program (`$(which env) DPKG_FORCE=… dpkg -r sed`)
+    // may be a wrapper, so what follows is read as a command too.
+    if has_expansion(prog_raw) {
+        a.raise(
+            Tier::T1,
+            "runs a program named by an expansion Reeve can't read",
+        );
+        if !args.is_empty() {
+            look_through(&mut a, args, sudo);
+        }
+        if sudo {
+            a.sudo = true;
+            a.raise(Tier::T2, "runs as root");
+        }
+        return a;
+    }
+
     // Shell grammar, not programs: look past a keyword to the command it
     // starts; a loop's word list is only read.
     match prog_raw.as_str() {
@@ -1347,7 +1482,13 @@ fn assess_words(
                 }
                 i += 1;
             }
-            if args.get(i).is_some() {
+            if let Some(next) = args.get(i) {
+                // `sudo VAR=value cmd`: an expansion there can be anything.
+                if has_expansion(next) {
+                    a.force_env.get_or_insert(format!(
+                        "gives a command an environment Reeve can't read (sudo {next} …)"
+                    ));
+                }
                 look_through(&mut a, &args[i..], true);
             }
         }
@@ -1366,7 +1507,12 @@ fn assess_words(
                     .map(|(_, v)| v.to_string())
             };
             match wrapper_command(prog, args, &lookup, 0) {
-                Ok(Some(words)) => look_through(&mut a, &words, sudo),
+                Ok(Some((words, unread))) => {
+                    if let Some(why) = unread {
+                        a.force_env.get_or_insert(why);
+                    }
+                    look_through(&mut a, &words, sudo);
+                }
                 Ok(None) => {}
                 Err(why) => a.raise(
                     Tier::T3,
@@ -1458,8 +1604,10 @@ fn assess_words(
             // `eval 'sudo dpkg -r libc6'`: the words, joined, are the
             // command line. One built from a variable or a substitution
             // can't be read.
-            if args.is_empty() || args.iter().any(|x| x.contains('$')) {
+            if args.is_empty() || args.iter().any(|x| has_expansion(x)) {
                 a.raise(Tier::T1, "runs code built at run time");
+                a.force_env
+                    .get_or_insert("runs code built at run time, which can set anything".into());
             } else {
                 a.merge(assess_in(
                     ctx,
@@ -1469,7 +1617,11 @@ fn assess_words(
                 ));
             }
         }
-        "source" | "." => a.raise(Tier::T1, "runs code built at run time"),
+        "source" | "." => {
+            a.raise(Tier::T1, "runs code built at run time");
+            a.force_env
+                .get_or_insert("runs a file Reeve hasn't read, which can set anything".into());
+        }
 
         // ── shell builtins: they change only the shell running the command ──
         "cd" | "pushd" | "popd" | "dirs" | "export" | "unset" | "local" | "declare" | "typeset"
@@ -2906,7 +3058,7 @@ fn dpkg_force_words(args: &[String], assigns: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for a in args {
         if let Some(list) = a.strip_prefix("--force-") {
-            out.extend(list.split(',').map(|w| w.trim().to_string()));
+            out.extend(list.split(',').map(str::to_string));
         }
     }
     for v in assigns {
@@ -2914,7 +3066,7 @@ fn dpkg_force_words(args: &[String], assigns: &[String]) -> Vec<String> {
             out.extend(
                 list.trim_matches(['"', '\''])
                     .split(',')
-                    .map(|w| w.trim().to_string()),
+                    .map(str::to_string),
             );
         }
     }
@@ -2942,7 +3094,19 @@ fn forced_by_env(line: &str) -> Option<String> {
             let prefix = &line[..at];
             let rest = &line[end..];
             let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
-            if prefix.ends_with(ident) || rest.starts_with(ident) {
+            if rest.starts_with(ident) {
+                continue;
+            }
+            if prefix.ends_with(ident) {
+                // `printf -vNAME`: the name attached to -v is set.
+                let glued_to_v = prefix
+                    .strip_suffix("-v")
+                    .is_some_and(|p| p.is_empty() || p.ends_with(char::is_whitespace));
+                if glued_to_v {
+                    return Some(format!(
+                        "sets {name} by a route Reeve can't follow (printf -v{name}) on a line that removes packages"
+                    ));
+                }
                 continue;
             }
             let route = || {
@@ -2958,7 +3122,7 @@ fn forced_by_env(line: &str) -> Option<String> {
             // A value, literal or not.
             let value = if prefix.ends_with("${") || prefix.ends_with("${!") {
                 match rest.strip_prefix(":=").or_else(|| rest.strip_prefix('=')) {
-                    Some(v) => Some(v.split('}').next().unwrap_or("").to_string()),
+                    Some(v) => Some(bash_value(v.split('}').next().unwrap_or(""), false)),
                     None => continue, // `${NAME}`, `${NAME:-x}`: a read.
                 }
             } else if prefix.ends_with('$') {
@@ -2970,7 +3134,9 @@ fn forced_by_env(line: &str) -> Option<String> {
                 {
                     return Some(route()); // A nameref: the name stands for another.
                 }
-                Some(value_token(v))
+                Some(bash_value(v, true))
+            } else if prefix.ends_with("--unset=") {
+                continue; // `env --unset=NAME`.
             } else if prefix.ends_with('=') {
                 return Some(route()); // The name as a value: `declare -n ref=NAME`.
             } else {
@@ -2989,8 +3155,10 @@ fn forced_by_env(line: &str) -> Option<String> {
                 }
                 return Some(route());
             };
-            let Some(value) = value else { continue };
-            if value.contains(['$', '`']) {
+            let Some((value, expands)) = value else {
+                continue;
+            };
+            if expands {
                 return Some(format!(
                     "gives {name} a value Reeve can't read ({value}) on a line that removes packages"
                 ));
@@ -3001,32 +3169,195 @@ fn forced_by_env(line: &str) -> Option<String> {
                         .to_string(),
                 );
             }
-            let words: Vec<String> = value.split(',').map(|w| w.trim().to_string()).collect();
-            if forces_past_essential(&words) || forces_past_depends(&words) {
-                return Some(format!(
-                    "gives dpkg DPKG_FORCE={value}, which lets it remove essential packages or ignore what depends on them"
-                ));
+            // `{confold,remove-essential}` ends as its last alternative; any
+            // alternative with a force word counts. dpkg doesn't trim the
+            // words of the list, so neither does this.
+            for alt in brace_alternatives(&value) {
+                let words: Vec<String> = alt.split(',').map(str::to_string).collect();
+                if forces_past_essential(&words) || forces_past_depends(&words) {
+                    return Some(format!(
+                        "gives dpkg DPKG_FORCE={alt}, which lets it remove essential packages or ignore what depends on them"
+                    ));
+                }
             }
         }
     }
     None
 }
 
-/// The value an assignment's `=` starts: a single-quoted string as it is
-/// (nothing expands in it), a double-quoted one with its `$` left in, or a
-/// bare word up to the next separator.
-fn value_token(v: &str) -> String {
-    if let Some(q) = v.strip_prefix('\'') {
-        return q.split('\'').next().unwrap_or("").replace(['$', '`'], "");
+/// The value bash assigns from the text after `=`: quotes joined (a
+/// single-quoted part as it is, nothing expands in it), backslashes
+/// dropped, and, when `stop` is set, ended at the first unquoted
+/// separator. The flag says whether an expansion (`$`, a backtick) outside
+/// single quotes is left in it.
+fn bash_value(v: &str, stop: bool) -> (String, bool) {
+    const SEPARATORS: &[char] = &[' ', '\t', '\n', ';', '|', '&', ')', '(', '<', '>'];
+    let mut out = String::new();
+    let mut expands = false;
+    let mut quote: Option<char> = None;
+    let mut chars = v.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), ch) if ch == q => quote = None,
+            (Some('\''), ch) => out.push(ch),
+            (None, '\'' | '"') => quote = Some(c),
+            (_, '\\') => {
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            }
+            (_, '$' | '`') => {
+                expands = true;
+                out.push(c);
+            }
+            (None, ch) if stop && SEPARATORS.contains(&ch) => break,
+            (_, ch) => out.push(ch),
+        }
     }
-    if let Some(q) = v.strip_prefix('"') {
-        return q.split('"').next().unwrap_or("").to_string();
+    (out, expands)
+}
+
+/// The alternatives a value's brace expansion yields (`{a,b}c` → `ac`,
+/// `bc`), or the value itself; nested braces expand too, up to a cap.
+fn brace_alternatives(value: &str) -> Vec<String> {
+    fn expand(chars: &[char], out: &mut Vec<String>) {
+        if out.len() > 64 {
+            return;
+        }
+        let mut depth = 0usize;
+        let mut open = None;
+        let mut commas = Vec::new();
+        for (i, c) in chars.iter().enumerate() {
+            match c {
+                '{' => {
+                    if depth == 0 {
+                        open = Some(i);
+                        commas.clear();
+                    }
+                    depth += 1;
+                }
+                '}' if depth > 0 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let (Some(o), false) = (open, commas.is_empty()) {
+                            let mut bounds = vec![o];
+                            bounds.extend(commas.iter().copied());
+                            bounds.push(i);
+                            for w in bounds.windows(2) {
+                                let next: Vec<char> = chars[..o]
+                                    .iter()
+                                    .chain(&chars[w[0] + 1..w[1]])
+                                    .chain(&chars[i + 1..])
+                                    .copied()
+                                    .collect();
+                                expand(&next, out);
+                            }
+                            return;
+                        }
+                        open = None;
+                    }
+                }
+                ',' if depth == 1 => commas.push(i),
+                _ => {}
+            }
+        }
+        out.push(chars.iter().collect());
     }
-    v.split([' ', '\t', '\n', ';', '|', '&', ')', '(', '<', '>'])
-        .next()
-        .unwrap_or("")
-        .trim_matches(['"', '\''])
-        .to_string()
+    let mut out = Vec::new();
+    expand(&value.chars().collect::<Vec<_>>(), &mut out);
+    out
+}
+
+/// Whether a word (its quotes already removed) holds an expansion: `$NAME`,
+/// `${…}`, `$(…)` (left as `$SUBST`), `$$`, `$?` and the other special
+/// parameters. A `$` before anything else is the character itself (`^htop$`).
+fn has_expansion(w: &str) -> bool {
+    let chars: Vec<char> = w.chars().collect();
+    chars.iter().enumerate().any(|(i, c)| {
+        *c == '$'
+            && chars.get(i + 1).is_some_and(|n| {
+                n.is_ascii_alphanumeric()
+                    || matches!(n, '_' | '{' | '(' | '$' | '!' | '#' | '?' | '@' | '*' | '-')
+            })
+    })
+}
+
+/// A shell-legal name.
+fn is_identifier(w: &str) -> bool {
+    !w.is_empty()
+        && !w.starts_with(|c: char| c.is_ascii_digit())
+        && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `$NAME` and `${NAME}` filled in from what the line gave NAME, when that
+/// value is a literal Reeve can read; anything else stays as written.
+fn expand_known(word: &str, vars: &[(String, String)]) -> String {
+    if !word.contains('$') {
+        return word.to_string();
+    }
+    let chars: Vec<char> = word.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' {
+            let (name, end) = if chars.get(i + 1) == Some(&'{') {
+                match chars[i + 2..].iter().position(|c| *c == '}') {
+                    Some(p) => (
+                        chars[i + 2..i + 2 + p].iter().collect::<String>(),
+                        i + 3 + p,
+                    ),
+                    None => (String::new(), i + 1),
+                }
+            } else {
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                (chars[i + 1..j].iter().collect(), j)
+            };
+            if is_identifier(&name) {
+                if let Some(v) = var_value(vars, &name).filter(|v| !v.contains(['$', '`'])) {
+                    out.push_str(&v);
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// `alias NAME=WORDS` on the line: a later NAME as the command word runs
+/// WORDS. `unalias` takes it back.
+fn note_aliases(words: &[String], aliases: &mut Vec<(String, Vec<String>)>) {
+    let mut it = words.iter().skip_while(|w| is_assignment(w));
+    match it.next().map(String::as_str) {
+        Some("alias") => {
+            for arg in it.filter(|w| !w.starts_with('-')) {
+                let Some((name, body)) = arg.split_once('=') else {
+                    continue;
+                };
+                if let Some(first) = tokenize(body)
+                    .ok()
+                    .and_then(|p| p.segments.into_iter().next())
+                {
+                    aliases.retain(|(n, _)| n != name);
+                    aliases.push((name.to_string(), first.words));
+                }
+            }
+        }
+        Some("unalias") => {
+            let names: Vec<&String> = it.collect();
+            if names.iter().any(|w| *w == "-a") {
+                aliases.clear();
+            } else {
+                aliases.retain(|(n, _)| !names.contains(&n));
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The command word of the simple command a position is in, and the
@@ -3311,6 +3642,13 @@ fn protected_packages(ctx: &PathCtx, pkgs: &[&str], a: &mut Assessment) {
         // after the last `/` or `=` off first; `libc6:amd64`: the arch is
         // after `:`. What's left is the name or the pattern.
         let raw = p.trim();
+        if has_expansion(raw) {
+            a.raise(
+                Tier::T3,
+                format!("removes a package named by an expansion Reeve can't read ({raw})"),
+            );
+            continue;
+        }
         let spec = raw.rfind(['/', '=']).map_or(raw, |at| &raw[..at]);
         let name = spec.rsplit_once(':').map_or(spec, |(n, _)| n);
         if PROTECTED.contains(&name) {
@@ -3749,6 +4087,13 @@ mod tests {
             "export DPKG_FORCE=remove-essential; sudo apt-get -s remove sed",
             "eval 'sudo dpkg -r htop'",
             "sudo DPKG_FORCE=confold bash -c 'dpkg -r htop'",
+            "export DPKG_FORCE=confold{,}; sudo -E dpkg -r htop",
+            "export DPKG_FORCE=\" remove-essential\"; sudo -E dpkg -r htop",
+            "sudo env --unset=DPKG_FORCE dpkg -r htop",
+            "PKG=htop; sudo apt-get remove -y $PKG",
+            "PKG=htop; sudo dpkg -r ${PKG}",
+            "alias ll='ls -l'; sudo dpkg -r htop",
+            "export PATH=$PATH:/opt/bin; sudo dpkg -r htop",
         ] {
             assert_eq!(
                 tier(cmd),
@@ -3910,6 +4255,7 @@ mod tests {
                 0,
             )
             .unwrap()
+            .map(|(words, _)| words)
         };
         assert_eq!(
             run(&["-S", "-i A=1 dpkg", "-r", "x"]).unwrap(),
@@ -4162,6 +4508,42 @@ mod tests {
             "APT_CONFIG=$(cat x) sudo apt-get purge grep",
             "export APT_CONFIG; sudo apt-get remove -y grep",
             "read APT_CONFIG; sudo apt-get remove -y grep",
+            // Values as bash assigns them: braces, joined quotes, escapes.
+            "export DPKG_FORCE={confold,remove-essential}; sudo -E dpkg -r sed",
+            "export DPKG_FORCE={confold,depends}; sudo -E dpkg -r sed",
+            "eval export DPKG_FORCE=remove-\"essential\"; sudo -E dpkg -r sed",
+            "set -a; : ${DPKG_FORCE:=remove-essen''tial}; sudo -E dpkg -r sed",
+            "set -a; : ${DPKG_FORCE:=remove-essen\\tial}; sudo -E dpkg -r sed",
+            "set -a; : ${DPKG_FORCE:=remove-\"essential\"}; sudo -E dpkg -r sed",
+            // Names as bash joins them, and names attached to -v.
+            "set -a; printf -vDPKG_FORCE %s remove-essential; sudo -E dpkg -r sed",
+            "printf -vDPKG_FORCE %s remove-essential; export DPKG_FORCE; sudo -E dpkg -r sed",
+            "set -a; printf -vAPT_CONFIG %s /tmp/x; sudo -E apt-get remove -y sed",
+            "set -a; eval \"DPKG_\"\"FORCE=remove-essential\"; sudo -E dpkg -r sed",
+            "set -a; eval $'\\x44PKG_FORCE=remove-essential'; sudo -E dpkg -r sed",
+            "set -a; printf -v DPKG_FOR''CE %s remove-essential; sudo -E dpkg -r sed",
+            "set -a; printf -v DPKG_FOR\\CE %s remove-essential; sudo -E dpkg -r sed",
+            "set -a; read DPKG_FOR\"\"CE <<< remove-essential; sudo -E dpkg -r sed",
+            // An expansion where the environment, the program, or the
+            // package is read.
+            "set -a; declare \"$(printf 'DPKG_%s=remove-essential' FORCE)\"; sudo -E dpkg -r sed",
+            "set -a; declare $(printf 'DPKG_FORCE=%s' remove-essential); sudo -E dpkg -r sed",
+            "export $(printf 'DPKG_FORCE=%s' remove-essential); sudo -E dpkg -r sed",
+            "export $(echo hi); sudo dpkg -r libc6",
+            "export \"$N\"=remove-essential; sudo -E dpkg -r sed",
+            "sudo env $(printf 'DPKG_FORCE=%s' remove-essential) dpkg -r sed",
+            "sudo env \"$N\"=remove-essential dpkg -r sed",
+            "sudo $(echo DPKG_FORCE=remove-essential) dpkg -r sed",
+            "$(which env) DPKG_FORCE=remove-essential dpkg -r sed",
+            "sudo dpkg -r $(cat list)",
+            "sudo apt-get remove -y $PKG",
+            "PKG=libc6; sudo apt-get remove -y $PKG",
+            "source ./env.sh; sudo -E dpkg -r sed",
+            "eval \"$CMD\"; sudo -E dpkg -r sed",
+            // Aliases defined on the line run in place of the command word.
+            "shopt -s expand_aliases\nalias dpkg='command dpkg --force-remove-essential'\ndpkg -r sed",
+            "alias dpkg='command dpkg --force-remove-essential'; dpkg -r sed",
+            "alias x='sudo dpkg -r libc6'; x",
             "sudo apt-get remove 'linux*'",
             "sudo apt-get remove '~nlinux'",
             "sudo apt remove '?name(linux)'",
