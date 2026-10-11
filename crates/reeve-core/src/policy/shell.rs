@@ -28,7 +28,16 @@ const MAX_RESTARTS: usize = 8;
 
 /// Assess a command line.
 pub fn assess(ctx: &PathCtx, command: &str) -> Assessment {
-    assess_at(ctx, command, 0)
+    let mut a = assess_at(ctx, command, 0);
+    // The floor doesn't rest on following bash's export rules. A line that
+    // gives dpkg's or apt's force variables a value by any route, or one
+    // Reeve can't read, and removes a package, asks.
+    if a.removes_packages {
+        if let Some(why) = forced_by_env(command) {
+            a.raise(Tier::T3, why);
+        }
+    }
+    a
 }
 
 fn assess_at(ctx: &PathCtx, command: &str, depth: usize) -> Assessment {
@@ -163,12 +172,21 @@ enum Export {
     Keep,
 }
 
-/// The letters of a command's `-x`-style options (`-os` → `os`).
-fn option_letters(args: &[String]) -> String {
-    args.iter()
-        .filter(|w| w.starts_with('-') && *w != "--")
-        .flat_map(|w| w[1..].chars())
-        .collect()
+/// The letters of a command's leading options (`-os` → `os`), minus-style
+/// and plus-style apart. Options stop at the first operand or `--`.
+fn option_letters(args: &[String]) -> (String, String) {
+    let (mut minus, mut plus) = (String::new(), String::new());
+    for w in args
+        .iter()
+        .take_while(|w| w.starts_with(['-', '+']) && *w != "--")
+    {
+        if let Some(l) = w.strip_prefix('-') {
+            minus.push_str(l);
+        } else if let Some(l) = w.strip_prefix('+') {
+            plus.push_str(l);
+        }
+    }
+    (minus, plus)
 }
 
 impl ShellEnv {
@@ -197,23 +215,36 @@ impl ShellEnv {
             }
             return;
         }
-        // `command set -a`, `builtin declare …`: the builtin behind it.
+        // `{ export …; }`, `if export …`, `time export …`: the keywords in
+        // front run the command in this shell. `command set -a`,
+        // `builtin declare …`: the builtin behind it; `command -v`/`-V`
+        // only describe it.
         let mut at = leading;
-        while matches!(words[at].as_str(), "command" | "builtin") {
-            at += 1;
-            while words.get(at).is_some_and(|w| w.starts_with('-')) {
-                at += 1;
-            }
-            if at >= words.len() {
-                return;
+        loop {
+            match words.get(at).map(String::as_str) {
+                Some(
+                    "{" | "!" | "if" | "then" | "else" | "elif" | "while" | "until" | "do" | "time",
+                ) => at += 1,
+                Some("command" | "builtin") => {
+                    at += 1;
+                    while let Some(opt) = words.get(at).filter(|w| w.starts_with('-')) {
+                        if opt.contains(['v', 'V']) {
+                            return;
+                        }
+                        at += 1;
+                    }
+                }
+                Some(_) => break,
+                None => return,
             }
         }
         let args = &words[at + 1..];
+        let (minus, plus) = option_letters(args);
         match words[at].as_str() {
             "set" => self.note_set(args),
             "shopt" => self.note_shopt(args),
             "export" => {
-                let mode = if option_letters(args).contains('n') {
+                let mode = if minus.contains('n') {
                     Export::Off
                 } else {
                     Export::On
@@ -221,9 +252,9 @@ impl ShellEnv {
                 self.note_declare(args, mode);
             }
             "declare" | "typeset" => {
-                let mode = if args.iter().any(|w| w.starts_with('+') && w.contains('x')) {
+                let mode = if plus.contains('x') {
                     Export::Off
-                } else if option_letters(args).contains('x') {
+                } else if minus.contains('x') {
                     Export::On
                 } else {
                     Export::Keep
@@ -240,9 +271,10 @@ impl ShellEnv {
         let Some((n, v)) = self.resolve(w) else {
             return;
         };
+        // Under allexport an assignment is exported even by `declare +x`.
         let exported = match mode {
             Export::On => true,
-            Export::Off => false,
+            Export::Off => self.allexport,
             Export::Keep => self.allexport || self.exported.iter().any(|(e, _)| *e == n),
         };
         set_var(&mut self.vars, &n, &v);
@@ -310,7 +342,7 @@ impl ShellEnv {
     /// `shopt -o -s allexport` (and `-os`, `-so`, `-s -o`) is `set -o
     /// allexport`; `-u` turns it off. Without `-o` the name isn't a shopt.
     fn note_shopt(&mut self, args: &[String]) {
-        let letters = option_letters(args);
+        let (letters, _) = option_letters(args);
         let (o, s, u) = (
             letters.contains('o'),
             letters.contains('s'),
@@ -2889,6 +2921,150 @@ fn dpkg_force_words(args: &[String], assigns: &[String]) -> Vec<String> {
     out
 }
 
+/// The variables dpkg and apt take force options from: `DPKG_FORCE` (dpkg's
+/// force list, which apt passes on to dpkg) and `APT_CONFIG` (a config
+/// file apt reads first). What a line does to them is read from the text
+/// of the whole line, not from a model of bash: an assignment anywhere
+/// (`NAME=…`, `NAME+=…`, `${NAME:=…}`), in any scope, exported or not,
+/// counts, and so does any builtin that sets a name it is given
+/// (`printf -v`, `read`, `for`, `declare -n`). A literal value is read as
+/// the comma list it is; a value with `$` in it, or a route whose value
+/// Reeve can't see, can't be read. Only `export NAME`, `declare -x NAME`,
+/// `unset NAME`, `export -n NAME`, `env -u NAME`, and plain reads
+/// (`$NAME`, `${NAME:-x}`) are nothing. Returns why the floor applies.
+fn forced_by_env(line: &str) -> Option<String> {
+    for name in ["DPKG_FORCE", "APT_CONFIG"] {
+        let mut from = 0;
+        while let Some(off) = line[from..].find(name) {
+            let at = from + off;
+            let end = at + name.len();
+            from = end;
+            let prefix = &line[..at];
+            let rest = &line[end..];
+            let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+            if prefix.ends_with(ident) || rest.starts_with(ident) {
+                continue;
+            }
+            let route = || {
+                let around: String = line[prefix.len().saturating_sub(20)..]
+                    .chars()
+                    .take(20 + name.len() + 12)
+                    .collect();
+                format!(
+                    "sets {name} by a route Reeve can't follow ({}) on a line that removes packages",
+                    around.trim()
+                )
+            };
+            // A value, literal or not.
+            let value = if prefix.ends_with("${") || prefix.ends_with("${!") {
+                match rest.strip_prefix(":=").or_else(|| rest.strip_prefix('=')) {
+                    Some(v) => Some(v.split('}').next().unwrap_or("").to_string()),
+                    None => continue, // `${NAME}`, `${NAME:-x}`: a read.
+                }
+            } else if prefix.ends_with('$') {
+                continue; // `$NAME`: a read.
+            } else if let Some(v) = rest.strip_prefix("+=").or_else(|| rest.strip_prefix('=')) {
+                let (cmd, letters) = simple_command_before(prefix);
+                if matches!(cmd.as_deref(), Some("declare" | "typeset" | "local"))
+                    && letters.contains('n')
+                {
+                    return Some(route()); // A nameref: the name stands for another.
+                }
+                Some(value_token(v))
+            } else if prefix.ends_with('=') {
+                return Some(route()); // The name as a value: `declare -n ref=NAME`.
+            } else {
+                let last = prefix.split_whitespace().next_back();
+                if matches!(last, Some("-u" | "--unset")) {
+                    continue; // `env -u NAME`.
+                }
+                let (cmd, letters) = simple_command_before(prefix);
+                let attribute_only = match cmd.as_deref() {
+                    Some("export" | "unset" | "readonly") => true,
+                    Some("declare" | "typeset" | "local") => !letters.contains('n'),
+                    _ => false,
+                };
+                if attribute_only {
+                    continue;
+                }
+                return Some(route());
+            };
+            let Some(value) = value else { continue };
+            if value.contains(['$', '`']) {
+                return Some(format!(
+                    "gives {name} a value Reeve can't read ({value}) on a line that removes packages"
+                ));
+            }
+            if name == "APT_CONFIG" {
+                return Some(
+                    "removes packages with apt options read from a file Reeve hasn't checked"
+                        .to_string(),
+                );
+            }
+            let words: Vec<String> = value.split(',').map(|w| w.trim().to_string()).collect();
+            if forces_past_essential(&words) || forces_past_depends(&words) {
+                return Some(format!(
+                    "gives dpkg DPKG_FORCE={value}, which lets it remove essential packages or ignore what depends on them"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The value an assignment's `=` starts: a single-quoted string as it is
+/// (nothing expands in it), a double-quoted one with its `$` left in, or a
+/// bare word up to the next separator.
+fn value_token(v: &str) -> String {
+    if let Some(q) = v.strip_prefix('\'') {
+        return q.split('\'').next().unwrap_or("").replace(['$', '`'], "");
+    }
+    if let Some(q) = v.strip_prefix('"') {
+        return q.split('"').next().unwrap_or("").to_string();
+    }
+    v.split([' ', '\t', '\n', ';', '|', '&', ')', '(', '<', '>'])
+        .next()
+        .unwrap_or("")
+        .trim_matches(['"', '\''])
+        .to_string()
+}
+
+/// The command word of the simple command a position is in, and the
+/// letters of its leading options: the first word after the last
+/// separator, past assignments, `command`/`builtin`, `sudo`, and the
+/// keywords that start a command.
+fn simple_command_before(prefix: &str) -> (Option<String>, String) {
+    let start = prefix
+        .rfind([';', '|', '&', '(', '{', '\n', '`'])
+        .map_or(0, |i| i + 1);
+    let mut words = prefix[start..].split_whitespace().skip_while(|w| {
+        w.contains('=')
+            || matches!(
+                *w,
+                "command"
+                    | "builtin"
+                    | "sudo"
+                    | "-E"
+                    | "if"
+                    | "then"
+                    | "else"
+                    | "elif"
+                    | "while"
+                    | "until"
+                    | "do"
+                    | "time"
+                    | "!"
+                    | "{"
+            )
+    });
+    let cmd = words.next().map(str::to_string);
+    let letters: String = words
+        .take_while(|w| w.starts_with(['-', '+']) && *w != "--")
+        .flat_map(|w| w[1..].chars())
+        .collect();
+    (cmd, letters)
+}
+
 /// Whether force words let dpkg remove a package others depend on, or an
 /// essential one.
 fn forces_past_depends(words: &[String]) -> bool {
@@ -2969,6 +3145,9 @@ fn assess_apt(ctx: &PathCtx, args: &[String], assigns: &[String], a: &mut Assess
             | "full-upgrade"
             | "dselect-upgrade"
     ) || packages.iter().any(|p| p.ends_with('-'));
+    if removes {
+        a.removes_packages = true;
+    }
     let unseen_config =
         assigns.iter().any(|v| v.starts_with("APT_CONFIG=")) || !line.config_files.is_empty();
     if removes && unseen_config {
@@ -3010,6 +3189,9 @@ fn assess_apt(ctx: &PathCtx, args: &[String], assigns: &[String], a: &mut Assess
 /// dependencies or essential status is the floor, like `rpm -e --nodeps`.
 fn assess_dpkg(ctx: &PathCtx, args: &[String], assigns: &[String], a: &mut Assessment) {
     let remove = has_flag(args, 'r', "--remove") || has_flag(args, 'P', "--purge");
+    if remove {
+        a.removes_packages = true;
+    }
     let forced = dpkg_force_words(args, assigns);
     let past_essential = forces_past_essential(&forced);
     if remove && (past_essential || forces_past_depends(&forced)) {
@@ -3551,19 +3733,20 @@ mod tests {
             "sudo apt-get remove libstdc++6",
             "sudo apt-get remove htop/now",
             "sudo apt-get remove 'htop*/now'",
-            "DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
-            "set -a; set +a; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
-            "set -o allexport; set +o allexport; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
-            "(set -a; DPKG_FORCE=remove-essential); sudo -E dpkg -r sed",
-            "set -a | true; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
-            "true | set -a; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
-            "export DPKG_FORCE=remove-essential; export -n DPKG_FORCE; sudo -E dpkg -r sed",
-            "export DPKG_FORCE=remove-essential; declare +x DPKG_FORCE; sudo -E dpkg -r sed",
-            "declare DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
-            "readonly DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
-            "shopt -s allexport; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
-            "set -o; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
-            "set -e; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            // The force variables, read from the text of the line: a value
+            // without a force word, a read, an unset, or no removal.
+            "DPKG_FORCE=confold; sudo -E dpkg -r htop",
+            "export DPKG_FORCE=confold,confnew; sudo -E dpkg -r htop",
+            "set -a; DPKG_FORCE=confold; sudo -E dpkg -r htop",
+            "echo $DPKG_FORCE; sudo dpkg -r htop",
+            "echo ${DPKG_FORCE:-none} \"$DPKG_FORCE\"; sudo dpkg -r htop",
+            "unset DPKG_FORCE; sudo dpkg -r htop",
+            "export -n DPKG_FORCE; sudo dpkg -r htop",
+            "declare +x DPKG_FORCE; sudo dpkg -r htop",
+            "sudo env -u DPKG_FORCE dpkg -r htop",
+            "export DPKG_FORCE=confold; sudo dpkg -i foo.deb",
+            "DPKG_FORCE=confold sudo apt-get install -y htop",
+            "export DPKG_FORCE=remove-essential; sudo apt-get -s remove sed",
             "eval 'sudo dpkg -r htop'",
             "sudo DPKG_FORCE=confold bash -c 'dpkg -r htop'",
         ] {
@@ -3937,6 +4120,48 @@ mod tests {
             "eval sudo dpkg -r libc6",
             "export DPKG_FORCE=remove-essential; eval 'sudo -E dpkg -r sed'",
             "export DPKG_FORCE=remove-essential; echo $(sudo -E dpkg -r sed)",
+            // The floor doesn't rest on following bash's export rules: a
+            // force variable given a force word by any route, in any
+            // scope, exported or not, asks when the line removes a package.
+            "DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -a; set +a; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "(set -a; DPKG_FORCE=remove-essential); sudo -E dpkg -r sed",
+            "export DPKG_FORCE=remove-essential; export -n DPKG_FORCE; sudo -E dpkg -r sed",
+            "declare DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -a; command -v set +a; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "export DPKG_FORCE=remove-essential; command -v export -n DPKG_FORCE; sudo -E dpkg -r sed",
+            "shopt -s lastpipe; true | export DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "eval 'export DPKG_FORCE=remove-essential'; sudo -E dpkg -r sed",
+            "eval set -a; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "export DPKG_FORCE=remove-essential; echo $(sudo -E dpkg -r sed); export -n DPKG_FORCE",
+            "(export DPKG_FORCE=remove-essential; echo $(sudo -E dpkg -r sed))",
+            "set -a; echo $(DPKG_FORCE=remove-essential; sudo -E dpkg -r sed); set +a",
+            "export DPKG_FORCE=remove-essential -n OTHER; sudo -E dpkg -r sed",
+            "declare -x DPKG_FORCE=remove-essential +x; sudo -E dpkg -r sed",
+            "set -a; declare +x DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "{ export DPKG_FORCE=remove-essential; }; sudo -E dpkg -r sed",
+            "{ set -a; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed; }",
+            "if true; then set -a; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed; fi",
+            "if export DPKG_FORCE=remove-essential; then :; fi; sudo -E dpkg -r sed",
+            "for x in 1; do export DPKG_FORCE=remove-essential; done; sudo -E dpkg -r sed",
+            "! export DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "time export DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -o posix; DPKG_FORCE=remove-essential :; sudo -E dpkg -r sed",
+            "set -a; f() { local DPKG_FORCE=remove-essential; sudo -E dpkg -r sed; }; f",
+            "export DPKG_FORCE='all'; sudo -E dpkg -r sed",
+            "export DPKG_FORCE=\"confold,remove-essential\"; sudo -E dpkg -r sed",
+            // A value or a route Reeve can't read.
+            "set -a; printf -v DPKG_FORCE %s remove-essential; sudo -E dpkg -r sed",
+            "set -a; read DPKG_FORCE <<< remove-essential; sudo -E dpkg -r sed",
+            "read DPKG_FORCE < /tmp/f; sudo -E apt-get remove sed",
+            "export DPKG_FORCE=$(echo remove-essential); sudo -E dpkg -r sed",
+            "export DPKG_FORCE=\"$FORCE\"; sudo -E dpkg -r sed",
+            ": ${DPKG_FORCE:=remove-essential}; export DPKG_FORCE; sudo -E dpkg -r sed",
+            "for DPKG_FORCE in remove-essential; do sudo -E dpkg -r sed; done",
+            "declare -n ref=DPKG_FORCE; ref=remove-essential; export DPKG_FORCE; sudo -E dpkg -r sed",
+            "APT_CONFIG=$(cat x) sudo apt-get purge grep",
+            "export APT_CONFIG; sudo apt-get remove -y grep",
+            "read APT_CONFIG; sudo apt-get remove -y grep",
             "sudo apt-get remove 'linux*'",
             "sudo apt-get remove '~nlinux'",
             "sudo apt remove '?name(linux)'",

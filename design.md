@@ -521,7 +521,13 @@ trait Distro {
     a `$(…)`; or through `env`, which is read as getopt_long reads it: clusters,
     abbreviated long options, a bare `-`, and `-S` strings env re-reads as its own command line); an
     apt config file Reeve hasn't read (`-c FILE`, `-cFILE`, `APT_CONFIG=`) with a removal. apt's command
-    line is read by apt's rules throughout, so `-s 0` and `--no-simulate` are not simulations.
+    line is read by apt's rules throughout, so `-s 0` and `--no-simulate` are not simulations. The
+    floor doesn't rest on that model of bash, though: `forced_by_env` reads the text of the whole line,
+    and a line that gives `DPKG_FORCE` a force word or `APT_CONFIG` any value by any route (an assignment
+    in any scope, exported or not, `${NAME:=…}`, `printf -v`, `read`, `for`, a nameref), or a value Reeve
+    can't read (`$(…)`, `$VAR`), and removes a package, asks. Only a read (`$NAME`), an unset, and
+    `export NAME` without a value are nothing. Over-asking there is by design; the model above only
+    makes the common cases precise.
   - **reeved:** a reboot is pending when the newest installed `linux-image-<abi>` isn't `uname -r`, when
     the running kernel's package version no longer matches the build in `/proc/version` (a security
     rebuild under the same name), or when `/var/run/reboot-required` is set. Security updates are the

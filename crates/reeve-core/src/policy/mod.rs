@@ -84,6 +84,11 @@ pub struct Assessment {
     /// packages): where snap-pac is installed, that snapshots itself.
     #[serde(default)]
     pub pacman: bool,
+    /// It removes packages (`dpkg -r`/`-P`, `apt remove`/`purge`/
+    /// `autoremove`, `install foo-`): the floor then reads what the line
+    /// did to dpkg's and apt's force variables.
+    #[serde(default)]
+    pub removes_packages: bool,
 }
 
 impl Assessment {
@@ -99,6 +104,7 @@ impl Assessment {
             quiet_write: false,
             owner_only: false,
             pacman: false,
+            removes_packages: false,
         }
     }
 
@@ -172,6 +178,7 @@ impl Assessment {
         self.quiet_write |= other.quiet_write;
         self.owner_only |= other.owner_only;
         self.pacman |= other.pacman;
+        self.removes_packages |= other.removes_packages;
         self.tier = self.tier.max(other.tier);
         self.sudo |= other.sudo;
         if self.deny.is_none() {
