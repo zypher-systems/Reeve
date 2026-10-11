@@ -757,11 +757,20 @@ fn assess_words(
         }
         "env" | "nohup" | "time" | "command" | "exec" | "builtin" | "chronic" | "unbuffer"
         | "stdbuf" | "setsid" => {
-            let rest: Vec<String> = args
+            // `env DPKG_FORCE=… dpkg -r sed`: the assignments env sets stay
+            // on the command it runs.
+            let mut rest: Vec<String> = args
                 .iter()
-                .skip_while(|w| w.starts_with('-') || is_assignment(w))
+                .take_while(|w| w.starts_with('-') || is_assignment(w))
+                .filter(|w| is_assignment(w))
                 .cloned()
                 .collect();
+            rest.extend(
+                args.iter()
+                    .skip_while(|w| w.starts_with('-') || is_assignment(w))
+                    .cloned(),
+            );
+            let rest: Vec<String> = rest;
             if rest.is_empty() {
                 if prog == "command" && args.iter().any(|x| x == "-v" || x == "-V") {
                     return a;
@@ -2885,6 +2894,8 @@ mod tests {
             "sudo dpkg -r --force-confold,confnew htop",
             "sudo apt-get -o Dpkg::Options::=--force-confold remove -y htop",
             "sudo DPKG_FORCE=confold apt-get install -y htop",
+            "sudo env DPKG_FORCE=confold dpkg -r htop",
+            "env FOO=bar sudo dpkg -r htop",
         ] {
             assert_eq!(
                 tier(cmd),
@@ -3039,6 +3050,9 @@ mod tests {
             "sudo dpkg --purge --force-all,depends grep",
             "sudo DPKG_FORCE=remove-essential dpkg -r perl-base",
             "DPKG_FORCE=depends,confold sudo dpkg -r tar",
+            "env DPKG_FORCE=remove-essential,depends dpkg -r sed",
+            "sudo env DPKG_FORCE=remove-essential,depends dpkg -r sed",
+            "sudo env -i DPKG_FORCE=all dpkg --purge gzip",
             "sudo apt-get -o APT::Get::allow-remove-essential=true remove sed",
             "sudo apt-get --option=apt::get::force-yes=true remove grep",
             "sudo apt-get -o Dpkg::Options::=--force-remove-essential remove tar",
