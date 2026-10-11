@@ -532,8 +532,13 @@ trait Distro {
     expansion where the environment is set (`export $(…)`, `declare $(…)`, `env $(…)`, `sudo $(…)`),
     where the program is named, or where a removed package is named can't be read and is the floor on a
     removal; an alias defined on the line runs in place of the command word; `$NAME` is filled in where
-    the line gave NAME a literal. Over-asking there is by design; the model above only makes the
-    common cases precise.
+    the line gave NAME a literal. Brace expansion happens in the tokenizer, on unquoted text, before
+    anything else, as bash does it (`{a,b}`, `{1..9}`, nested; past 512 words the word is unreadable),
+    so `DPKG_F{ORCE,}=…`, `--force-{remove-essential,confold}` and `{dpkg,--force-remove-essential,-r,sed}`
+    read as the words bash runs. A function defined on the line is read at each call with the call's
+    arguments in `$@`/`$1`…, so `dpkg() { command dpkg "$@"; }; dpkg --force-remove-essential -r sed`
+    is the command it forwards. Over-asking there is by design; the model above only makes the common
+    cases precise.
   - **reeved:** a reboot is pending when the newest installed `linux-image-<abi>` isn't `uname -r`, when
     the running kernel's package version no longer matches the build in `/proc/version` (a security
     rebuild under the same name), or when `/var/run/reboot-required` is set. Security updates are the

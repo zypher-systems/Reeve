@@ -33,7 +33,7 @@ pub fn assess(ctx: &PathCtx, command: &str) -> Assessment {
     // gives dpkg's or apt's force variables a value by any route, or one
     // Reeve can't read, and removes a package, asks.
     if a.removes_packages {
-        if let Some(why) = forced_by_env(command).or_else(|| a.force_env.clone()) {
+        if let Some(why) = forced_by_env(command, true).or_else(|| a.force_env.clone()) {
             a.raise(Tier::T3, why);
         }
     }
@@ -72,25 +72,14 @@ fn assess_in(ctx: &PathCtx, command: &str, depth: usize, env: ShellEnv) -> Asses
     // The force variables, read from the words as bash joins them (quotes
     // joined, `$'…'` decoded), at every level a line nests.
     let joined: Vec<String> = parsed.segments.iter().map(|s| s.words.join(" ")).collect();
-    if let Some(why) = forced_by_env(&joined.join("\n")) {
+    if let Some(why) = forced_by_env(&joined.join("\n"), false) {
         a.force_env.get_or_insert(why);
     }
 
     // Functions defined in this line: their bodies are checked where they're
     // written, so a call to one is not an unknown program.
-    let funcs: Vec<&str> = parsed
-        .segments
-        .iter()
-        .filter_map(|s| {
-            if s.func_def {
-                s.words.last().map(String::as_str)
-            } else if s.words.first().is_some_and(|w| w == "function") {
-                s.words.get(1).map(String::as_str)
-            } else {
-                None
-            }
-        })
-        .collect();
+    let (functions, body_at) = function_bodies(&parsed.segments);
+    let funcs: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
     let mut prev: Option<&Segment> = None;
     // What the line has put in the environment so far: later commands on
     // the line run with it (`export DPKG_FORCE=…; sudo -E dpkg -r sed`). A
@@ -117,6 +106,10 @@ fn assess_in(ctx: &PathCtx, command: &str, depth: usize, env: ShellEnv) -> Asses
             .iter()
             .map(|w| expand_known(w, &env.vars))
             .collect();
+        // A function body where it is written: its arguments come at the call.
+        if body_at.contains(&at) {
+            words = strip_positionals(&words);
+        }
         if let Some(k) = words.iter().position(|w| !is_assignment(w)) {
             if let Some((_, body)) = aliases.iter().rev().find(|(n, _)| *n == words[k]) {
                 words.splice(k..k + 1, body.iter().cloned());
@@ -126,12 +119,39 @@ fn assess_in(ctx: &PathCtx, command: &str, depth: usize, env: ShellEnv) -> Asses
             .and_then(|(_, w)| w.first().cloned())
             .is_some_and(|p| funcs.contains(&p.as_str()));
         if calls_func {
-            // Only its redirects are new.
+            // The call's redirects are new, and so is its body run with the
+            // call's arguments in `$@`, `$*`, `$1`…: a body that forwards
+            // them to a command is that command.
             let only = Segment {
                 words: Vec::new(),
                 ..seg.clone()
             };
             a.merge(assess_segment(ctx, &only, prev, depth));
+            let (_, call) = command_words(&words).expect("a call has words");
+            let args = &call[1..];
+            let body = functions
+                .iter()
+                .find(|(n, _)| *n == call[0])
+                .map(|(_, b)| b.clone())
+                .unwrap_or_default();
+            for body_words in body {
+                let expanded = with_positionals(&body_words, args);
+                let run = Segment {
+                    words: env
+                        .exported
+                        .iter()
+                        .map(|(n, v)| format!("{n}={v}"))
+                        .chain(expanded.iter().cloned())
+                        .collect(),
+                    depth: seg.depth,
+                    ..Default::default()
+                };
+                a.merge(assess_segment(ctx, &run, prev, depth + 1));
+                env.note(&expanded);
+                if let Some(why) = env.unreadable.take() {
+                    a.force_env.get_or_insert(why);
+                }
+            }
         } else {
             let mut with_env = seg.clone();
             with_env.words = env
@@ -467,19 +487,23 @@ fn tokenize(src: &str) -> Result<Parsed, &'static str> {
     let mut heredocs: Vec<(String, bool)> = Vec::new();
     // Open `(` subshells: a `)` with none open ends a `case` pattern.
     let mut paren_depth = 0usize;
+    // Open `${` parameters: their braces are not a brace expansion.
+    let mut param_depth = 0usize;
     let mut i = 0;
 
     macro_rules! end_word {
         () => {
             if in_word {
                 let w = std::mem::take(&mut word);
+                param_depth = 0;
                 if want_heredoc {
-                    heredocs.push((w.clone(), false));
+                    heredocs.push((unmark(&w), false));
                     want_heredoc = false;
                 } else if let Some(writes) = want_target.take() {
-                    seg.redirects.push((w, writes));
+                    seg.redirects.push((unmark(&w), writes));
                 } else {
-                    seg.words.push(w);
+                    // Brace expansion, of what was unquoted.
+                    seg.words.extend(brace_words(&w));
                 }
                 in_word = false;
             }
@@ -703,6 +727,25 @@ fn tokenize(src: &str) -> Result<Parsed, &'static str> {
                     want_target = Some(writes);
                 }
             }
+            '{' | '}' | ',' => {
+                // Unquoted braces and commas may be a brace expansion, which
+                // `end_word!` performs; `${…}` is a parameter, not a brace.
+                let marked = match c {
+                    '{' if word.ends_with('$') => {
+                        param_depth += 1;
+                        c
+                    }
+                    '}' if param_depth > 0 => {
+                        param_depth -= 1;
+                        c
+                    }
+                    '{' => BRACE_OPEN,
+                    '}' => BRACE_CLOSE,
+                    _ => BRACE_COMMA,
+                };
+                word.push(marked);
+                in_word = true;
+            }
             ch => {
                 word.push(ch);
                 in_word = true;
@@ -714,7 +757,155 @@ fn tokenize(src: &str) -> Result<Parsed, &'static str> {
     Ok(out)
 }
 
-/// Text inside `$(`…`)` starting at `from`, and the index of the closing paren.
+/// Stand-ins for a word's unquoted `{`, `}` and `,` while it is tokenized:
+/// the ones bash would brace-expand.
+const BRACE_OPEN: char = '\u{E000}';
+const BRACE_CLOSE: char = '\u{E001}';
+const BRACE_COMMA: char = '\u{E002}';
+/// How many words one brace expansion may yield before Reeve stops
+/// following it and calls the word unreadable.
+const MAX_BRACE_WORDS: usize = 512;
+
+/// The stand-ins back to the characters they stand for.
+fn unmark(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            BRACE_OPEN => '{',
+            BRACE_CLOSE => '}',
+            BRACE_COMMA => ',',
+            c => c,
+        })
+        .collect()
+}
+
+/// The words bash's brace expansion makes of a word whose unquoted braces
+/// are marked: `{a,b}c` → `ac`, `bc`; `{1..3}` → `1`, `2`, `3` (`{a..c}`,
+/// `{01..10}`, `{1..9..2}` too); nested ones expand in turn; a brace with
+/// neither comma nor range is the character itself. Past
+/// `MAX_BRACE_WORDS` the word comes back alone, marked `$BRACE` so the
+/// policy reads it as an expansion it can't follow.
+fn brace_words(marked: &str) -> Vec<String> {
+    fn expand(chars: &[char], out: &mut Vec<String>) -> bool {
+        if out.len() >= MAX_BRACE_WORDS {
+            return false;
+        }
+        let mut depth = 0usize;
+        let mut open = None;
+        let mut commas = Vec::new();
+        for (i, c) in chars.iter().enumerate() {
+            match *c {
+                BRACE_OPEN => {
+                    if depth == 0 {
+                        open = Some(i);
+                        commas.clear();
+                    }
+                    depth += 1;
+                }
+                BRACE_CLOSE if depth > 0 => {
+                    depth -= 1;
+                    if depth > 0 {
+                        continue;
+                    }
+                    let o = open.expect("a brace was opened");
+                    let alternatives: Vec<String> = if commas.is_empty() {
+                        let inner: String = chars[o + 1..i].iter().collect();
+                        match brace_sequence(&inner) {
+                            Some(seq) => seq,
+                            None => continue,
+                        }
+                    } else {
+                        let mut bounds = vec![o];
+                        bounds.extend(commas.iter().copied());
+                        bounds.push(i);
+                        bounds
+                            .windows(2)
+                            .map(|w| chars[w[0] + 1..w[1]].iter().collect())
+                            .collect()
+                    };
+                    for alt in alternatives {
+                        let next: Vec<char> = chars[..o]
+                            .iter()
+                            .copied()
+                            .chain(alt.chars())
+                            .chain(chars[i + 1..].iter().copied())
+                            .collect();
+                        if !expand(&next, out) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                BRACE_COMMA if depth == 1 => commas.push(i),
+                _ => {}
+            }
+        }
+        out.push(unmark(&chars.iter().collect::<String>()));
+        true
+    }
+    let chars: Vec<char> = marked.chars().collect();
+    let mut out = Vec::new();
+    if expand(&chars, &mut out) {
+        out
+    } else {
+        vec![format!("$BRACE{}", unmark(marked))]
+    }
+}
+
+/// `x..y` or `x..y..step` between integers (zero-padded to the wider
+/// end when either is) or single characters, as bash counts them. More
+/// than the cap is cut short; the caller then gives up on the word.
+fn brace_sequence(inner: &str) -> Option<Vec<String>> {
+    let parts: Vec<&str> = inner.split("..").collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    let step = match parts.get(2) {
+        Some(s) => s.parse::<i64>().ok()?.abs().max(1),
+        None => 1,
+    };
+    let mut out = Vec::new();
+    if let (Ok(a), Ok(b)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
+        let padded = |p: &str| p.len() > 1 && p.trim_start_matches(['-', '+']).starts_with('0');
+        let width = if padded(parts[0]) || padded(parts[1]) {
+            parts[0].len().max(parts[1].len())
+        } else {
+            0
+        };
+        let mut n = a;
+        loop {
+            out.push(format!("{n:0width$}"));
+            if out.len() > MAX_BRACE_WORDS {
+                break;
+            }
+            n = if a <= b { n + step } else { n - step };
+            if (a <= b && n > b) || (a > b && n < b) {
+                break;
+            }
+        }
+        return Some(out);
+    }
+    let one = |p: &str| {
+        let mut it = p.chars();
+        match (it.next(), it.next()) {
+            (Some(c), None) => Some(c as i64),
+            _ => None,
+        }
+    };
+    let (a, b) = (one(parts[0])?, one(parts[1])?);
+    let mut n = a;
+    loop {
+        out.push(char::from_u32(u32::try_from(n).ok()?)?.to_string());
+        if out.len() > MAX_BRACE_WORDS {
+            break;
+        }
+        n = if a <= b { n + step } else { n - step };
+        if (a <= b && n > b) || (a > b && n < b) {
+            break;
+        }
+    }
+    Some(out)
+}
+
 /// One escape of bash's `$'…'`, given the characters after the backslash:
 /// the character it stands for and how many characters it used (0 for an
 /// escape bash keeps as written, the backslash included).
@@ -758,6 +949,7 @@ fn ansi_c_escape(rest: &[char]) -> (char, usize) {
     }
 }
 
+/// Text inside `$(`…`)` starting at `from`, and the index of the closing paren.
 fn balanced(chars: &[char], from: usize) -> Result<(String, usize), &'static str> {
     let mut depth = 1;
     let mut i = from;
@@ -3084,7 +3276,7 @@ fn dpkg_force_words(args: &[String], assigns: &[String]) -> Vec<String> {
 /// Reeve can't see, can't be read. Only `export NAME`, `declare -x NAME`,
 /// `unset NAME`, `export -n NAME`, `env -u NAME`, and plain reads
 /// (`$NAME`, `${NAME:-x}`) are nothing. Returns why the floor applies.
-fn forced_by_env(line: &str) -> Option<String> {
+fn forced_by_env(line: &str, raw: bool) -> Option<String> {
     for name in ["DPKG_FORCE", "APT_CONFIG"] {
         let mut from = 0;
         while let Some(off) = line[from..].find(name) {
@@ -3122,7 +3314,7 @@ fn forced_by_env(line: &str) -> Option<String> {
             // A value, literal or not.
             let value = if prefix.ends_with("${") || prefix.ends_with("${!") {
                 match rest.strip_prefix(":=").or_else(|| rest.strip_prefix('=')) {
-                    Some(v) => Some(bash_value(v.split('}').next().unwrap_or(""), false)),
+                    Some(v) => Some(bash_value(v.split('}').next().unwrap_or(""), false, raw)),
                     None => continue, // `${NAME}`, `${NAME:-x}`: a read.
                 }
             } else if prefix.ends_with('$') {
@@ -3134,7 +3326,7 @@ fn forced_by_env(line: &str) -> Option<String> {
                 {
                     return Some(route()); // A nameref: the name stands for another.
                 }
-                Some(bash_value(v, true))
+                Some(bash_value(v, true, raw))
             } else if prefix.ends_with("--unset=") {
                 continue; // `env --unset=NAME`.
             } else if prefix.ends_with('=') {
@@ -3170,9 +3362,16 @@ fn forced_by_env(line: &str) -> Option<String> {
                 );
             }
             // `{confold,remove-essential}` ends as its last alternative; any
-            // alternative with a force word counts. dpkg doesn't trim the
-            // words of the list, so neither does this.
-            for alt in brace_alternatives(&value) {
+            // alternative with a force word counts, and one Reeve can't
+            // follow to the end can't be read. dpkg doesn't trim the words
+            // of the list, so neither does this.
+            let alternatives = brace_words(&value);
+            if alternatives.iter().any(|w| w.starts_with("$BRACE")) {
+                return Some(format!(
+                    "gives {name} a brace expansion with more words than Reeve follows, on a line that removes packages"
+                ));
+            }
+            for alt in alternatives {
                 let words: Vec<String> = alt.split(',').map(str::to_string).collect();
                 if forces_past_essential(&words) || forces_past_depends(&words) {
                     return Some(format!(
@@ -3188,9 +3387,11 @@ fn forced_by_env(line: &str) -> Option<String> {
 /// The value bash assigns from the text after `=`: quotes joined (a
 /// single-quoted part as it is, nothing expands in it), backslashes
 /// dropped, and, when `stop` is set, ended at the first unquoted
-/// separator. The flag says whether an expansion (`$`, a backtick) outside
-/// single quotes is left in it.
-fn bash_value(v: &str, stop: bool) -> (String, bool) {
+/// separator. With `braces`, the unquoted braces and commas come back
+/// marked for `brace_words` (raw text); tokenized words were expanded
+/// already, so theirs are the characters. The flag says whether an
+/// expansion (`$`, a backtick) outside single quotes is left in it.
+fn bash_value(v: &str, stop: bool, braces: bool) -> (String, bool) {
     const SEPARATORS: &[char] = &[' ', '\t', '\n', ';', '|', '&', ')', '(', '<', '>'];
     let mut out = String::new();
     let mut expands = false;
@@ -3201,6 +3402,9 @@ fn bash_value(v: &str, stop: bool) -> (String, bool) {
             (Some(q), ch) if ch == q => quote = None,
             (Some('\''), ch) => out.push(ch),
             (None, '\'' | '"') => quote = Some(c),
+            (None, '{') if braces => out.push(BRACE_OPEN),
+            (None, '}') if braces => out.push(BRACE_CLOSE),
+            (None, ',') if braces => out.push(BRACE_COMMA),
             (_, '\\') => {
                 if let Some(n) = chars.next() {
                     out.push(n);
@@ -3215,57 +3419,6 @@ fn bash_value(v: &str, stop: bool) -> (String, bool) {
         }
     }
     (out, expands)
-}
-
-/// The alternatives a value's brace expansion yields (`{a,b}c` → `ac`,
-/// `bc`), or the value itself; nested braces expand too, up to a cap.
-fn brace_alternatives(value: &str) -> Vec<String> {
-    fn expand(chars: &[char], out: &mut Vec<String>) {
-        if out.len() > 64 {
-            return;
-        }
-        let mut depth = 0usize;
-        let mut open = None;
-        let mut commas = Vec::new();
-        for (i, c) in chars.iter().enumerate() {
-            match c {
-                '{' => {
-                    if depth == 0 {
-                        open = Some(i);
-                        commas.clear();
-                    }
-                    depth += 1;
-                }
-                '}' if depth > 0 => {
-                    depth -= 1;
-                    if depth == 0 {
-                        if let (Some(o), false) = (open, commas.is_empty()) {
-                            let mut bounds = vec![o];
-                            bounds.extend(commas.iter().copied());
-                            bounds.push(i);
-                            for w in bounds.windows(2) {
-                                let next: Vec<char> = chars[..o]
-                                    .iter()
-                                    .chain(&chars[w[0] + 1..w[1]])
-                                    .chain(&chars[i + 1..])
-                                    .copied()
-                                    .collect();
-                                expand(&next, out);
-                            }
-                            return;
-                        }
-                        open = None;
-                    }
-                }
-                ',' if depth == 1 => commas.push(i),
-                _ => {}
-            }
-        }
-        out.push(chars.iter().collect());
-    }
-    let mut out = Vec::new();
-    expand(&value.chars().collect::<Vec<_>>(), &mut out);
-    out
 }
 
 /// Whether a word (its quotes already removed) holds an expansion: `$NAME`,
@@ -3325,6 +3478,121 @@ fn expand_known(word: &str, vars: &[(String, String)]) -> String {
         }
         out.push(chars[i]);
         i += 1;
+    }
+    out
+}
+
+/// A function the line defines: its name and its body as word lists.
+type Function = (String, Vec<Vec<String>>);
+
+/// The functions a line defines, each with its body as word lists:
+/// `name() { a; b; }`, `name() ( … )`, and `function name { … }`. The body
+/// is read where it is written, and again at each call with the call's
+/// arguments.
+fn function_bodies(segments: &[Segment]) -> (Vec<Function>, Vec<usize>) {
+    let mut out = Vec::new();
+    let mut body_at = Vec::new();
+    for (i, s) in segments.iter().enumerate() {
+        let keyword = s.words.first().is_some_and(|w| w == "function");
+        let name = if s.func_def {
+            s.words.last().cloned()
+        } else if keyword {
+            s.words.get(1).cloned()
+        } else {
+            None
+        };
+        let Some(name) = name else { continue };
+        let mut body: Vec<Vec<String>> = Vec::new();
+        // `function name { cmd`: the first command shares the segment.
+        let mut opened = false;
+        if keyword {
+            let first: Vec<String> = s
+                .words
+                .iter()
+                .skip(2)
+                .skip_while(|w| {
+                    opened |= *w == "{";
+                    *w == "{"
+                })
+                .cloned()
+                .collect();
+            if !first.is_empty() {
+                body.push(first);
+                body_at.push(i);
+            }
+        }
+        for (k, b) in segments.iter().enumerate().skip(i + 1) {
+            if b.depth > s.depth {
+                body.push(b.words.clone());
+                body_at.push(k);
+                continue;
+            }
+            if b.func_def || b.pattern {
+                break;
+            }
+            let mut words = b.words.clone();
+            if !opened && words.first().is_some_and(|w| w == "{") {
+                opened = true;
+                words.remove(0);
+            }
+            if !opened || words.first().is_some_and(|w| w == "}") {
+                break;
+            }
+            if !words.is_empty() {
+                body.push(words);
+                body_at.push(k);
+            }
+        }
+        out.push((name, body));
+    }
+    (out, body_at)
+}
+
+/// A function body as written: its positional parameters have no value
+/// yet (`$@` and `$*` are no words, `$1`… are empty), so what it does with
+/// its arguments is read at the call.
+fn strip_positionals(words: &[String]) -> Vec<String> {
+    words
+        .iter()
+        .filter(|w| !matches!(w.as_str(), "$@" | "$*" | "${@}" | "${*}"))
+        .map(|w| {
+            let mut s = w.clone();
+            for each in ["${@}", "${*}", "$@", "$*"] {
+                s = s.replace(each, "");
+            }
+            for n in 1..=9 {
+                s = s
+                    .replace(&format!("${{{n}}}"), "")
+                    .replace(&format!("${n}"), "");
+            }
+            s
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// A function body's words with the call's arguments in place of `$@`,
+/// `$*` (as separate words when they stand alone) and `$1`…`$9`. A
+/// positional the call didn't give stays as written, which reads as an
+/// expansion Reeve can't follow.
+fn with_positionals(words: &[String], args: &[String]) -> Vec<String> {
+    let all = args.join(" ");
+    let mut out = Vec::new();
+    for w in words {
+        if matches!(w.as_str(), "$@" | "$*" | "${@}" | "${*}") {
+            out.extend(args.iter().cloned());
+            continue;
+        }
+        let mut s = w.clone();
+        for (i, arg) in args.iter().enumerate().take(9) {
+            s = s
+                .replace(&format!("${{{}}}", i + 1), arg)
+                .replace(&format!("${}", i + 1), arg);
+        }
+        for each in ["${@}", "${*}", "$@", "$*"] {
+            s = s.replace(each, &all);
+        }
+        out.push(s);
     }
     out
 }
@@ -4094,6 +4362,12 @@ mod tests {
             "PKG=htop; sudo dpkg -r ${PKG}",
             "alias ll='ls -l'; sudo dpkg -r htop",
             "export PATH=$PATH:/opt/bin; sudo dpkg -r htop",
+            "export DPKG_FORCE=\"{confold,remove-essential}\"; sudo -E dpkg -r htop",
+            "export DPKG_FORCE='{confold,remove-essential}'; sudo -E dpkg -r htop",
+            "sudo apt-get remove {htop,vim}",
+            "echo {a,b} {1..3}; sudo dpkg -r htop",
+            "sudo dpkg --force-{confold,confnew} -r htop",
+            "rmpkg() { sudo dpkg -r \"$1\"; }; rmpkg htop",
         ] {
             assert_eq!(
                 tier(cmd),
@@ -4102,6 +4376,14 @@ mod tests {
                 assess(&PathCtx::for_tests(), cmd)
             );
         }
+        // More alternatives than Reeve follows can't be read.
+        let many = format!(
+            "export DPKG_FORCE={{{}remove-essential}}; sudo -E dpkg -r sed",
+            "confold,".repeat(600)
+        );
+        assert_eq!(tier(&many), Tier::T3, "{many}");
+        // A body that only echoes its arguments runs nothing else.
+        assert_eq!(tier("f() { echo \"$@\"; }; f sudo dpkg -r libc6"), Tier::T0);
         assert!(assess(&PathCtx::for_tests(), "sudo ls").sudo);
     }
 
@@ -4544,6 +4826,35 @@ mod tests {
             "shopt -s expand_aliases\nalias dpkg='command dpkg --force-remove-essential'\ndpkg -r sed",
             "alias dpkg='command dpkg --force-remove-essential'; dpkg -r sed",
             "alias x='sudo dpkg -r libc6'; x",
+            // Brace expansion, as bash does it before anything else: in a
+            // name, in dpkg's and apt's options, as the program, in ranges.
+            "export DPKG_F{ORCE,}=remove-essential; sudo -E dpkg -r sed",
+            "export DPKG_FORCE{,}=remove-essential; sudo -E dpkg -r sed",
+            "export DPKG_{FORCE,FOO}=remove-essential; sudo -E dpkg -r sed",
+            "declare -x DPKG_F{ORCE,}=remove-essential; sudo -E dpkg -r sed",
+            "set -a; read DPKG_F{ORCE,} <<< remove-essential; sudo -E dpkg -r sed",
+            "eval export DPKG_F{ORCE,}=remove-essential; sudo -E dpkg -r sed",
+            "sudo env DPKG_F{ORCE,}=remove-essential dpkg -r sed",
+            "sudo DPKG_F{ORCE,}=remove-essential dpkg -r sed",
+            "export DPKG_FORC{E..E}=remove-essential; sudo -E dpkg -r sed",
+            "export APT_C{ONFIG,}=/tmp/x; sudo apt-get remove -y sed",
+            "sudo dpkg --force-{remove-essential,confold} -r sed",
+            "sudo dpkg --force-remove-{essential,protected} -r sed",
+            "sudo dpkg --force-{all,confold} -r grep",
+            "sudo dpkg --force-remove-essential{,} -r sed",
+            "sudo {dpkg,--force-remove-essential,-r,htop}",
+            "sudo apt-get --allow-remove-essential{,} remove htop",
+            "sudo apt-get --allow-remove-{essential,essential} remove htop",
+            "sudo apt-get --option=APT::Get::allow-remove-essential=true{,} remove htop",
+            "sudo apt-get {-y,--allow-remove-essential} remove htop",
+            "export DPKG_FORCE=remove-essentia{l..l}; sudo -E dpkg -r sed",
+            "export DPKG_FORCE={a..a}ll; sudo -E dpkg -r sed",
+            "sudo apt-get remove {htop,libc6}",
+            // A function that forwards its arguments is the command they make.
+            "dpkg() { command dpkg \"$@\"; }; dpkg --force-remove-essential -r sed",
+            "rmpkg() { sudo dpkg -r \"$1\"; }; rmpkg libc6",
+            "function f { sudo dpkg -r \"$@\"; }; f libc6",
+            "f() ( sudo apt-get remove -y \"$@\" ); f linux-image-6.17.4-200.fc44.x86_64",
             "sudo apt-get remove 'linux*'",
             "sudo apt-get remove '~nlinux'",
             "sudo apt remove '?name(linux)'",
