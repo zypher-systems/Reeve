@@ -72,10 +72,9 @@ fn assess_at(ctx: &PathCtx, command: &str, depth: usize) -> Assessment {
         })
         .collect();
     let mut prev: Option<&Segment> = None;
-    // What `export` put in the environment so far: later commands on the
-    // line run with it (`export DPKG_FORCE=…; sudo -E dpkg -r sed`).
-    let mut vars: Vec<(String, String)> = Vec::new();
-    let mut exported: Vec<(String, String)> = Vec::new();
+    // What the line has put in the environment so far: later commands on
+    // the line run with it (`export DPKG_FORCE=…; sudo -E dpkg -r sed`).
+    let mut env = ShellEnv::default();
     for seg in &parsed.segments {
         if seg.pattern || seg.func_def {
             prev = Some(seg);
@@ -93,78 +92,129 @@ fn assess_at(ctx: &PathCtx, command: &str, depth: usize) -> Assessment {
             a.merge(assess_segment(ctx, &only, prev, depth));
         } else {
             let mut with_env = seg.clone();
-            with_env.words = exported
+            with_env.words = env
+                .exported
                 .iter()
                 .map(|(n, v)| format!("{n}={v}"))
                 .chain(seg.words.iter().cloned())
                 .collect();
             a.merge(assess_segment(ctx, &with_env, prev, depth));
         }
-        note_exports(&seg.words, &mut vars, &mut exported);
+        env.note(&seg.words);
         prev = Some(seg);
     }
     a
 }
 
-/// Track `A=b`, `A+=b`, `export A=b`, `export A` (after an `A=b`), and
-/// `declare -x`/`typeset -x`, so what a later command's environment holds
-/// is known. `exported` is (name, value). `+=` appends to what the shell
-/// variable holds so far, or to nothing.
-fn note_exports(
-    words: &[String],
-    vars: &mut Vec<(String, String)>,
-    exported: &mut Vec<(String, String)>,
-) {
-    fn set(list: &mut Vec<(String, String)>, name: &str, value: &str) {
-        list.retain(|(n, _)| n != name);
-        list.push((name.to_string(), value.to_string()));
+/// What a line has put in the shell's environment so far.
+#[derive(Default)]
+struct ShellEnv {
+    /// Shell variables, exported or not: (name, value).
+    vars: Vec<(String, String)>,
+    /// What child processes see: (name, value).
+    exported: Vec<(String, String)>,
+    /// `set -a` / `set -o allexport`: every assignment from here is exported.
+    allexport: bool,
+}
+
+fn set_var(list: &mut Vec<(String, String)>, name: &str, value: &str) {
+    list.retain(|(n, _)| n != name);
+    list.push((name.to_string(), value.to_string()));
+}
+
+fn var_value(list: &[(String, String)], name: &str) -> Option<String> {
+    list.iter()
+        .rev()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v.clone())
+}
+
+impl ShellEnv {
+    /// Track `A=b`, `A+=b`, `export A=b`, `export A` (after an `A=b`),
+    /// `declare -x`/`typeset -x`, and `set -a`. An exported name stays
+    /// exported, so a later bare assignment reaches children too; `+=`
+    /// appends to what the variable holds so far, or to nothing.
+    fn note(&mut self, words: &[String]) {
+        let leading: Vec<&String> = words.iter().take_while(|w| is_assignment(w)).collect();
+        let Some(prog) = words.get(leading.len()) else {
+            // A bare `A=b`: a shell variable, in the environment when the
+            // name is exported already or everything is.
+            for w in leading {
+                if let Some((n, v)) = self.resolve(w) {
+                    let exported = self.allexport || self.exported.iter().any(|(e, _)| *e == n);
+                    set_var(&mut self.vars, &n, &v);
+                    if exported {
+                        set_var(&mut self.exported, &n, &v);
+                    }
+                }
+            }
+            return;
+        };
+        if prog == "set" {
+            self.note_set(&words[leading.len() + 1..]);
+            return;
+        }
+        let exports = prog == "export"
+            || (matches!(prog.as_str(), "declare" | "typeset")
+                && words.iter().any(|w| w.starts_with('-') && w.contains('x')));
+        if !exports {
+            return;
+        }
+        for w in &words[leading.len() + 1..] {
+            if w.starts_with('-') {
+                continue;
+            }
+            match self.resolve(w) {
+                Some((n, v)) => {
+                    set_var(&mut self.vars, &n, &v);
+                    set_var(&mut self.exported, &n, &v);
+                }
+                None => {
+                    if let Some(v) = var_value(&self.vars, w) {
+                        set_var(&mut self.exported, w, &v);
+                    }
+                }
+            }
+        }
     }
-    fn value_of(list: &[(String, String)], name: &str) -> Option<String> {
-        list.iter()
-            .rev()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v.clone())
+
+    /// `set -a`, `set -o allexport`, `set +a`, `set +o allexport`, in
+    /// clusters too (`set -ax`, `set -eo allexport`).
+    fn note_set(&mut self, args: &[String]) {
+        let mut i = 0;
+        while i < args.len() {
+            let w = args[i].as_str();
+            i += 1;
+            let on = match w.chars().next() {
+                Some('-') if w != "--" => true,
+                Some('+') => false,
+                _ => break,
+            };
+            let letters = &w[1..];
+            if letters.contains('a') {
+                self.allexport = on;
+            }
+            if letters.ends_with('o') {
+                if let Some(opt) = args.get(i) {
+                    i += 1;
+                    if opt == "allexport" {
+                        self.allexport = on;
+                    }
+                }
+            }
+        }
     }
-    fn resolve(vars: &[(String, String)], w: &str) -> Option<(String, String)> {
+
+    /// The (name, value) an assignment word sets, `+=` appended to the
+    /// variable's value so far.
+    fn resolve(&self, w: &str) -> Option<(String, String)> {
         let (name, appends, value) = assignment(w)?;
         let before = if appends {
-            value_of(vars, name).unwrap_or_default()
+            var_value(&self.vars, name).unwrap_or_default()
         } else {
             String::new()
         };
         Some((name.to_string(), format!("{before}{value}")))
-    }
-    let leading: Vec<&String> = words.iter().take_while(|w| is_assignment(w)).collect();
-    let Some(prog) = words.get(leading.len()) else {
-        // A bare `A=b`: a shell variable, not yet in the environment.
-        for w in leading {
-            if let Some((n, v)) = resolve(vars, w) {
-                set(vars, &n, &v);
-            }
-        }
-        return;
-    };
-    let exports = prog == "export"
-        || (matches!(prog.as_str(), "declare" | "typeset")
-            && words.iter().any(|w| w.starts_with('-') && w.contains('x')));
-    if !exports {
-        return;
-    }
-    for w in &words[leading.len() + 1..] {
-        if w.starts_with('-') {
-            continue;
-        }
-        match resolve(vars, w) {
-            Some((n, v)) => {
-                set(vars, &n, &v);
-                set(exported, &n, &v);
-            }
-            None => {
-                if let Some(v) = value_of(vars, w) {
-                    set(exported, w, &v);
-                }
-            }
-        }
     }
 }
 
@@ -2934,9 +2984,12 @@ fn protected_packages(ctx: &PathCtx, pkgs: &[&str], a: &mut Assessment) {
     let mut candidates: Vec<&str> = images.iter().map(String::as_str).collect();
     candidates.extend(PROTECTED);
     for p in pkgs {
-        // `libc6:amd64`, `htop=3.2.2-2`: the name is what's before.
+        // `htop=3.2.2-2`, `libc6/now`: apt takes the version or release
+        // after the last `/` or `=` off first; `libc6:amd64`: the arch is
+        // after `:`. What's left is the name or the pattern.
         let raw = p.trim();
-        let name = raw.split_once(['=', ':']).map_or(raw, |(n, _)| n);
+        let spec = raw.rfind(['/', '=']).map_or(raw, |at| &raw[..at]);
+        let name = spec.rsplit_once(':').map_or(spec, |(n, _)| n);
         if PROTECTED.contains(&name) {
             a.raise(
                 Tier::T3,
@@ -2958,10 +3011,10 @@ fn protected_packages(ctx: &PathCtx, pkgs: &[&str], a: &mut Assessment) {
         // held against the running kernel's image names and the protected
         // names. A pattern apt itself can't read is the floor too: what it
         // would take is unknown.
-        let low = raw.to_ascii_lowercase();
+        let low = spec.to_ascii_lowercase();
         let marker = low.contains(['*', '?', '[', '^', '~', '$']);
         let about_kernels = low.contains("kernel") || low.contains("linux-image");
-        let hit = match apt_syntax::selects(raw, &candidates) {
+        let hit = match apt_syntax::selects(spec, &candidates) {
             Ok(hit) => hit,
             Err(why) => {
                 a.raise(
@@ -3355,6 +3408,11 @@ mod tests {
             "sudo apt-get remove '~nhtop~i'",
             "sudo apt-get remove '?exact-name(htop)'",
             "sudo apt-get remove libstdc++6",
+            "sudo apt-get remove htop/now",
+            "sudo apt-get remove 'htop*/now'",
+            "DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -a; set +a; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -o allexport; set +o allexport; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
         ] {
             assert_eq!(
                 tier(cmd),
@@ -3453,6 +3511,10 @@ mod tests {
             "sudo apt-get remove '?nope(x)'",
             "sudo apt-get remove '~nlinux htop'",
             "sudo apt-get remove '?name(linux):amd64'",
+            // The release suffix comes off before the name is read.
+            "sudo apt-get remove linux-image-6.1.0-37-amd64/now",
+            "sudo apt-get remove linux-image-6.1.0-37-amd64:amd64/now",
+            "sudo apt-get remove 'linux-image-6.1.0-3?-amd64/now'",
         ] {
             assert_eq!(assess(&ctx, cmd).tier, Tier::T3, "{cmd}");
         }
@@ -3462,6 +3524,7 @@ mod tests {
         for cmd in [
             "sudo apt-get remove -y linux-image-6.1.0-36-amd64",
             "sudo apt-get remove -y LINUX-IMAGE-6.1.0-36-AMD64",
+            "sudo apt-get remove -y linux-image-6.1.0-36-amd64/now",
             "sudo apt-get remove -y linux-image-6.1.0-37-amd64-dbg",
             "sudo apt-get -o Dpkg::Options::=--force-confold remove -y linux-image-6.1.0-36-amd64",
             "sudo apt-get -t bookworm-backports install linux-image-amd64",
@@ -3671,6 +3734,23 @@ mod tests {
             "sudo apt-get remove '~nlib|~nhtop'",
             "sudo apt-get remove 'lib*'",
             "sudo apt-get remove '?not(~nhtop)'",
+            // apt's version or release suffix comes off first.
+            "sudo apt-get remove libc6/now",
+            "sudo apt-get remove bash/now",
+            "sudo apt-get remove '~nlibc/now'",
+            "sudo apt-get remove 'linux*/now'",
+            "sudo apt-get remove 'LINUX*/now'",
+            "sudo apt-get remove '~nlinux/now'",
+            "sudo apt-get install libc6/stable-",
+            "sudo apt-get remove libc6:amd64/now",
+            // An exported name stays exported; `set -a` exports everything.
+            "export DPKG_FORCE=confold; DPKG_FORCE+=,remove-essential; sudo -E dpkg -r sed",
+            "declare -x DPKG_FORCE=confold; DPKG_FORCE+=,remove-essential; sudo -E dpkg -r sed",
+            "export DPKG_FORCE=confold; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -a; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -o allexport; DPKG_FORCE=remove-essential; sudo -E dpkg -r sed",
+            "set -ex -a; DPKG_FORCE=all; sudo -E dpkg -r tar",
+            "set -eo allexport; DPKG_FORCE=all; sudo -E dpkg -r tar",
             "sudo apt-get remove 'linux*'",
             "sudo apt-get remove '~nlinux'",
             "sudo apt remove '?name(linux)'",

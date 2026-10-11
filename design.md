@@ -504,7 +504,8 @@ trait Distro {
     restarting them on its own; a restart is an action with its own approval and undo.
   - **The floor:** `libc6`, `dpkg`, `apt`, `systemd-sysv`, `grub-*`, `shim-signed`, `initramfs-tools`,
     `linux-image-amd64`, and the rest of the Debian list in `protected_packages`; `install foo-` is a
-    removal; a package argument that isn't a name is read the way apt reads it (`policy/apt_syntax.rs`:
+    removal, and a `/release` or `=version` suffix comes off before the name is read (`libc6/now`);
+    a package argument that isn't a name is read the way apt reads it (`policy/apt_syntax.rs`:
     a case-folded glob, apt's unanchored case-insensitive regex, or an apt pattern parsed with
     apt-patterns(7)'s grammar, a `:arch` suffix split off first) and is the floor when it can take the
     running kernel's image or a protected name (`linux*`, `LINUX*`, `~nlinux~i`, `?not(~nhtop)`,
@@ -513,7 +514,8 @@ trait Distro {
     items they set, with any value apt's `StringToBool` reads as true (`1`, `0x1`, `+1`, `enable`);
     dpkg's `--force-depends`, `--force-all`, `--force-remove-essential` when removing, as a flag, in a
     comma list, in `-o Dpkg::Options::=…`, or in `DPKG_FORCE=` (on the command, `+=`-appended,
-    `export`ed earlier on the line, or through `env`, which is read as getopt_long reads it: clusters,
+    `export`ed earlier on the line including a later bare assignment to an exported name or any
+    assignment under `set -a`, or through `env`, which is read as getopt_long reads it: clusters,
     abbreviated long options, a bare `-`, and `-S` strings env re-reads as its own command line); an
     apt config file Reeve hasn't read (`-c FILE`, `-cFILE`, `APT_CONFIG=`) with a removal. apt's command
     line is read by apt's rules throughout, so `-s 0` and `--no-simulate` are not simulations.
