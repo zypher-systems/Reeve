@@ -75,11 +75,26 @@ fn assess_in(ctx: &PathCtx, command: &str, depth: usize, env: ShellEnv) -> Asses
     if let Some(why) = forced_by_env(&joined.join("\n"), false) {
         a.force_env.get_or_insert(why);
     }
+    // A brace expansion with more words than Reeve follows: whatever stood
+    // in it, a program or an option, can't be checked.
+    if let Some(w) = parsed
+        .segments
+        .iter()
+        .flat_map(|s| s.words.iter())
+        .find(|w| w.starts_with("$BRACE"))
+    {
+        let shown: String = w.chars().skip("$BRACE".len()).take(40).collect();
+        a.raise(
+            Tier::T3,
+            format!(
+                "expands {shown}… into more words than Reeve follows, so what runs can't be checked"
+            ),
+        );
+    }
 
     // Functions defined in this line: their bodies are checked where they're
     // written, so a call to one is not an unknown program.
     let (functions, body_at) = function_bodies(&parsed.segments);
-    let funcs: Vec<&str> = functions.iter().map(|(n, _)| n.as_str()).collect();
     let mut prev: Option<&Segment> = None;
     // What the line has put in the environment so far: later commands on
     // the line run with it (`export DPKG_FORCE=…; sudo -E dpkg -r sed`). A
@@ -115,43 +130,29 @@ fn assess_in(ctx: &PathCtx, command: &str, depth: usize, env: ShellEnv) -> Asses
                 words.splice(k..k + 1, body.iter().cloned());
             }
         }
-        let calls_func = command_words(&words)
-            .and_then(|(_, w)| w.first().cloned())
-            .is_some_and(|p| funcs.contains(&p.as_str()));
-        if calls_func {
+        // A call of a function the line defined before this point, as the
+        // command word or behind a keyword (`if f …`, `{ f …; }`, `time f`).
+        let call_at = call_position(&words);
+        let callee = words
+            .get(call_at)
+            .filter(|n| defined_before(&functions, n, at))
+            .cloned();
+        if let Some(name) = callee {
             // The call's redirects are new, and so is its body run with the
-            // call's arguments in `$@`, `$*`, `$1`…: a body that forwards
-            // them to a command is that command.
+            // call's arguments (`assess_call`).
             let only = Segment {
                 words: Vec::new(),
                 ..seg.clone()
             };
             a.merge(assess_segment(ctx, &only, prev, depth));
-            let (_, call) = command_words(&words).expect("a call has words");
-            let args = &call[1..];
-            let body = functions
-                .iter()
-                .find(|(n, _)| *n == call[0])
-                .map(|(_, b)| b.clone())
-                .unwrap_or_default();
-            for body_words in body {
-                let expanded = with_positionals(&body_words, args);
-                let run = Segment {
-                    words: env
-                        .exported
-                        .iter()
-                        .map(|(n, v)| format!("{n}={v}"))
-                        .chain(expanded.iter().cloned())
-                        .collect(),
-                    depth: seg.depth,
-                    ..Default::default()
-                };
-                a.merge(assess_segment(ctx, &run, prev, depth + 1));
-                env.note(&expanded);
-                if let Some(why) = env.unreadable.take() {
-                    a.force_env.get_or_insert(why);
-                }
-            }
+            let site = CallSite {
+                ctx,
+                functions: &functions,
+                before: at,
+                prev,
+                depth,
+            };
+            assess_call(&site, &name, &words[call_at + 1..], env, &mut a, 0);
         } else {
             let mut with_env = seg.clone();
             with_env.words = env
@@ -729,19 +730,24 @@ fn tokenize(src: &str) -> Result<Parsed, &'static str> {
             }
             '{' | '}' | ',' => {
                 // Unquoted braces and commas may be a brace expansion, which
-                // `end_word!` performs; `${…}` is a parameter, not a brace.
-                let marked = match c {
-                    '{' if word.ends_with('$') => {
+                // `end_word!` performs; inside `${…}` they are the characters.
+                let marked = if param_depth > 0 {
+                    if c == '{' {
                         param_depth += 1;
-                        c
-                    }
-                    '}' if param_depth > 0 => {
+                    } else if c == '}' {
                         param_depth -= 1;
-                        c
                     }
-                    '{' => BRACE_OPEN,
-                    '}' => BRACE_CLOSE,
-                    _ => BRACE_COMMA,
+                    c
+                } else {
+                    match c {
+                        '{' if word.ends_with('$') => {
+                            param_depth = 1;
+                            c
+                        }
+                        '{' => BRACE_OPEN,
+                        '}' => BRACE_CLOSE,
+                        _ => BRACE_COMMA,
+                    }
                 };
                 word.push(marked);
                 in_word = true;
@@ -764,7 +770,7 @@ const BRACE_CLOSE: char = '\u{E001}';
 const BRACE_COMMA: char = '\u{E002}';
 /// How many words one brace expansion may yield before Reeve stops
 /// following it and calls the word unreadable.
-const MAX_BRACE_WORDS: usize = 512;
+const MAX_BRACE_WORDS: usize = 4096;
 
 /// The stand-ins back to the characters they stand for.
 fn unmark(s: &str) -> String {
@@ -877,7 +883,14 @@ fn brace_sequence(inner: &str) -> Option<Vec<String>> {
             if out.len() > MAX_BRACE_WORDS {
                 break;
             }
-            n = if a <= b { n + step } else { n - step };
+            n = match if a <= b {
+                n.checked_add(step)
+            } else {
+                n.checked_sub(step)
+            } {
+                Some(next) => next,
+                None => break,
+            };
             if (a <= b && n > b) || (a > b && n < b) {
                 break;
             }
@@ -898,7 +911,14 @@ fn brace_sequence(inner: &str) -> Option<Vec<String>> {
         if out.len() > MAX_BRACE_WORDS {
             break;
         }
-        n = if a <= b { n + step } else { n - step };
+        n = match if a <= b {
+            n.checked_add(step)
+        } else {
+            n.checked_sub(step)
+        } {
+            Some(next) => next,
+            None => break,
+        };
         if (a <= b && n > b) || (a > b && n < b) {
             break;
         }
@@ -3482,8 +3502,116 @@ fn expand_known(word: &str, vars: &[(String, String)]) -> String {
     out
 }
 
-/// A function the line defines: its name and its body as word lists.
-type Function = (String, Vec<Vec<String>>);
+/// A function the line defines: its name, the segment that defined it, and
+/// its body as word lists.
+type Function = (String, usize, Vec<Vec<String>>);
+
+/// Whether `name` is a function defined before segment `at`; bash runs the
+/// last definition made so far.
+fn defined_before(functions: &[Function], name: &str, at: usize) -> bool {
+    functions.iter().any(|(n, i, _)| n == name && *i < at)
+}
+
+/// Where a segment's command word is: past leading assignments and the
+/// keywords that start a command (`if`, `then`, `{`, `!`, `time`, …).
+fn call_position(words: &[String]) -> usize {
+    let mut at = words.iter().take_while(|w| is_assignment(w)).count();
+    while words.get(at).is_some_and(|w| {
+        matches!(
+            w.as_str(),
+            "if" | "then" | "else" | "elif" | "while" | "until" | "do" | "!" | "{" | "time"
+        )
+    }) {
+        at += 1;
+    }
+    at
+}
+
+/// What a call of a line-defined function runs in.
+struct CallSite<'a> {
+    ctx: &'a PathCtx,
+    functions: &'a [Function],
+    /// The segment the call stands in: only earlier definitions count.
+    before: usize,
+    prev: Option<&'a Segment>,
+    depth: usize,
+}
+
+/// A call: the last body defined for the name before the call, run with
+/// the call's arguments as the positionals (`shift`, `shift N` and
+/// `set -- …` change them for what follows), assessed segment by segment
+/// and noted into the environment. A body segment that calls another
+/// function the line defines is run the same way, a few levels deep; a
+/// function calling itself without end never gets further.
+fn assess_call(
+    site: &CallSite,
+    name: &str,
+    call_args: &[String],
+    env: &mut ShellEnv,
+    a: &mut Assessment,
+    nesting: usize,
+) {
+    if nesting > MAX_DEPTH {
+        return;
+    }
+    let Some((_, _, body)) = site
+        .functions
+        .iter()
+        .rfind(|(n, i, _)| n == name && *i < site.before)
+    else {
+        return;
+    };
+    let mut args: Vec<String> = call_args.to_vec();
+    for body_words in body {
+        let at = call_position(body_words);
+        match body_words.get(at).map(String::as_str) {
+            Some("shift") => {
+                let n = body_words
+                    .get(at + 1)
+                    .and_then(|w| w.parse::<usize>().ok())
+                    .unwrap_or(1);
+                args.drain(..n.min(args.len()));
+                continue;
+            }
+            Some("set") if body_words.get(at + 1).is_some_and(|w| w == "--") => {
+                args = with_positionals(&body_words[at + 2..], &args);
+                continue;
+            }
+            _ => {}
+        }
+        let expanded = with_positionals(body_words, &args);
+        let inner_at = call_position(&expanded);
+        let callee = expanded
+            .get(inner_at)
+            .filter(|n| defined_before(site.functions, n, site.before))
+            .cloned();
+        if let Some(callee) = callee {
+            assess_call(
+                site,
+                &callee,
+                &expanded[inner_at + 1..],
+                env,
+                a,
+                nesting + 1,
+            );
+            continue;
+        }
+        let run = Segment {
+            words: env
+                .exported
+                .iter()
+                .map(|(n, v)| format!("{n}={v}"))
+                .chain(expanded.iter().cloned())
+                .collect(),
+            ..Default::default()
+        };
+        a.merge(assess_segment(site.ctx, &run, site.prev, site.depth + 1));
+        env.note(&expanded);
+        if let Some(why) = env.unreadable.take() {
+            a.force_env.get_or_insert(why);
+        }
+    }
+}
 
 /// The functions a line defines, each with its body as word lists:
 /// `name() { a; b; }`, `name() ( … )`, and `function name { … }`. The body
@@ -3543,7 +3671,7 @@ fn function_bodies(segments: &[Segment]) -> (Vec<Function>, Vec<usize>) {
                 body_at.push(k);
             }
         }
-        out.push((name, body));
+        out.push((name, i, body));
     }
     (out, body_at)
 }
@@ -3572,9 +3700,10 @@ fn strip_positionals(words: &[String]) -> Vec<String> {
 }
 
 /// A function body's words with the call's arguments in place of `$@`,
-/// `$*` (as separate words when they stand alone) and `$1`…`$9`. A
-/// positional the call didn't give stays as written, which reads as an
-/// expansion Reeve can't follow.
+/// `$*` (as separate words when they stand alone), `$1`…`$9` and `${N}`
+/// for every N the call gave (`$10` is `$1` and a `0`, as in bash). A
+/// positional the call didn't give, or any other form (`${1:-x}`), stays
+/// as written, which reads as an expansion Reeve can't follow.
 fn with_positionals(words: &[String], args: &[String]) -> Vec<String> {
     let all = args.join(" ");
     let mut out = Vec::new();
@@ -3584,10 +3713,11 @@ fn with_positionals(words: &[String], args: &[String]) -> Vec<String> {
             continue;
         }
         let mut s = w.clone();
-        for (i, arg) in args.iter().enumerate().take(9) {
-            s = s
-                .replace(&format!("${{{}}}", i + 1), arg)
-                .replace(&format!("${}", i + 1), arg);
+        for (i, arg) in args.iter().enumerate() {
+            s = s.replace(&format!("${{{}}}", i + 1), arg);
+            if i < 9 {
+                s = s.replace(&format!("${}", i + 1), arg);
+            }
         }
         for each in ["${@}", "${*}", "$@", "$*"] {
             s = s.replace(each, &all);
@@ -3746,6 +3876,12 @@ fn assess_apt(ctx: &PathCtx, args: &[String], assigns: &[String], a: &mut Assess
     ) || packages.iter().any(|p| p.ends_with('-'));
     if removes {
         a.removes_packages = true;
+        if let Some(w) = args.iter().find(|w| has_expansion(w)) {
+            a.raise(
+                Tier::T3,
+                format!("removes packages with an argument Reeve can't read ({w})"),
+            );
+        }
     }
     let unseen_config =
         assigns.iter().any(|v| v.starts_with("APT_CONFIG=")) || !line.config_files.is_empty();
@@ -3790,6 +3926,13 @@ fn assess_dpkg(ctx: &PathCtx, args: &[String], assigns: &[String], a: &mut Asses
     let remove = has_flag(args, 'r', "--remove") || has_flag(args, 'P', "--purge");
     if remove {
         a.removes_packages = true;
+        // `--force-${x:-remove-essential}`: an option or a name Reeve can't read.
+        if let Some(w) = args.iter().find(|w| has_expansion(w)) {
+            a.raise(
+                Tier::T3,
+                format!("removes packages with an argument Reeve can't read ({w})"),
+            );
+        }
     }
     let forced = dpkg_force_words(args, assigns);
     let past_essential = forces_past_essential(&forced);
@@ -4368,6 +4511,10 @@ mod tests {
             "echo {a,b} {1..3}; sudo dpkg -r htop",
             "sudo dpkg --force-{confold,confnew} -r htop",
             "rmpkg() { sudo dpkg -r \"$1\"; }; rmpkg htop",
+            "f() { shift; sudo dpkg -r \"$1\"; }; f libc6 htop",
+            "f() { set -- htop; sudo dpkg -r \"$1\"; }; f libc6",
+            "f() { sudo dpkg -r \"$1\"; }; if true; then f htop; fi",
+            "echo {1..20}; sudo dpkg -r htop",
         ] {
             assert_eq!(
                 tier(cmd),
@@ -4382,8 +4529,22 @@ mod tests {
             "confold,".repeat(600)
         );
         assert_eq!(tier(&many), Tier::T3, "{many}");
-        // A body that only echoes its arguments runs nothing else.
+        // A body that only echoes its arguments runs nothing else; the last
+        // definition before the call is the one that runs (the dead first
+        // body is still read where it is written: `dpkg -r`, T2, not libc6).
         assert_eq!(tier("f() { echo \"$@\"; }; f sudo dpkg -r libc6"), Tier::T0);
+        assert_eq!(
+            tier("f() { dpkg -r \"$1\"; }; f() { echo \"$1\"; }; f libc6"),
+            Tier::T2
+        );
+        // A brace Reeve stops expanding is the floor wherever it stands, and
+        // a sequence that can't be counted doesn't panic.
+        let wide = format!(
+            "{{dpkg,--force-remove-essential,-r,sed{}}}",
+            ",x".repeat(4100)
+        );
+        assert_eq!(tier(&wide), Tier::T3);
+        assert_eq!(tier("echo {1..2..9223372036854775807}"), Tier::T0);
         assert!(assess(&PathCtx::for_tests(), "sudo ls").sudo);
     }
 
@@ -4855,6 +5016,22 @@ mod tests {
             "rmpkg() { sudo dpkg -r \"$1\"; }; rmpkg libc6",
             "function f { sudo dpkg -r \"$@\"; }; f libc6",
             "f() ( sudo apt-get remove -y \"$@\" ); f linux-image-6.17.4-200.fc44.x86_64",
+            // Calls as bash runs them: ${10}, nested functions, shift and
+            // set --, the last definition, calls behind keywords, and a
+            // positional form Reeve can't follow.
+            "f() { command dpkg \"${10}\" \"${11}\" \"${12}\"; }; f a b c d e f g h i --force-remove-essential -r sed",
+            "inner() { command dpkg \"$@\"; }; dpkg() { inner \"$@\"; }; dpkg --force-remove-essential -r sed",
+            "f() { shift; dpkg \"$1\" -r sed; }; f dummy --force-remove-essential",
+            "f() { shift; dpkg --force-$1 -r sed; }; f dummy remove-essential",
+            "f() { set -- --force-remove-essential \"$@\"; dpkg \"$@\"; }; f -r sed",
+            "f() { echo \"$1\"; }; f() { dpkg \"$1\" -r sed; }; f --force-remove-essential",
+            "f() { dpkg --force-$1 -r sed; }; if true; then f remove-essential; fi",
+            "f() { dpkg --force-$1 -r sed; }; { f remove-essential; }",
+            "f() { dpkg --force-$1 -r sed; }; time f remove-essential",
+            "f() { dpkg --force-${1:-remove-essential} -r sed; }; f",
+            "f() { dpkg --force-${1:-remove-essential} -r sed; }; f confold",
+            "dpkg --force-${x:-remove-essential} -r sed",
+            "sudo dpkg --force-{${x:-remove-essential,all},confold} -r sed",
             "sudo apt-get remove 'linux*'",
             "sudo apt-get remove '~nlinux'",
             "sudo apt remove '?name(linux)'",

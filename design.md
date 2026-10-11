@@ -536,9 +536,13 @@ trait Distro {
     anything else, as bash does it (`{a,b}`, `{1..9}`, nested; past 512 words the word is unreadable),
     so `DPKG_F{ORCE,}=…`, `--force-{remove-essential,confold}` and `{dpkg,--force-remove-essential,-r,sed}`
     read as the words bash runs. A function defined on the line is read at each call with the call's
-    arguments in `$@`/`$1`…, so `dpkg() { command dpkg "$@"; }; dpkg --force-remove-essential -r sed`
-    is the command it forwards. Over-asking there is by design; the model above only makes the common
-    cases precise.
+    arguments in `$@`/`$1`…/`${N}` (the last definition before the call; `shift` and `set --` move the
+    positionals; a body calling another function the line defines runs it too; a call behind `if`,
+    `{`, `time` counts), so `dpkg() { command dpkg "$@"; }; dpkg --force-remove-essential -r sed` is the
+    command it forwards. Two rules close what the models don't follow: an expansion left in a
+    removal's arguments (`--force-${1:-remove-essential}`) is the floor, and a brace Reeve stopped
+    expanding (more than 4096 words) is the floor wherever it stands. Over-asking there is by design;
+    the model above only makes the common cases precise.
   - **reeved:** a reboot is pending when the newest installed `linux-image-<abi>` isn't `uname -r`, when
     the running kernel's package version no longer matches the build in `/proc/version` (a security
     rebuild under the same name), or when `/var/run/reboot-required` is set. Security updates are the
