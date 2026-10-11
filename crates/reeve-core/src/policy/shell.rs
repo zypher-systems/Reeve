@@ -758,26 +758,68 @@ fn assess_words(
         "env" | "nohup" | "time" | "command" | "exec" | "builtin" | "chronic" | "unbuffer"
         | "stdbuf" | "setsid" => {
             // `env DPKG_FORCE=… dpkg -r sed`: the assignments env sets stay
-            // on the command it runs.
-            let mut rest: Vec<String> = args
-                .iter()
-                .take_while(|w| w.starts_with('-') || is_assignment(w))
-                .filter(|w| is_assignment(w))
-                .cloned()
-                .collect();
-            rest.extend(
-                args.iter()
-                    .skip_while(|w| w.starts_with('-') || is_assignment(w))
-                    .cloned(),
-            );
-            let rest: Vec<String> = rest;
-            if rest.is_empty() {
-                if prog == "command" && args.iter().any(|x| x == "-v" || x == "-V") {
-                    return a;
+            // on the command it runs. An option that takes an argument
+            // (`-u NAME`, `-C DIR`, `-a NAME`) doesn't give it up as the
+            // command, and `-S STRING` is split into the command itself.
+            let mut assigns_here = Vec::new();
+            let mut split: Option<String> = None;
+            let mut i = 0;
+            while i < args.len() {
+                let w = args[i].as_str();
+                if is_assignment(w) {
+                    assigns_here.push(args[i].clone());
+                } else if !w.starts_with('-') {
+                    break;
+                } else if matches!(w, "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0") {
+                    i += 1;
+                } else if matches!(w, "-S" | "--split-string") {
+                    split = args.get(i + 1).cloned();
+                    i += 1;
+                } else if let Some(v) = w
+                    .strip_prefix("--split-string=")
+                    .or_else(|| w.strip_prefix("-S").filter(|v| !v.is_empty()))
+                {
+                    split = Some(v.to_string());
                 }
-                return a;
+                i += 1;
             }
-            look_through(&mut a, &rest, sudo);
+            let rest = &args[i.min(args.len())..];
+            if let Some(line) = split {
+                // What env splits is a command line of its own; the words
+                // after `-S` follow its last command.
+                match tokenize(&line) {
+                    Ok(parsed) => {
+                        for sub in &parsed.substitutions {
+                            a.merge(assess_at(ctx, sub, depth + 1));
+                        }
+                        let n = parsed.segments.len();
+                        for (k, seg) in parsed.segments.iter().enumerate() {
+                            for (target, writes) in &seg.redirects {
+                                if *writes {
+                                    if !is_harmless_sink(target) {
+                                        a.merge(write(ctx, target));
+                                    }
+                                } else {
+                                    a.merge(read(ctx, target));
+                                }
+                            }
+                            let mut words = assigns_here.clone();
+                            words.extend(seg.words.iter().cloned());
+                            if k + 1 == n {
+                                words.extend(rest.iter().cloned());
+                            }
+                            look_through(&mut a, &words, sudo);
+                        }
+                    }
+                    Err(why) => a.raise(Tier::T1, format!("couldn't be parsed ({why})")),
+                }
+            } else if rest.is_empty() {
+                return a;
+            } else {
+                let mut words = assigns_here;
+                words.extend(rest.iter().cloned());
+                look_through(&mut a, &words, sudo);
+            }
         }
         "nice" | "ionice" | "timeout" | "watch" | "flock" => {
             // One option value (`-n 10`) and, for timeout/flock, one positional before the command.
@@ -2369,9 +2411,27 @@ fn apt_removes_essential(args: &[String], assigns: &[String]) -> bool {
     let forced = dpkg_force_words(&dpkg_opts, assigns);
     args.iter().any(|x| {
         let low = x.to_ascii_lowercase();
-        low.contains("allow-remove-essential") || low.contains("force-yes")
+        apt_switch_on(&low, "allow-remove-essential") || apt_switch_on(&low, "force-yes")
     }) || forces_past_essential(&forced)
         || forces_past_depends(&forced)
+}
+
+/// Whether a lower-cased argument turns an apt switch on: the long flag
+/// itself (`--force-yes`), or a config item with an affirmative value
+/// (`-o APT::Get::force-yes=true`, `--allow-remove-essential=yes`). Not
+/// `--no-force-yes`, not `=false`, and not a package that happens to be
+/// named like the flag.
+fn apt_switch_on(low: &str, key: &str) -> bool {
+    if low == format!("--{key}") {
+        return true;
+    }
+    low.split(key).skip(1).any(|after| {
+        after.strip_prefix('=').is_some_and(|v| {
+            let v = v.trim_start_matches(['"', '\'']);
+            let v = v.split([' ', ',', '"', '\'']).next().unwrap_or("");
+            matches!(v, "true" | "yes" | "1" | "on")
+        })
+    })
 }
 
 /// apt-get, apt, aptitude: queries and simulations (`-s`) are reads;
@@ -2572,16 +2632,18 @@ fn protected_packages(ctx: &PathCtx, pkgs: &[&str], a: &mut Assessment) {
         // `libc6:amd64`, `htop=3.2.2-2`: the name is what's before.
         let raw = p.trim();
         let name = raw.split_once(['=', ':']).map_or(raw, |(n, _)| n);
-        // A pattern over kernel packages (`kernel*`, `linux-image-6.1*`,
-        // `linux-image-*-amd64`): the package manager expands it, and the
+        // A pattern over kernel packages (a glob `linux-image-6.1*`, apt's
+        // regex `^linux-image-.*`, an apt pattern `~n^linux-image-` or
+        // `?name(^linux-image-)`), or one broad enough to take them (`~i`,
+        // everything installed): the package manager expands it, and the
         // running kernel can be in it.
-        let kernel_glob = (name.starts_with("kernel") || name.starts_with("linux-image"))
-            && name.contains(['*', '?', '[']);
-        if kernel_glob {
+        let marker = raw.contains(['*', '?', '[', '^', '~', '$']);
+        let about_kernels = raw.contains("kernel") || raw.contains("linux-image");
+        if marker && about_kernels || broad_apt_pattern(raw) {
             a.raise(
                 Tier::T3,
                 format!(
-                    "removes kernel packages by pattern ({raw}), which can include the running one"
+                    "removes packages by a pattern ({raw}) that can include the running kernel"
                 ),
             );
         } else if PROTECTED.contains(&name) {
@@ -2590,11 +2652,46 @@ fn protected_packages(ctx: &PathCtx, pkgs: &[&str], a: &mut Assessment) {
                 format!("removes {name}, which the system can't run without"),
             );
         } else if !ctx.kernel.is_empty()
-            && (name.starts_with("kernel") || name.starts_with("linux-image-"))
-            && name.contains(&ctx.kernel)
+            && (name.starts_with("kernel") && name.contains(&ctx.kernel)
+                || deb_kernel_image(name) == Some(ctx.kernel.as_str()))
         {
             a.raise(Tier::T3, "removes the running kernel");
         }
+    }
+}
+
+/// The ABI a Debian kernel image package boots: `linux-image-6.1.0-37-amd64`
+/// (or its `-unsigned` build) → `6.1.0-37-amd64`. Debug symbols (`-dbg`,
+/// `-dbgsym`) and the metapackage aren't an image.
+fn deb_kernel_image(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("linux-image-")?;
+    if !rest.starts_with(|c: char| c.is_ascii_digit())
+        || rest.ends_with("-dbg")
+        || rest.ends_with("-dbgsym")
+    {
+        return None;
+    }
+    Some(rest.strip_suffix("-unsigned").unwrap_or(rest))
+}
+
+/// apt patterns that select by state rather than name, which take
+/// kernels along: `~i`/`?installed`, `~E`/`?essential`, `~T`/`?true`,
+/// `~U`/`?upgradable`, `~b`/`?broken`. `~nfoo` and `?name(foo)` are by name.
+fn broad_apt_pattern(raw: &str) -> bool {
+    let Some(rest) = raw.strip_prefix(['~', '?']) else {
+        return false;
+    };
+    let word: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    if raw.starts_with('~') {
+        word.len() == 1 && matches!(word.as_str(), "i" | "E" | "T" | "U" | "b")
+    } else {
+        matches!(
+            word.as_str(),
+            "installed" | "essential" | "true" | "upgradable" | "broken"
+        )
     }
 }
 
@@ -2825,6 +2922,9 @@ mod tests {
             "update-alternatives --display editor",
             "update-alternatives --query editor --quiet",
             "unattended-upgrade --dry-run",
+            "env -u LANG printenv",
+            "env -C /tmp ls",
+            "env -S 'ls -la /etc'",
         ] {
             assert_eq!(
                 tier(cmd),
@@ -2896,6 +2996,14 @@ mod tests {
             "sudo DPKG_FORCE=confold apt-get install -y htop",
             "sudo env DPKG_FORCE=confold dpkg -r htop",
             "env FOO=bar sudo dpkg -r htop",
+            "sudo env -u LANG dpkg -r htop",
+            "sudo env -S 'dpkg -r htop'",
+            "apt-get remove force-yes",
+            "sudo apt-get install -y allow-remove-essential",
+            "sudo apt-get --no-allow-remove-essential remove htop",
+            "sudo apt-get -o APT::Get::force-yes=false remove htop",
+            "sudo apt-get remove '?name(^htop$)'",
+            "sudo apt-get remove '~nhtop'",
         ] {
             assert_eq!(
                 tier(cmd),
@@ -2965,9 +3073,11 @@ mod tests {
         ] {
             assert_eq!(assess(&ctx, cmd).tier, Tier::T3, "{cmd}");
         }
-        // Another kernel can go; `-o`'s value isn't a package.
+        // Another kernel can go, and so can the running one's debug
+        // symbols; `-o`'s value isn't a package.
         for cmd in [
             "sudo apt-get remove -y linux-image-6.1.0-36-amd64",
+            "sudo apt-get remove -y linux-image-6.1.0-37-amd64-dbg",
             "sudo apt-get -o Dpkg::Options::=--force-confold remove -y linux-image-6.1.0-36-amd64",
             "sudo apt-get -t bookworm-backports install linux-image-amd64",
         ] {
@@ -3053,6 +3163,16 @@ mod tests {
             "env DPKG_FORCE=remove-essential,depends dpkg -r sed",
             "sudo env DPKG_FORCE=remove-essential,depends dpkg -r sed",
             "sudo env -i DPKG_FORCE=all dpkg --purge gzip",
+            "sudo env -u LANG DPKG_FORCE=remove-essential,depends dpkg -r sed",
+            "sudo env -C /tmp DPKG_FORCE=remove-essential dpkg -r perl-base",
+            "env -S 'DPKG_FORCE=remove-essential,depends dpkg -r sed'",
+            "sudo env --split-string='DPKG_FORCE=all dpkg -r gzip'",
+            "sudo env -S 'DPKG_FORCE=all dpkg' -r tar",
+            "sudo apt-get remove '^linux-image-.*'",
+            "sudo apt-get remove '~n^linux-image-'",
+            "sudo apt remove '?name(^linux-image-)'",
+            "sudo apt-get remove -y '~i'",
+            "sudo apt-get purge '?installed'",
             "sudo apt-get -o APT::Get::allow-remove-essential=true remove sed",
             "sudo apt-get --option=apt::get::force-yes=true remove grep",
             "sudo apt-get -o Dpkg::Options::=--force-remove-essential remove tar",
