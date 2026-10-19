@@ -457,7 +457,9 @@ impl ReceiptBook {
     }
 }
 
-/// The last non-empty line of a file, read from the end.
+/// The last non-empty line of a file, read from the end. The tail is read
+/// as bytes: where it starts can fall inside a character, and only the line
+/// after the last newline, which starts on a character, is decoded.
 fn last_line(path: &Path) -> Result<Option<String>> {
     let mut f = match fs::File::open(path) {
         Ok(f) => f,
@@ -469,16 +471,29 @@ fn last_line(path: &Path) -> Result<Option<String>> {
     loop {
         let start = len.saturating_sub(take);
         f.seek(SeekFrom::Start(start))?;
-        let mut buf = String::new();
-        f.read_to_string(&mut buf)?;
-        let trimmed = buf.trim_end();
-        if let Some(i) = trimmed.rfind('\n') {
-            return Ok(Some(trimmed[i + 1..].to_string()));
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        let end = buf.len()
+            - buf
+                .iter()
+                .rev()
+                .take_while(|b| b.is_ascii_whitespace())
+                .count();
+        let trimmed = &buf[..end];
+        let line = match trimmed.iter().rposition(|&b| b == b'\n') {
+            Some(i) => &trimmed[i + 1..],
+            None if start == 0 => trimmed,
+            None => {
+                take *= 4;
+                continue;
+            }
+        };
+        if line.is_empty() {
+            return Ok(None);
         }
-        if start == 0 {
-            return Ok((!trimmed.is_empty()).then(|| trimmed.to_string()));
-        }
-        take *= 4;
+        return String::from_utf8(line.to_vec())
+            .map(Some)
+            .map_err(|e| Error::Io(format!("{}: last line: {e}", path.display())));
     }
 }
 
@@ -602,5 +617,62 @@ mod tests {
             .collect();
         fs::write(&file, format!("{}\n{}\n", text[0], text[2])).unwrap();
         assert!(b.verify().problem.unwrap().contains("missing"));
+    }
+
+    /// Whether the newest 64 KiB of `file` starts inside a character.
+    fn tail_splits_a_character(file: &Path) -> bool {
+        let bytes = fs::read(file).unwrap();
+        bytes.len() > 64 * 1024 && bytes[bytes.len() - 64 * 1024] & 0xC0 == 0x80
+    }
+
+    #[test]
+    fn the_last_line_reads_when_the_tail_starts_inside_a_character() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("2026-10.jsonl");
+        // "a\n", then em dashes (3 bytes each), then the last line.
+        fs::write(
+            &file,
+            format!("a\n{}\nlast: \u{2014}\n", "\u{2014}".repeat(30_000)),
+        )
+        .unwrap();
+        assert!(tail_splits_a_character(&file));
+        assert_eq!(last_line(&file).unwrap().as_deref(), Some("last: \u{2014}"));
+
+        fs::write(&file, "\u{2014}".repeat(30_000)).unwrap();
+        assert!(tail_splits_a_character(&file));
+        assert_eq!(last_line(&file).unwrap(), Some("\u{2014}".repeat(30_000)));
+
+        fs::write(&file, "\n\n").unwrap();
+        assert_eq!(last_line(&file).unwrap(), None);
+    }
+
+    #[test]
+    fn receipts_keep_appending_when_the_tail_starts_inside_a_character() {
+        let (_d, b) = book();
+        let mut split = false;
+        for i in 0..5_000 {
+            let mut r = Receipt::draft(
+                "s",
+                "shell",
+                json!({"command": format!("echo {i} \u{2014} {}", "\u{2014}".repeat(i % 7))}),
+                Tier::T0,
+            );
+            r.approved_by = "policy".into();
+            b.append(r).unwrap();
+            if tail_splits_a_character(&b.months().pop().unwrap()) {
+                split = true;
+                break;
+            }
+        }
+        assert!(split, "no append left the tail inside a character");
+        let seq = b.head().unwrap().unwrap().seq;
+        let r = b.append(Receipt::draft(
+            "s",
+            "fs_read",
+            json!({"path": "/etc/f"}),
+            Tier::T0,
+        ));
+        assert_eq!(r.unwrap().seq, seq + 1);
+        assert!(b.verify().problem.is_none());
     }
 }
