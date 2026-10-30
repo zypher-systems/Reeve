@@ -32,6 +32,7 @@ bytes = "1"
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 rustix = { version = "1", features = ["fs", "process"] }
+zeroize = "1"
 sha2 = "0.10"
 regex = "1"
 walkdir = "2"

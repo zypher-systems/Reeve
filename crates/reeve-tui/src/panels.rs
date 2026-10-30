@@ -966,6 +966,14 @@ fn observer(f: &mut Frame, r: Rect, p: &crate::overlay::ObserverPanel, t: &Theme
     f.render_widget(Paragraph::new(lines), r);
 }
 
+fn minutes_text(n: u64) -> String {
+    if n == 1 {
+        "1 minute".into()
+    } else {
+        format!("{n} minutes")
+    }
+}
+
 fn password(f: &mut Frame, r: Rect, p: &crate::overlay::PasswordEntry, t: &Theme) {
     let n = p.secret.chars().count();
     let dots: String = "•".repeat(n.min(r.width.saturating_sub(12) as usize));
@@ -995,19 +1003,33 @@ fn password(f: &mut Frame, r: Rect, p: &crate::overlay::PasswordEntry, t: &Theme
             ),
         ]),
         Line::raw(""),
-        Line::from(vec![
-            Span::styled(format!("{check} "), Style::default().fg(t.teal)),
-            Span::styled(
-                "remember for 5 minutes (in memory only, gone when Reeve quits)",
+        if p.minutes > 0 {
+            Line::from(vec![
+                Span::styled(format!("{check} "), Style::default().fg(t.teal)),
+                Span::styled(
+                    format!(
+                        "remember for {} (in memory only, gone when Reeve quits)",
+                        minutes_text(p.minutes)
+                    ),
+                    t.muted(),
+                ),
+            ])
+        } else {
+            Line::from(Span::styled(
+                "asked for every root step (password_minutes = 0 in the config)",
                 t.muted(),
-            ),
-        ]),
+            ))
+        },
         Line::from(Span::styled(
             "It goes to sudo only: never to the model, a log, or a receipt.",
             t.ghost(),
         )),
         Line::raw(""),
-        hints(&[("⏎", "send"), ("tab", "remember"), ("esc", "refuse")], t),
+        if p.minutes > 0 {
+            hints(&[("⏎", "send"), ("tab", "remember"), ("esc", "refuse")], t)
+        } else {
+            hints(&[("⏎", "send"), ("esc", "refuse")], t)
+        },
     ];
     f.render_widget(Paragraph::new(lines), r);
     let col = 3 + dots.width() as u16;

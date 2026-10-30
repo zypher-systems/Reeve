@@ -26,6 +26,7 @@ regex.workspace = true
 walkdir.workspace = true
 similar.workspace = true
 rustix.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

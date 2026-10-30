@@ -133,7 +133,7 @@ impl Default for SpendConfig {
 }
 
 /// `[approvals]`.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ApprovalConfig {
     /// Start every session in YOLO mode (auto-approve T0–T2). The safeguard
@@ -143,6 +143,20 @@ pub struct ApprovalConfig {
     /// deletes it keeps a copy of) without asking. Changes it can't undo,
     /// system changes, and the floor still ask. Off by default.
     pub undoable: bool,
+    /// How long a typed sudo password answers the root steps that follow,
+    /// in minutes (sudo's own default is 5). It stays in memory only and
+    /// goes when Reeve quits; 0 asks for every step.
+    pub password_minutes: u64,
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            yolo: false,
+            undoable: false,
+            password_minutes: 5,
+        }
+    }
 }
 
 /// `[snapshots]`.

@@ -199,11 +199,15 @@ Reads that would send secrets to a model provider are T3: `~/.ssh/id_*`, `~/.gnu
 
 ### 5.6 Root: `sudo -A`
 
-Reeve always runs as you. A root action runs `sudo -A` with `SUDO_ASKPASS=reeve askpass`.
+Reeve always runs as you. A root action runs `sudo -A` with `SUDO_ASKPASS=reeve-askpass`.
 The askpass helper connects to the running TUI over a private socket
 (`$XDG_RUNTIME_DIR/reeve/askpass-<pid>.sock`, 0600), and the TUI shows a masked password modal.
-The password is never sent to the model, never logged, and never kept after sudo reads it.
-sudo's own timestamp cache applies as usual.
+The password is never sent to the model and never logged. sudo's own timestamp cache is no help
+(commands run with no terminal, so it is keyed on each command's own shell), so Reeve remembers
+the typed password in memory for `[approvals] password_minutes` (5 by default, 0 never) and
+answers each new sudo with it; the helper names the sudo asking, and the same one asking twice
+means it was refused, so the modal comes back. `tab` in the modal keeps that one password out
+of memory.
 
 `reeved` has no terminal and no password. A standing order that needs root works only if you
 install the narrow sudoers drop-in that `reeve orders sudoers <order>` prints. The drop-in lists

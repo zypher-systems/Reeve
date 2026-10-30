@@ -95,8 +95,10 @@ The approval card shows when a step is part of a verified change, and whether th
 ## Root
 
 When an approved action needs root, Reeve asks for your password in a masked panel. The password goes to
-sudo and nowhere else: not to the model, a log, or a receipt. You can let Reeve remember it in memory for
-5 minutes (`tab` in the panel). The prompt only works while an approved root action is running.
+sudo and nowhere else: not to the model, a log, or a receipt. Reeve remembers it in memory for 5 minutes
+after its last use, like sudo would in a terminal, so the root steps that follow don't ask again
+(`password_minutes` under `[approvals]` changes that; `tab` in the panel keeps one password out of memory).
+The prompt only works while an approved root action is running.
 
 - Root-owned files are changed in place by `sudo reeve root`, so owner, mode, and SELinux label are kept.
   Undo copies go to `/var/lib/reeve/undo` (root-only). Edits to `/etc/sudoers*` and `/etc/fstab` must pass

@@ -2,6 +2,22 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-10-29: The remembered password answers every new sudo; only the same sudo asking twice means it was wrong
+- **Decision:**
+  - The remembered password moves from the TUI into `Askpass` (`reeve-core/src/sudo.rs`). It answers any sudo that hasn't asked yet, for `[approvals] password_minutes` (default 5, like sudo; 0 never remembers), and like sudo's own cache the clock restarts on each use. It is held in a `Zeroizing<String>` and wiped when dropped or replaced.
+  - The askpass helper sends the pid of its parent, which is the sudo that ran it. The same (run, pid) asking a second time means sudo refused what it got: the memory is dropped and the person is asked. A different pid, or the same pid in a later run, is simply the next root step.
+  - The panel is only for a password Reeve doesn't have; `tab` still says "don't remember this one". With `password_minutes = 0` the panel says so and `tab` does nothing.
+- **Chosen vs rejected:**
+  - Replaced the 15-second rule ("asked again within 15 s of a remembered answer: it was wrong"). It could not tell a refusal from the next sudo, and the next sudo is the common case: a snapper pre-snapshot, the action, and the post-snapshot are three sudos within seconds, each in its own shell, and a request's root steps follow each other the same way. The memory was thrown away every other step, so a patch install asked for the password many times in a row.
+  - Rejected reading sudo's "Sorry, try again" from stderr: translated, and the earlier pacman work already ruled out reading sudo's text.
+  - Rejected sudo's own timestamp cache once more. Running commands in Reeve's own terminal session would make it work, but the whole point of `setsid` is that nothing a command runs can reach the TUI's terminal. A private pty behind a long-lived runner process would keep that and still share one session with sudo; it is the right design if the in-memory password ever has to go, and a much bigger change.
+- **Why:** The owner typed the password five to fifteen times for one request, "which makes no sense because if I type it once it should allow sudo commands for the next 5 minutes".
+- **Where:** `reeve-core/src/sudo.rs` (`answer`, `Ask.caller`, `helper_main`), `reeve-core/src/config.rs` (`password_minutes`), `reeve-tui/src/run.rs` (`password_asked`), `reeve-tui/src/panels.rs`, `reeve-cli/tests/askpass.rs` (the built binary as the helper, against a sudo stand-in)
+- **Residual risk:**
+  - A wrong remembered password reaches sudo once per sudo process before the person is asked, so at most one failed attempt per root step and a corrected one right after; `pam_faillock` counts that one.
+  - A command whose sudo processes change pid between tries (none known) would be answered from memory again.
+  - The password lives in process memory for `password_minutes` after its last use, which a busy session keeps extending.
+
 ### 2026-10-10: Debian (M7): apt-get through the same tools, undo from dpkg's log in one simulated-first transaction
 - **Decision:**
   - `Distro::Debian { id }` for `ID=debian` or an `ID_LIKE` naming debian or ubuntu (Ubuntu, Mint, Raspberry Pi OS…). The `pkg_*` tools speak `apt-get`, `apt-cache`, `apt-mark`, and `dpkg-query`; `apt` (the friendly front end) only for `list --upgradable`.
