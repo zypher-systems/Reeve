@@ -16,6 +16,7 @@ toml_edit.workspace = true
 dirs.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
+url.workspace = true
 futures-util.workspace = true
 async-trait.workspace = true
 bytes.workspace = true

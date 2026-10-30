@@ -91,35 +91,34 @@ impl ConnectionConfig {
 
     /// The host of a `local` connection that isn't this machine. "Local"
     /// turns masking off and counts the calls as free, so it has to be true.
+    /// The URL is read by the parser the client dials with (the `url`
+    /// crate, WHATWG), so the host checked is the host called: a hand
+    /// split of the authority disagrees with it on `#`, `?` and `\` before
+    /// an `@`, and on `127.1`, `0x7f000001` or `LOCALHOST`.
     pub fn local_url_problem(&self) -> Option<String> {
         if !self.is_local() {
             return None;
         }
-        let rest = self
-            .base_url
-            .split_once("://")
-            .map_or(self.base_url.as_str(), |(_, r)| r);
-        let hostport = rest.split('/').next().unwrap_or("");
-        let hostport = hostport.rsplit_once('@').map_or(hostport, |(_, h)| h);
-        let host = match hostport.strip_prefix('[') {
-            Some(v6) => v6.split(']').next().unwrap_or(""),
-            None => hostport.rsplit_once(':').map_or(hostport, |(h, _)| h),
+        let parsed = match url::Url::parse(&self.base_url) {
+            Ok(u) => u,
+            Err(e) => return Some(format!("nothing Reeve can read as a URL ({e})")),
         };
-        // A name is local by name only; an address only if it parses as one
-        // of this machine's. `127.evil.com` is neither.
-        let this_machine = |ip: std::net::IpAddr| match ip {
-            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
-            std::net::IpAddr::V6(v6) => {
+        // A name is local by name only; an address only if it is one of
+        // this machine's. `127.evil.com` is neither.
+        let local = match parsed.host() {
+            Some(url::Host::Domain(d)) => d == "localhost" || d.ends_with(".localhost"),
+            Some(url::Host::Ipv4(v4)) => v4.is_loopback() || v4.is_unspecified(),
+            Some(url::Host::Ipv6(v6)) => {
                 v6.is_loopback()
                     || v6.is_unspecified()
                     || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
             }
+            None => false,
         };
-        let local = host.is_empty()
-            || host == "localhost"
-            || host.ends_with(".localhost")
-            || host.parse::<std::net::IpAddr>().is_ok_and(this_machine);
-        (!local).then(|| host.to_string())
+        (!local).then(|| match parsed.host() {
+            Some(h) => h.to_string(),
+            None => format!("no host ({})", self.base_url),
+        })
     }
 }
 
@@ -673,18 +672,37 @@ mod tests {
             "http://127.1.2.3:8080/v1",
             "http://[::ffff:127.0.0.1]:8080/v1",
             "http://0.0.0.0:8080/v1",
+            // Spellings the client resolves to loopback.
+            "http://127.1:8080/v1",
+            "http://127.0.1:8080/v1",
+            "http://2130706433/v1",
+            "http://0x7f000001/v1",
+            "http://LOCALHOST:11434/v1",
         ] {
             assert_eq!(conn("local", url).local_url_problem(), None, "{url}");
         }
         for (url, host) in [
             ("http://127.evil.com/v1", "127.evil.com"),
             ("http://127.0.0.1.example.com/v1", "127.0.0.1.example.com"),
-            ("http://[fe80::1]:8080/v1", "fe80::1"),
+            ("http://[fe80::1]:8080/v1", "[fe80::1]"),
+            // The `@` is in the fragment, the query, or the path: the
+            // client dials evil.com.
+            ("http://evil.com#@127.0.0.1/v1", "evil.com"),
+            ("http://evil.com?@127.0.0.1/v1", "evil.com"),
+            ("http://evil.com\\@127.0.0.1/v1", "evil.com"),
         ] {
             assert_eq!(
                 conn("local", url).local_url_problem(),
                 Some(host.into()),
-                "{url}: a name that starts like an address isn't one"
+                "{url}: the host checked is the host dialed"
+            );
+        }
+        for url in ["localhost:11434/v1", "not a url"] {
+            let p = conn("local", url).local_url_problem();
+            assert!(
+                p.as_deref()
+                    .is_some_and(|p| p.starts_with("no host") || p.starts_with("nothing")),
+                "{url}: {p:?}"
             );
         }
         assert_eq!(
