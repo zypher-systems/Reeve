@@ -357,8 +357,32 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> 
         return Err(e.into());
     }
     if let Some(m) = mode {
-        // The open above was masked by the umask; this is the exact mode.
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(m & 0o7777))?;
+        // The open above was masked by the umask; this is the exact mode,
+        // set on the open file, not on a name that could have been swapped.
+        if let Err(e) = f.set_permissions(fs::Permissions::from_mode(m & 0o7777)) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+    }
+    // In a directory others can write to, the name may no longer be this
+    // file. Only this file is put in place.
+    let same = (|| {
+        use std::os::unix::fs::MetadataExt;
+        let (ours, named) = (f.metadata()?, fs::symlink_metadata(&tmp)?);
+        Ok::<_, std::io::Error>(ours.dev() == named.dev() && ours.ino() == named.ino())
+    })();
+    match same {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(Error::Io(format!(
+                "{} was swapped while being written; nothing was put in place",
+                tmp.display()
+            )));
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
     }
     fs::rename(&tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);

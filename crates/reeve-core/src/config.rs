@@ -105,12 +105,20 @@ impl ConnectionConfig {
             Some(v6) => v6.split(']').next().unwrap_or(""),
             None => hostport.rsplit_once(':').map_or(hostport, |(h, _)| h),
         };
+        // A name is local by name only; an address only if it parses as one
+        // of this machine's. `127.evil.com` is neither.
+        let this_machine = |ip: std::net::IpAddr| match ip {
+            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
+        };
         let local = host.is_empty()
             || host == "localhost"
             || host.ends_with(".localhost")
-            || host.starts_with("127.")
-            || host == "::1"
-            || host == "0.0.0.0";
+            || host.parse::<std::net::IpAddr>().is_ok_and(this_machine);
         (!local).then(|| host.to_string())
     }
 }
@@ -662,8 +670,22 @@ mod tests {
             "http://[::1]:8080/v1",
             "http://user:pw@localhost/v1",
             "http://llm.localhost/v1",
+            "http://127.1.2.3:8080/v1",
+            "http://[::ffff:127.0.0.1]:8080/v1",
+            "http://0.0.0.0:8080/v1",
         ] {
             assert_eq!(conn("local", url).local_url_problem(), None, "{url}");
+        }
+        for (url, host) in [
+            ("http://127.evil.com/v1", "127.evil.com"),
+            ("http://127.0.0.1.example.com/v1", "127.0.0.1.example.com"),
+            ("http://[fe80::1]:8080/v1", "fe80::1"),
+        ] {
+            assert_eq!(
+                conn("local", url).local_url_problem(),
+                Some(host.into()),
+                "{url}: a name that starts like an address isn't one"
+            );
         }
         assert_eq!(
             conn("local", "https://api.example.com/v1").local_url_problem(),

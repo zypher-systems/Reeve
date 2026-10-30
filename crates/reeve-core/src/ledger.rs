@@ -53,8 +53,11 @@ pub fn record(home: &Path, rec: &SpendRecord) -> Result<()> {
 }
 
 /// Append one JSON line, creating parent directories. The file is the
-/// owner's alone (0600). A torn last line (a crash mid-write) gets its
-/// newline first, so the new record never glues onto it.
+/// owner's alone (0600), and the append holds a lock on it. A last line
+/// left without its newline by a crash mid-write is dealt with first, so
+/// the new record never glues onto it and no line is left that can't be
+/// read: a whole record that only lacks its newline gets it; a fragment
+/// that isn't whole is dropped, since nothing could ever have counted it.
 pub fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::OpenOptionsExt;
@@ -69,16 +72,52 @@ pub fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .append(true)
         .mode(0o600)
         .open(path)?;
+    // The TUI and reeved may append at once; one repairs the tail at a
+    // time. The lock goes when the file is closed.
+    rustix::fs::flock(&f, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(|e| crate::Error::Io(format!("{}: lock: {e}", path.display())))?;
     let len = f.metadata()?.len();
     if len > 0 {
         let mut last = [0u8; 1];
         f.seek(SeekFrom::Start(len - 1))?;
         f.read_exact(&mut last)?;
         if last[0] != b'\n' {
-            f.write_all(b"\n")?;
+            seal_torn_tail(&mut f, len)?;
         }
     }
     f.write_all(line.as_bytes())?;
+    Ok(())
+}
+
+/// The file ends mid-line. Find where that line starts, then either finish
+/// it with its newline (it is whole JSON) or cut it off (a fragment no
+/// reader could parse), so sealing it never makes a record that can't be
+/// read.
+fn seal_torn_tail(f: &mut fs::File, len: u64) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    const CHUNK: u64 = 4096;
+    let mut end = len;
+    let start = loop {
+        let from = end.saturating_sub(CHUNK);
+        let mut buf = vec![0u8; (end - from) as usize];
+        f.seek(SeekFrom::Start(from))?;
+        f.read_exact(&mut buf)?;
+        if let Some(i) = buf.iter().rposition(|&b| b == b'\n') {
+            break from + i as u64 + 1;
+        }
+        if from == 0 {
+            break 0;
+        }
+        end = from;
+    };
+    let mut tail = vec![0u8; (len - start) as usize];
+    f.seek(SeekFrom::Start(start))?;
+    f.read_exact(&mut tail)?;
+    if serde_json::from_slice::<serde::de::IgnoredAny>(&tail).is_ok() {
+        f.write_all(b"\n")?;
+    } else {
+        f.set_len(start)?;
+    }
     Ok(())
 }
 
@@ -309,16 +348,27 @@ mod tests {
         assert!(!t.unreadable, "{t:?}");
         record_at(home.path(), &priced(0.25));
         let t = totals(home.path(), now);
+        assert!(
+            !t.unreadable,
+            "the fragment was cut off, not sealed in: {t:?}"
+        );
         assert!((t.month.usd - 0.75).abs() < 1e-9, "{t:?}");
+        assert!(!fs::read_to_string(&path).unwrap().contains("2026-\n"));
+        // A whole record that only lost its newline is kept and counted.
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(serde_json::to_string(&priced(0.1)).unwrap().as_bytes())
+            .unwrap();
+        drop(f);
+        record_at(home.path(), &priced(0.05));
+        let t = totals(home.path(), now);
+        assert!(!t.unreadable, "{t:?}");
+        assert!((t.month.usd - 0.9).abs() < 1e-9, "{t:?}");
         // A record in the middle that doesn't parse is another matter.
         let text = fs::read_to_string(&path).unwrap();
-        fs::write(&path, text.replace("{\"ts\":\"2026-\n", "not json\n")).unwrap();
+        fs::write(&path, text.replacen('\n', "\nnot json\n", 1)).unwrap();
         let t = totals(home.path(), now);
         assert!(t.unreadable && t.month.partial, "{t:?}");
-        assert!(
-            (t.month.usd - 0.75).abs() < 1e-9,
-            "what parses still counts"
-        );
+        assert!((t.month.usd - 0.9).abs() < 1e-9, "what parses still counts");
     }
 
     fn record_at(home: &Path, rec: &SpendRecord) {

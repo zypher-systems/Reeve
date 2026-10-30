@@ -429,9 +429,6 @@ impl Observer {
             }
             let run = crate::orders::run(&home, &cfg, &order, cause, &profile).await;
             let orders = Orders::new(&home);
-            // A state that stopped parsing while the run was on isn't
-            // overwritten with a fresh one; the tick reports it.
-            let mut states = orders.states_checked().unwrap_or_default();
             let summary_line = run
                 .summary
                 .lines()
@@ -440,8 +437,20 @@ impl Observer {
                 .to_string();
             let status = run.status.clone();
             let receipts = run.receipts.len();
-            states.entry(order.id.clone()).or_default().push(run);
-            let _ = orders.save_states(&states);
+            // A state that stopped parsing while the run was on isn't
+            // replaced with one that remembers only this run: the file
+            // stays as it is, the tick reports it, and this run is known
+            // by its receipts alone.
+            match orders.states_checked() {
+                Ok(mut states) => {
+                    states.entry(order.id.clone()).or_default().push(run);
+                    let _ = orders.save_states(&states);
+                }
+                Err(e) => eprintln!(
+                    "reeved: orders: {e}; the run of \"{}\" ({status}) isn't in its history",
+                    order.name
+                ),
+            }
             // A blocked run left a proposal: that's worth a popup. A finished
             // or failed one only if the order asks for it.
             let proposal = status == "blocked" || status == "rolled_back";

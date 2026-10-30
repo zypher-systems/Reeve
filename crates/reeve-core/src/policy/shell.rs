@@ -1804,7 +1804,8 @@ fn assess_words(
             } else {
                 a.raise(Tier::T1, "runs a program whose contents weren't checked");
             }
-            names_reeve_state(ctx, &args[1..], &mut a);
+            names_reeve_state(ctx, args, &mut a);
+            reads(ctx, args, &mut a);
             if prog == "perl"
                 && args
                     .iter()
@@ -3286,17 +3287,6 @@ fn dpkg_force_words(args: &[String], assigns: &[String]) -> Vec<String> {
     out
 }
 
-/// The variables dpkg and apt take force options from: `DPKG_FORCE` (dpkg's
-/// force list, which apt passes on to dpkg) and `APT_CONFIG` (a config
-/// file apt reads first). What a line does to them is read from the text
-/// of the whole line, not from a model of bash: an assignment anywhere
-/// (`NAME=…`, `NAME+=…`, `${NAME:=…}`), in any scope, exported or not,
-/// counts, and so does any builtin that sets a name it is given
-/// (`printf -v`, `read`, `for`, `declare -n`). A literal value is read as
-/// the comma list it is; a value with `$` in it, or a route whose value
-/// Reeve can't see, can't be read. Only `export NAME`, `declare -x NAME`,
-/// `unset NAME`, `export -n NAME`, `env -u NAME`, and plain reads
-/// (`$NAME`, `${NAME:-x}`) are nothing. Returns why the floor applies.
 /// A program Reeve can't read names Reeve's own state. A spelled-out path
 /// to its keys is refused: no tool may read them. Its receipts and undo
 /// store may not be written, and inside a program a read can't be told from
@@ -3342,6 +3332,17 @@ fn names_reeve_state(ctx: &PathCtx, words: &[String], a: &mut Assessment) {
     }
 }
 
+/// The variables dpkg and apt take force options from: `DPKG_FORCE` (dpkg's
+/// force list, which apt passes on to dpkg) and `APT_CONFIG` (a config
+/// file apt reads first). What a line does to them is read from the text
+/// of the whole line, not from a model of bash: an assignment anywhere
+/// (`NAME=…`, `NAME+=…`, `${NAME:=…}`), in any scope, exported or not,
+/// counts, and so does any builtin that sets a name it is given
+/// (`printf -v`, `read`, `for`, `declare -n`). A literal value is read as
+/// the comma list it is; a value with `$` in it, or a route whose value
+/// Reeve can't see, can't be read. Only `export NAME`, `declare -x NAME`,
+/// `unset NAME`, `export -n NAME`, `env -u NAME`, and plain reads
+/// (`$NAME`, `${NAME:-x}`) are nothing. Returns why the floor applies.
 fn forced_by_env(line: &str, raw: bool) -> Option<String> {
     for name in ["DPKG_FORCE", "APT_CONFIG"] {
         let mut from = 0;
@@ -4203,6 +4204,11 @@ mod tests {
             r#"python3 -c 'print(open("/home/u/.reeve/keys/openrouter").read())'"#,
             r#"perl -e 'print `cat ~/.reeve/keys/openrouter`'"#,
             r#"node -e "console.log(require('fs').readFileSync(process.env.HOME + '/.reeve/keys/x', 'utf8'))""#,
+            // The code glued to its flag, and the key file as the script.
+            r#"python3 -c'print(open("/home/u/.reeve/keys/openrouter").read())'"#,
+            r#"perl -e'print `cat ~/.reeve/keys/openrouter`'"#,
+            "python3 /home/u/.reeve/keys/openrouter",
+            "python3 ~/.reeve/keys/openrouter",
         ] {
             let a = assess(&ctx, cmd);
             assert!(a.deny.is_some(), "{cmd}: {a:?}");
@@ -4214,6 +4220,7 @@ mod tests {
             // Put together at run time: not readable, so the typed yes.
             r#"node -e "console.log(require('fs').readFileSync(process.env.REEVE_HOME + '/keys/x', 'utf8'))""#,
             r#"python3 -c 'import os; print(open(os.environ["REEVE_HOME"] + "/receipts/2026-10.jsonl").read())'"#,
+            r#"node -e"require('fs').rmSync(process.env.HOME + '/.reeve/undo', {recursive: true})""#,
         ] {
             let a = assess(&ctx, cmd);
             assert_eq!(a.tier, Tier::T3, "{cmd}: {a:?}");
