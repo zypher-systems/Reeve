@@ -712,3 +712,98 @@ today; an open one is not, or not yet proven.
   drafter, and this design describes what shipped (§11 still shows the ledger UI, not the board).
 
 **Not needed for 1.0:** timeshift, and macOS or Windows.
+
+---
+
+## 15. Road to the next releases
+
+Written 2026-10-29 against 0.7.1, from a day of field use and a 25-finding review of the code
+(referred to below as G01–G25). The review's own words: this is not a missing-feature problem; the
+gaps are between the guarantees Reeve states and what happens under failure. The order below puts
+what stops daily use first, what makes unattended work trustworthy second, and the 1.0 gate (§14)
+last. Sizes: S is under half a day, M one or two days, L a week or more. Every fix lands with a
+regression test that fails on 0.7.1.
+
+**In dev since 0.7.1**
+
+- The sudo password is asked once per `password_minutes`, not every other root step (the remembered
+  password is keyed on the sudo asking; DECISIONS 2026-10-29).
+- Orders count every start against `runs_per_day`, run-now requests wait their turn, and a journal
+  that wasn't read fails the `journal_quiet` check instead of passing it (G05, G08, G09).
+
+**Release A, fixes only (a PATCH): ship within days**
+
+1. **Protected paths named inside a program** (G01, the part a parser can do). The floor scans the
+   whole command text for Reeve's own state (`keys`, `receipts`, `undo`, `skills` under `~/.reeve`)
+   the way it scans for `DPKG_FORCE`, so `python3 -c '…open("~/.reeve/keys/x")…'` is T3. The README
+   stops saying "no tool, in any mode" and says what is true: every spelling the policy can read is
+   refused; a program that learns the path some other way is held only by the tier of running it.
+   S. The real boundary is a 1.0 item below.
+2. **Temporary files** (G02, part of G17). `write_atomic`, the settings writer and the root helper
+   create their temp file with `create_new` and a random suffix, never following a symlink. S.
+3. **No action without a receipt it can write** (G03, the cheap half). Before an approved action
+   runs, the receipt log must open for append; if it can't, the action is refused with the error
+   instead of running unrecorded (the 0.7.1 outage was this class). S. The crash window between
+   execution and append is the 1.0 item.
+4. **Private state** (G06). `~/.reeve` and everything Reeve creates under it is 0700/0600 whatever
+   the umask, sessions included. A `kind = "local"` connection whose URL isn't loopback is flagged by
+   `reeve doctor` and the providers panel: "local" means nothing leaves the machine, so it has to be
+   true. S. Redacting the owner's own transcripts on their own disk is not planned.
+5. **A ledger that can't be read isn't zero** (G07). A month file that exists but doesn't parse, or
+   has lines that don't, makes the totals `partial`, and reeved starts no order or draft while they
+   are. Unknown usage on a call is recorded as unknown, not dropped. S. Atomic reservations are not
+   planned: the overshoot is one call, and the docs say so.
+6. **reeved with a broken config observes only** (G11). Invalid TOML or state means no orders and no
+   drafter until it's fixed, with a finding that says which file. S.
+7. **An errored run is `failed`** (G12), however much the model said before the error. S.
+8. **`fs_read` reads only what it shows** (G20): a byte cap on the read, not just the output. S.
+9. **Docs tell the truth** (G25): the README status line (done), the unit description, the "root
+   changes aren't available yet" message, and §2 and §11 marked as proposed where they differ from
+   what shipped. S.
+
+Done when: each item has its test, `cargo test --workspace`, clippy and fmt pass, the live container
+tests for pacman and apt pass, and the dev → main PR has its two external reviews.
+
+**Release B, features (a MINOR)**
+
+1. **The observer loop never blocks** (G10). Slow checks and the drafter run as supervised tasks
+   with deadlines, like orders already do; sampling, the heartbeat and the scheduler keep their
+   cadence while a model call takes minutes. M.
+2. **Snapshots out of the box** (G14, §14). The once-only offer to create the snapper root config;
+   a failed pre-snapshot shown on the card and the receipt; the coverage a T2 action has, shown
+   before it runs. M.
+3. **Long sessions** (G18). When the transcript nears the model's context length, older rounds are
+   compacted; the owner's constraints, pending approvals and the open change are kept. M.
+4. **A .deb** in the release workflow, since the servers it's wanted on are Debian; install.sh stays.
+   M.
+5. **A runbook "worked" only with evidence** (G19): reflection counts a success only when the
+   session has a verified change or no failed receipt. S.
+6. **Locked updates for shared files** (G17): settings and order state use the lock the receipts
+   already use. S.
+
+**The 1.0 gate (§14), with the findings that bear on each**
+
+- The floor is proven: a real execution boundary for shell programs (Landlock or bubblewrap masking
+  Reeve's state; or, if neither is available, an honest statement of the trust model) and tests
+  that execute, not only classify (G01, G23). L.
+- Receipts cover every change: an intent record before the action and a completion after, with
+  reconciliation at startup; an open verified change survives a crash or cancel (G03, G04). L.
+- Undo covers what it claims: moves and units record a post-state and refuse when it changed;
+  partial multi-file restores leave their inverse (G13). M.
+- reeved stays small: retention for sessions, undo objects and findings; a 90-day soak with
+  measured disk, memory and query time (G15). M.
+- Upgrades never lose data: a version in every file format, fixtures from each shipped release,
+  and a migration test (G16). M.
+- `reeve update` and rollback behave the same on every install method, or the docs say where they
+  don't; a signed release manifest if that becomes a requirement (G22). M.
+- Arch as solid as Fedora, and packages published: the live tests run on a schedule in disposable
+  containers; COPR and AUR publish from the release workflow (G21). M.
+- First run teaches itself, and the TUI degrades: the screenshot harness asserts 80×24, 16 colors,
+  mono and no-reeved, and a fresh-home walk-through is part of each release (G24). M.
+
+**Reviewed and not planned**
+
+- Retrying a finding occurrence skipped for cooldown (noted under G09): each episode is handled
+  once, on purpose.
+- Local transcript redaction and atomic budget reservations, as above.
+
