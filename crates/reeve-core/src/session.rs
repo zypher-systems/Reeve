@@ -41,7 +41,8 @@ impl Session {
     pub fn create(home: &Path, connection: &str, model: &str) -> Result<Self> {
         let id = uuid::Uuid::now_v7().to_string();
         let dir = home.join("sessions").join(&id);
-        fs::create_dir_all(&dir)?;
+        crate::config::private_dir(&home.join("sessions"))?;
+        crate::config::private_dir(&dir)?;
         let meta = Meta {
             id,
             started: Utc::now(),

@@ -202,7 +202,8 @@ fn journal_verdict(
 /// An open transaction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Txn {
-    /// Short id (`t<unix seconds>`).
+    /// Short id (`t<unix seconds>-<4 hex>`: two changes begun in the same
+    /// second, in two sessions, stay apart).
     pub id: String,
     /// What the changes are for.
     pub goal: String,
@@ -225,7 +226,7 @@ impl Txn {
     pub fn new(goal: &str, checks: Vec<Check>, wait_secs: Option<u64>) -> Self {
         let now = Utc::now();
         Self {
-            id: format!("t{}", now.timestamp()),
+            id: format!("t{}-{}", now.timestamp(), crate::undo::random_hex(2)),
             goal: goal.trim().to_string(),
             checks,
             wait_secs: wait_secs.unwrap_or(3).min(120),

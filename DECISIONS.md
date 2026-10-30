@@ -2,6 +2,32 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-10-29: Failure paths fail closed, before the next release
+- **Decision:**
+  - `write_atomic` creates its temporary file exclusively (`create_new`) under a random name, with the mode on the open and the exact mode set after, so a name planted next to the target can't redirect the write. `settings.toml` goes through it. The root helper's check file for `visudo -cf` / `findmnt --verify` is created the same way: it runs as root in `/tmp`.
+  - Before any tool call runs, `ReceiptBook::writable` takes the receipt lock, reads the chain's head and opens this month's file. If that fails, the call is refused with the reason and no receipt (nothing happened), so no change can run unrecorded the way 0.7.1's actions failed after running. The crash window between an action and its receipt remains (the 1.0 item: an intent record first).
+  - `~/.reeve` is made 0700 at every start (`config::private_dir`), and so are session directories; ledger and transcript files are 0600 (`append_jsonl`), whatever the umask. `append_jsonl` writes a missing newline first, so a line torn by a crash never swallows the next record.
+  - `ledger::Totals.unreadable`: a month file that can't be read, or a record that doesn't parse (a torn last line excepted), marks the totals partial and unreadable; reeved starts no order and no draft while they are. A call that returned neither usage nor a price is recorded with unknown cost, not dropped.
+  - reeved whose `config.toml` doesn't load watches on defaults and starts nothing: orders and the drafter pause, and the status says so, until it loads. A `.state.json` that doesn't parse stops the orders tick and is never replaced with an empty state.
+  - An order run or a draft that saw an agent error is `failed` (or blocked), whatever the model said before; the error leads the summary.
+  - `fs_read` loads at most 8 MiB of a file and says when there was more; search reads at most 4 MiB a file.
+  - A `kind = "local"` connection whose URL isn't loopback is flagged by `reeve doctor` and at TUI start: "local" turns masking off and counts calls as free.
+  - An interpreter one-liner (`python3 -c`, `perl -e`, `node -e`, …) that spells a path to Reeve's keys is refused; one that names its receipts or undo store, or mentions its state directory together with `keys`, `receipts` or `undo`, is T3. The README says what is true: spelled paths are refused in every mode, a program that names them needs the typed yes, one that reaches them another way is held only by the tier of running it.
+  - Change ids are `t<seconds>-<4 hex>`, so two begun in the same second stay apart.
+  - Docs: the unit description says reeved runs standing orders; the permission-denied message says how root files are changed; design §2 and §11 are marked as planned where the shipped product differs.
+- **Chosen vs rejected:**
+  - Rejected a private umask for the process: files Reeve writes for the owner must follow the owner's umask; only Reeve's own directories and records are forced private.
+  - Rejected flagging a torn last line as unreadable: that is the crash case, now repaired on the next append; a record that doesn't parse elsewhere is another matter.
+  - Rejected redacting the owner's transcripts on the owner's disk: they are protected by mode, and the owner reads them.
+  - Rejected a sandbox (Landlock, bubblewrap) for this release: it is the 1.0 boundary. The text scan closes the spellings the review reproduced, and the README no longer claims more.
+  - Rejected refusing every program that mentions Reeve's state: an assembled path can't be read, so it over-asks (T3) rather than refuses, and `print(1 + 1)` stays T1.
+- **Why:** The 2026-10-29 review reproduced writes through a planted temp name, a change with no receipt, a 0644 transcript, a corrupt ledger read as $0, and `python3 -c` reading a key at T1; the owner asked for these before the next release.
+- **Where:** `reeve-core/src/undo.rs` (`write_atomic`, `random_hex`), `root.rs`, `receipts.rs` (`writable`), `agent.rs` (the preflight, `charge`), `config.rs` (`private_dir`, `local_url_problem`), `ledger.rs`, `session.rs`, `settings.rs`, `orders.rs` (`states_checked`), `txn.rs`, `tools/fs.rs` (`read_capped`), `policy/shell.rs` (`names_reeve_state`), `reeve-observer/src/daemon.rs`, `orders.rs` (`status_of`), `drafter.rs`, `reeve-cli/src/main.rs`, `reeve-tui/src/run.rs`
+- **Residual risk:**
+  - A program that assembles a path to Reeve's state without mentioning `.reeve`, `REEVE_HOME` or `/var/lib/reeve` runs at T1, as does a script file whose contents name them.
+  - `unreadable` stops unattended work until the owner repairs the ledger file by hand; the TUI keeps working and shows the totals as a floor (≥).
+  - The receipt preflight is a check, not a transaction: a crash between the action and its receipt still loses the receipt.
+
 ### 2026-10-29: Orders count every start, run-now requests wait their turn, and a journal that wasn't read isn't quiet
 - **Decision:**
   - `OrderState.today` counts the runs started on the current local day, incremented by `OrderState::claim` when a run is claimed (reeved's tick, and `reeve orders run`), before anything happens. `runs_today` is the larger of that counter and what the 20-entry history shows, so a state written before the counter still counts its day. The history stays at 20 and is for reading.

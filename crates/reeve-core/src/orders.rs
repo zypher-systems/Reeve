@@ -821,12 +821,24 @@ impl Orders {
         self.dir.join(".state.json")
     }
 
-    /// Every order's state.
+    /// Every order's state, for reading. A state that can't be read shows
+    /// as empty here; [`Orders::states_checked`] says so instead.
     pub fn states(&self) -> BTreeMap<String, OrderState> {
-        fs::read_to_string(self.state_path())
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+        self.states_checked().unwrap_or_default()
+    }
+
+    /// Every order's state, or why the state file can't be read. No file is
+    /// an empty state; a file that doesn't parse is an error, since running
+    /// on forgotten limits is worse than not running.
+    pub fn states_checked(&self) -> Result<BTreeMap<String, OrderState>> {
+        let path = self.state_path();
+        match fs::read_to_string(&path) {
+            Ok(t) => {
+                serde_json::from_str(&t).map_err(|e| Error::Io(format!("{}: {e}", path.display())))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(e) => Err(Error::Io(format!("{}: {e}", path.display()))),
+        }
     }
 
     /// Save every order's state.

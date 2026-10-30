@@ -2402,6 +2402,16 @@ fn spawn_worker(
         };
         rt.block_on(async move {
             let cfg = config::load_at(&home).unwrap_or_default();
+            if let Ok((name, conn, _)) = cfg.route() {
+                if let Some(host) = conn.local_url_problem() {
+                    let _ = tx.send(UiMsg::Notice(
+                        Speaker::Error,
+                        format!(
+                            "connection {name:?} is kind = \"local\" but its URL points at {host}: nothing sent there is masked, and it's counted as free. Fix [connections.{name}] in config.toml."
+                        ),
+                    ));
+                }
+            }
             let remember_for =
                 Duration::from_secs(cfg.approvals.password_minutes.saturating_mul(60));
             let askpass = match Askpass::start(&home, passwords, remember_for) {

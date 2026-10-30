@@ -699,6 +699,17 @@ impl Agent {
             // Nothing happened, so there's nothing to receipt.
             Err(msg) => return Ok(call_error(call, &msg, emit)),
         };
+        // Nothing runs that can't be recorded: the receipt log must take a
+        // receipt now, or the action is refused before anything happens.
+        if let Err(e) = self.receipts.writable() {
+            return Ok(call_error(
+                call,
+                &format!(
+                    "Reeve can't write its receipts ({e}), so no action runs until that's fixed. Tell the owner."
+                ),
+                emit,
+            ));
+        }
         // What only the owner may say yes to (a standing order, a skill, an
         // AUR build) never happens unattended: an order can't make another,
         // and the drafter can't make one.
@@ -1194,12 +1205,12 @@ impl Agent {
         reported: Option<f64>,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<()> {
-        if usage == Usage::default() && reported.is_none() {
-            return Ok(());
-        }
         let (usd, priced_by) = match reported {
             Some(c) => (Some(c), Some("provider")),
             None if self.local => (Some(0.0), Some("local")),
+            // Neither usage nor a price came back: the call cost something
+            // unknown, which is recorded as unknown, not as nothing.
+            None if usage == Usage::default() => (None, None),
             None => {
                 let c = self.book.cost(&self.model, usage);
                 (c, c.map(|_| "book"))
@@ -1708,6 +1719,34 @@ mod tests {
         let receipts = ReceiptBook::new(&a.home).all();
         assert_eq!(receipts[0].approved_by, "yolo");
         assert_eq!(receipts[1].outcome.status, Status::Denied);
+    }
+
+    #[tokio::test]
+    async fn nothing_runs_when_receipts_cannot_be_written() {
+        let (home, mut a) = agent(
+            vec![
+                call(
+                    "fs_write",
+                    serde_json::json!({"path": "~/x", "content": "x"}),
+                ),
+                done("ok"),
+            ],
+            fixed(Decision::Approve, true),
+        );
+        // The receipts directory is taken by a file: nothing can be recorded.
+        std::fs::create_dir_all(&a.home).unwrap();
+        std::fs::write(a.home.join("receipts"), "not a directory").unwrap();
+        run(&mut a).await;
+        assert!(
+            !home.path().join("x").exists(),
+            "the write ran without a receipt"
+        );
+        assert!(
+            a.transcript
+                .iter()
+                .any(|m| m.content.contains("can't write its receipts")),
+            "the model was told why"
+        );
     }
 
     #[tokio::test]

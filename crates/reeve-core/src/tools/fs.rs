@@ -18,6 +18,9 @@ use crate::root::{RootOp, RootReply};
 use crate::undo::{FileChange, Undo, write_atomic};
 
 const MAX_READ: usize = 64 * 1024;
+/// The most of a file `fs_read` loads: a huge or growing file costs no more
+/// memory than this, whatever it shows.
+const MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_OUTPUT: usize = 48 * 1024;
 const DIFF_ROWS: usize = 400;
 
@@ -134,8 +137,8 @@ fn fail(msg: String) -> Executed {
 fn io_msg(p: &Path, e: &std::io::Error) -> String {
     match e.kind() {
         ErrorKind::PermissionDenied => format!(
-            "permission denied on {} — it belongs to another user (likely root). Root file changes \
-             aren't available yet: tell the owner what to change and the exact command to run.",
+            "permission denied on {}: it belongs to another user (likely root). To change it, use \
+             fs_write or fs_edit, which go through sudo; to read it, run `sudo cat` in shell.",
             p.display()
         ),
         ErrorKind::NotFound => format!("{} doesn't exist", p.display()),
@@ -358,8 +361,8 @@ pub(super) fn read(ctx: &ToolCtx, a: &ReadArgs) -> Executed {
     if meta.is_dir() {
         return fail(format!("{} is a directory; use fs_list", p.display()));
     }
-    let bytes = match fs::read(&p) {
-        Ok(b) => b,
+    let (bytes, more) = match read_capped(&p, MAX_READ_BYTES) {
+        Ok(x) => x,
         Err(e) => return fail(io_msg(&p, &e)),
     };
     if bytes.iter().take(8192).any(|b| *b == 0) {
@@ -391,7 +394,25 @@ pub(super) fn read(ctx: &ToolCtx, a: &ReadArgs) -> Executed {
             offset + shown
         ));
     }
-    ok(out, format!("{shown} of {total} lines"))
+    if more {
+        out.push_str(&format!(
+            "… the file goes on past the first {} MiB, which is all Reeve reads\n",
+            MAX_READ_BYTES / (1024 * 1024)
+        ));
+    }
+    let plus = if more { "+" } else { "" };
+    ok(out, format!("{shown} of {total}{plus} lines"))
+}
+
+/// The first `cap` bytes of a file, and whether there were more.
+fn read_capped(p: &Path, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
+    use std::io::Read;
+    let mut f = fs::File::open(p)?;
+    let mut buf = Vec::new();
+    (&mut f).take(cap).read_to_end(&mut buf)?;
+    let mut probe = [0u8; 1];
+    let more = f.read(&mut probe)? > 0;
+    Ok((buf, more))
 }
 
 pub(super) fn list(ctx: &ToolCtx, a: &ListArgs) -> Executed {
@@ -538,12 +559,17 @@ fn search_blocking(ctx: &ToolCtx, a: &SearchArgs) -> Executed {
             }
             continue;
         };
+        // Over 4 MiB is skipped; the read is capped too, so a file that
+        // grows between the size check and the read costs no more.
         if entry.metadata().is_ok_and(|m| m.len() > 4 * 1024 * 1024) {
             continue;
         }
-        let Ok(bytes) = fs::read(entry.path()) else {
+        let Ok((bytes, more)) = read_capped(entry.path(), 4 * 1024 * 1024) else {
             continue;
         };
+        if more {
+            continue;
+        }
         if bytes.iter().take(4096).any(|b| *b == 0) {
             continue;
         }
@@ -966,6 +992,19 @@ mod tests {
     async fn run(c: &ToolCtx, tool: &str, args: serde_json::Value) -> Executed {
         let plan = prepare(c, tool, &args.to_string()).unwrap();
         execute(c, &plan).await
+    }
+
+    #[test]
+    fn reads_are_capped_at_the_read_not_the_display() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("big");
+        std::fs::write(&p, vec![b'a'; 100]).unwrap();
+        let (bytes, more) = read_capped(&p, 40).unwrap();
+        assert_eq!((bytes.len(), more), (40, true));
+        let (bytes, more) = read_capped(&p, 100).unwrap();
+        assert_eq!((bytes.len(), more), (100, false));
+        let (bytes, more) = read_capped(&p, 1000).unwrap();
+        assert_eq!((bytes.len(), more), (100, false));
     }
 
     #[tokio::test]

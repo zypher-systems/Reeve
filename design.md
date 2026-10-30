@@ -35,6 +35,10 @@ New for an operator:
 
 ## 2. Architecture
 
+*As shipped (0.7): reeved and the TUI are the same binary and share files under `~/.reeve`
+(findings, proposals, `observer/status.json`, `orders/.run-now`); there is no `reeved.sock`. The
+askpass socket is the only socket. The diagram is the original plan.*
+
 ```
  ┌──────────────── reeve (TUI, your user) ────────────────┐      ┌──── reeved (systemd --user) ────┐
  │ UI thread ── View/draw ◄── AgentEvent ── worker thread │◄────►│ samplers → baselines            │
@@ -558,6 +562,10 @@ trait Distro {
 
 ## 11. The TUI: the ledger, and tabs for the rest
 
+*As shipped (0.7): the TUI is the board of tiles (DECISIONS 2026-09-29), F1–F8 open tiles from
+anywhere, esc returns to the board, the composer stays at the bottom. This section describes the
+earlier ledger-and-tabs design; the approval card and receipt semantics below still hold.*
+
 ```
  reeve   F1 ledger   F2 findings 7   F3 orders   F4 spend   F5 memory   F6 system   nexus · all quiet, except swap 99%
 ─────────━━━━━━━━──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -724,45 +732,26 @@ what stops daily use first, what makes unattended work trustworthy second, and t
 last. Sizes: S is under half a day, M one or two days, L a week or more. Every fix lands with a
 regression test that fails on 0.7.1.
 
-**In dev since 0.7.1**
+**Release A, fixes only (a PATCH): in dev as of 2026-10-29, ships when the owner cuts it**
 
 - The sudo password is asked once per `password_minutes`, not every other root step (the remembered
   password is keyed on the sudo asking; DECISIONS 2026-10-29).
 - Orders count every start against `runs_per_day`, run-now requests wait their turn, and a journal
   that wasn't read fails the `journal_quiet` check instead of passing it (G05, G08, G09).
+- Failure paths fail closed (DECISIONS 2026-10-29, "Failure paths fail closed"): temp files are
+  created exclusively under random names, as is the root helper's check file (G02, part of G17);
+  no tool call runs when a receipt can't be written (G03, the cheap half); `~/.reeve`, sessions,
+  ledgers and transcripts are private whatever the umask, and a torn ledger line can't swallow the
+  next record (G06); an unreadable ledger is a floor, not zero, and stops unattended spend (G07);
+  reeved with a config or order state that doesn't load watches and starts nothing (G11); an
+  errored run or draft is a failure (G12); `fs_read` and search cap what they load (G20); a
+  `local` connection must point at this machine (G06); interpreter one-liners that name Reeve's
+  keys are refused and ones that name its receipts or undo store take the typed yes, and the README
+  says what is true (G01, the part a parser can do); change ids can't collide (part of G04); the
+  unit description, the permission-denied message and design §2 and §11 tell the truth (G25).
 
-**Release A, fixes only (a PATCH): ship within days**
-
-1. **Protected paths named inside a program** (G01, the part a parser can do). The floor scans the
-   whole command text for Reeve's own state (`keys`, `receipts`, `undo`, `skills` under `~/.reeve`)
-   the way it scans for `DPKG_FORCE`, so `python3 -c '…open("~/.reeve/keys/x")…'` is T3. The README
-   stops saying "no tool, in any mode" and says what is true: every spelling the policy can read is
-   refused; a program that learns the path some other way is held only by the tier of running it.
-   S. The real boundary is a 1.0 item below.
-2. **Temporary files** (G02, part of G17). `write_atomic`, the settings writer and the root helper
-   create their temp file with `create_new` and a random suffix, never following a symlink. S.
-3. **No action without a receipt it can write** (G03, the cheap half). Before an approved action
-   runs, the receipt log must open for append; if it can't, the action is refused with the error
-   instead of running unrecorded (the 0.7.1 outage was this class). S. The crash window between
-   execution and append is the 1.0 item.
-4. **Private state** (G06). `~/.reeve` and everything Reeve creates under it is 0700/0600 whatever
-   the umask, sessions included. A `kind = "local"` connection whose URL isn't loopback is flagged by
-   `reeve doctor` and the providers panel: "local" means nothing leaves the machine, so it has to be
-   true. S. Redacting the owner's own transcripts on their own disk is not planned.
-5. **A ledger that can't be read isn't zero** (G07). A month file that exists but doesn't parse, or
-   has lines that don't, makes the totals `partial`, and reeved starts no order or draft while they
-   are. Unknown usage on a call is recorded as unknown, not dropped. S. Atomic reservations are not
-   planned: the overshoot is one call, and the docs say so.
-6. **reeved with a broken config observes only** (G11). Invalid TOML or state means no orders and no
-   drafter until it's fixed, with a finding that says which file. S.
-7. **An errored run is `failed`** (G12), however much the model said before the error. S.
-8. **`fs_read` reads only what it shows** (G20): a byte cap on the read, not just the output. S.
-9. **Docs tell the truth** (G25): the README status line (done), the unit description, the "root
-   changes aren't available yet" message, and §2 and §11 marked as proposed where they differ from
-   what shipped. S.
-
-Done when: each item has its test, `cargo test --workspace`, clippy and fmt pass, the live container
-tests for pacman and apt pass, and the dev → main PR has its two external reviews.
+Done when: `cargo test --workspace`, clippy and fmt pass (they do), the live container tests for
+pacman and apt pass, and the dev → main PR has its two external reviews.
 
 **Release B, features (a MINOR)**
 

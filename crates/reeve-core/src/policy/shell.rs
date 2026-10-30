@@ -1804,6 +1804,7 @@ fn assess_words(
             } else {
                 a.raise(Tier::T1, "runs a program whose contents weren't checked");
             }
+            names_reeve_state(ctx, &args[1..], &mut a);
             if prog == "perl"
                 && args
                     .iter()
@@ -3296,6 +3297,51 @@ fn dpkg_force_words(args: &[String], assigns: &[String]) -> Vec<String> {
 /// Reeve can't see, can't be read. Only `export NAME`, `declare -x NAME`,
 /// `unset NAME`, `export -n NAME`, `env -u NAME`, and plain reads
 /// (`$NAME`, `${NAME:-x}`) are nothing. Returns why the floor applies.
+/// A program Reeve can't read names Reeve's own state. A spelled-out path
+/// to its keys is refused: no tool may read them. Its receipts and undo
+/// store may not be written, and inside a program a read can't be told from
+/// a write, so naming them takes the owner's typed yes. A path put together
+/// at run time (`REEVE_HOME + '/keys'`) can't be read either way, so a
+/// program that mentions Reeve's state directory and one of those names
+/// takes the typed yes too. One that reaches them by neither is held only
+/// by the tier of running it.
+fn names_reeve_state(ctx: &PathCtx, words: &[String], a: &mut Assessment) {
+    let home = ctx.reeve_home.to_string_lossy().into_owned();
+    let text = words.join(" ");
+    let spelled = |dir: &str| {
+        [
+            format!("{home}/{dir}"),
+            format!(".reeve/{dir}"),
+            format!("REEVE_HOME/{dir}"),
+            format!("REEVE_HOME}}/{dir}"),
+        ]
+        .iter()
+        .any(|s| text.contains(s.as_str()))
+    };
+    let mentions_state = text.contains(&home)
+        || text.contains(".reeve")
+        || text.contains("REEVE_HOME")
+        || text.contains("/var/lib/reeve");
+    if spelled("keys") {
+        a.refuse("a program Reeve can't read names its API keys, which no tool may read");
+    } else if mentions_state && text.contains("keys") {
+        a.raise(
+            Tier::T3,
+            "a program Reeve can't read mentions its state directory and its keys",
+        );
+    }
+    if spelled("receipts")
+        || spelled("undo")
+        || text.contains("/var/lib/reeve")
+        || (mentions_state && (text.contains("receipts") || text.contains("undo")))
+    {
+        a.raise(
+            Tier::T3,
+            "a program Reeve can't read names its receipts or undo store",
+        );
+    }
+}
+
 fn forced_by_env(line: &str, raw: bool) -> Option<String> {
     for name in ["DPKG_FORCE", "APT_CONFIG"] {
         let mut from = 0;
@@ -4148,6 +4194,34 @@ mod tests {
 
     fn tier(cmd: &str) -> Tier {
         assess(&PathCtx::for_tests(), cmd).tier
+    }
+
+    #[test]
+    fn a_program_that_names_reeves_state_is_held() {
+        let ctx = PathCtx::for_tests();
+        for cmd in [
+            r#"python3 -c 'print(open("/home/u/.reeve/keys/openrouter").read())'"#,
+            r#"perl -e 'print `cat ~/.reeve/keys/openrouter`'"#,
+            r#"node -e "console.log(require('fs').readFileSync(process.env.HOME + '/.reeve/keys/x', 'utf8'))""#,
+        ] {
+            let a = assess(&ctx, cmd);
+            assert!(a.deny.is_some(), "{cmd}: {a:?}");
+        }
+        for cmd in [
+            r#"python3 -c 'import shutil; shutil.rmtree("/home/u/.reeve/receipts")'"#,
+            r#"node -e "require('fs').rmSync(process.env.HOME + '/.reeve/undo', {recursive: true})""#,
+            r#"ruby -e 'File.write("/var/lib/reeve/undo/x", "")'"#,
+            // Put together at run time: not readable, so the typed yes.
+            r#"node -e "console.log(require('fs').readFileSync(process.env.REEVE_HOME + '/keys/x', 'utf8'))""#,
+            r#"python3 -c 'import os; print(open(os.environ["REEVE_HOME"] + "/receipts/2026-10.jsonl").read())'"#,
+        ] {
+            let a = assess(&ctx, cmd);
+            assert_eq!(a.tier, Tier::T3, "{cmd}: {a:?}");
+            assert!(a.deny.is_none(), "{cmd}");
+        }
+        let a = assess(&ctx, "python3 -c 'print(1 + 1)'");
+        assert_eq!(a.tier, Tier::T1, "{a:?}");
+        assert!(a.deny.is_none());
     }
 
     #[test]

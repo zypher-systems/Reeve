@@ -52,17 +52,32 @@ pub fn record(home: &Path, rec: &SpendRecord) -> Result<()> {
     append_jsonl(&path, rec)
 }
 
-/// Append one JSON line, creating parent directories.
+/// Append one JSON line, creating parent directories. The file is the
+/// owner's alone (0600). A torn last line (a crash mid-write) gets its
+/// newline first, so the new record never glues onto it.
 pub fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+        crate::config::private_dir(dir)?;
     }
     let mut line = serde_json::to_string(value).map_err(|e| crate::Error::Io(e.to_string()))?;
     line.push('\n');
     let mut f = fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
+        .mode(0o600)
         .open(path)?;
+    let len = f.metadata()?.len();
+    if len > 0 {
+        let mut last = [0u8; 1];
+        f.seek(SeekFrom::Start(len - 1))?;
+        f.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            f.write_all(b"\n")?;
+        }
+    }
     f.write_all(line.as_bytes())?;
     Ok(())
 }
@@ -77,10 +92,15 @@ pub struct Totals {
     pub month: Tally,
     /// USD per day of this month so far.
     pub by_day: Vec<f64>,
+    /// The month's file exists but couldn't be read in full: a record
+    /// Reeve can't parse, or a file it can't open. The totals are a floor,
+    /// and nothing should spend unattended on them.
+    pub unreadable: bool,
 }
 
-/// Read this month's ledger. Unreadable lines are skipped: a torn final
-/// line from a crash must not hide the rest of the month.
+/// Read this month's ledger. A torn final line (a crash mid-write, with
+/// no newline after it) is skipped quietly; any other line that doesn't
+/// parse, or a file that can't be read, marks the totals `unreadable`.
 pub fn totals(home: &Path, now: DateTime<Local>) -> Totals {
     let today = now.date_naive();
     let path = month_path(home, now.year(), now.month());
@@ -88,13 +108,34 @@ pub fn totals(home: &Path, now: DateTime<Local>) -> Totals {
         by_day: vec![0.0; today.day() as usize],
         ..Totals::default()
     };
-    let Ok(text) = fs::read_to_string(path) else {
-        return t;
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return t,
+        Err(_) => {
+            t.unreadable = true;
+            t.today.partial = true;
+            t.month.partial = true;
+            return t;
+        }
     };
-    for rec in text
-        .lines()
-        .filter_map(|l| serde_json::from_str::<SpendRecord>(l).ok())
-    {
+    let torn = !text.ends_with('\n');
+    let last = text.lines().count().saturating_sub(1);
+    let records = text.lines().enumerate().filter_map(|(i, l)| {
+        if l.trim().is_empty() {
+            return None;
+        }
+        match serde_json::from_str::<SpendRecord>(l) {
+            Ok(r) => Some(r),
+            Err(_) if torn && i == last => None,
+            Err(_) => {
+                t.unreadable = true;
+                t.today.partial = true;
+                t.month.partial = true;
+                None
+            }
+        }
+    });
+    for rec in records.collect::<Vec<_>>() {
         let day: NaiveDate = rec.ts.with_timezone(&Local).date_naive();
         if day.year() != today.year() || day.month() != today.month() {
             continue;
@@ -228,6 +269,61 @@ pub fn over_cap(spend: &SpendConfig, session: &Tally, totals: &Totals) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn priced(usd: f64) -> SpendRecord {
+        SpendRecord {
+            ts: Utc::now(),
+            session: "s".into(),
+            connection: "c".into(),
+            model: "m".into(),
+            usage: Usage::default(),
+            usd: Some(usd),
+            priced_by: Some("provider".into()),
+            role: None,
+        }
+    }
+
+    #[test]
+    fn a_ledger_that_cannot_be_read_in_full_is_not_zero() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let now = Local::now();
+        let path = month_path(home.path(), now.year(), now.month());
+        assert!(
+            !totals(home.path(), now).unreadable,
+            "no file yet: nothing spent"
+        );
+        record_at(home.path(), &priced(0.5));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let t = totals(home.path(), now);
+        assert!(!t.unreadable && (t.month.usd - 0.5).abs() < 1e-9);
+        // A crash mid-write leaves a torn last line: skipped, not alarming,
+        // and the next record starts on its own line.
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"{\"ts\":\"2026-").unwrap();
+        drop(f);
+        let t = totals(home.path(), now);
+        assert!(!t.unreadable, "{t:?}");
+        record_at(home.path(), &priced(0.25));
+        let t = totals(home.path(), now);
+        assert!((t.month.usd - 0.75).abs() < 1e-9, "{t:?}");
+        // A record in the middle that doesn't parse is another matter.
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(&path, text.replace("{\"ts\":\"2026-\n", "not json\n")).unwrap();
+        let t = totals(home.path(), now);
+        assert!(t.unreadable && t.month.partial, "{t:?}");
+        assert!(
+            (t.month.usd - 0.75).abs() < 1e-9,
+            "what parses still counts"
+        );
+    }
+
+    fn record_at(home: &Path, rec: &SpendRecord) {
+        super::record(home, rec).unwrap();
+    }
 
     #[test]
     fn statements_group_by_session_and_role() {

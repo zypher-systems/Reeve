@@ -67,7 +67,9 @@ cargo build --release --locked -p reeve-cli && ./target/release/reeve
 | **T2** system change | system files, packages, system services, anything with sudo | yes, every time |
 | **T3** floor | formatting disks, partition tables, bootloader, `rm -rf` of top-level dirs, protected packages, secrets | you type `yes`, even in YOLO |
 
-Reeve's own keys can't be read, and its receipts and undo store can't be written, by any tool, in any mode.
+Reeve's own keys can't be read, and its receipts and undo store can't be written, by any command Reeve can
+read: those paths are refused in every mode. A program Reeve can't read (`python3 -c …`, a script) that names
+them needs your typed yes, and one that reaches them some other way is held only by the tier of running it.
 
 **Reading never asks.** Commands are read the way the shell will run them: `if`, `for … do … done`, `case`, functions,
 and builtins like `cd` and `export` are structure, not programs; awk and sed programs that only print are reads (one

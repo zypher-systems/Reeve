@@ -59,14 +59,11 @@ impl Settings {
             c.api_key = None;
         }
         let text = toml::to_string_pretty(&clean).map_err(|e| Error::Config(e.to_string()))?;
-        let path = Self::path(home);
-        let tmp = path.with_extension("toml.tmp");
-        fs::write(
-            &tmp,
-            format!("# Written by Reeve's TUI. Edit config.toml instead.\n{text}"),
-        )?;
-        fs::rename(tmp, path)?;
-        Ok(())
+        crate::undo::write_atomic(
+            &Self::path(home),
+            format!("# Written by Reeve's TUI. Edit config.toml instead.\n{text}").as_bytes(),
+            Some(0o600),
+        )
     }
 
     /// Apply these choices on top of `cfg`.

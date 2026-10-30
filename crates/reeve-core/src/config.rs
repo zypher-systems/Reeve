@@ -88,6 +88,31 @@ impl ConnectionConfig {
     pub fn is_local(&self) -> bool {
         self.kind == "local"
     }
+
+    /// The host of a `local` connection that isn't this machine. "Local"
+    /// turns masking off and counts the calls as free, so it has to be true.
+    pub fn local_url_problem(&self) -> Option<String> {
+        if !self.is_local() {
+            return None;
+        }
+        let rest = self
+            .base_url
+            .split_once("://")
+            .map_or(self.base_url.as_str(), |(_, r)| r);
+        let hostport = rest.split('/').next().unwrap_or("");
+        let hostport = hostport.rsplit_once('@').map_or(hostport, |(_, h)| h);
+        let host = match hostport.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or(""),
+            None => hostport.rsplit_once(':').map_or(hostport, |(h, _)| h),
+        };
+        let local = host.is_empty()
+            || host == "localhost"
+            || host.ends_with(".localhost")
+            || host.starts_with("127.")
+            || host == "::1"
+            || host == "0.0.0.0";
+        (!local).then(|| host.to_string())
+    }
 }
 
 /// `[pricing."<model>"]`. Values are USD per million tokens.
@@ -405,6 +430,14 @@ pub fn connection_template(kind: &str) -> Result<ConnectionConfig> {
     })
 }
 
+/// Create `dir` if needed and make it the owner's alone (0700), whatever
+/// the umask: Reeve's state is private.
+pub fn private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
 /// Where Reeve keeps its state (`REEVE_HOME` or `~/.reeve`).
 pub fn home_dir() -> PathBuf {
     if let Ok(p) = std::env::var("REEVE_HOME") {
@@ -613,6 +646,62 @@ pub fn store_secret_at(home: &Path, connection: &str, secret: &str) -> Result<Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_local_connection_must_point_at_this_machine() {
+        let conn = |kind: &str, url: &str| ConnectionConfig {
+            kind: kind.into(),
+            base_url: url.into(),
+            env_key: None,
+            api_key: None,
+            default_model: None,
+        };
+        for url in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://[::1]:8080/v1",
+            "http://user:pw@localhost/v1",
+            "http://llm.localhost/v1",
+        ] {
+            assert_eq!(conn("local", url).local_url_problem(), None, "{url}");
+        }
+        assert_eq!(
+            conn("local", "https://api.example.com/v1").local_url_problem(),
+            Some("api.example.com".into())
+        );
+        assert_eq!(
+            conn("local", "http://192.168.1.20:11434/v1").local_url_problem(),
+            Some("192.168.1.20".into())
+        );
+        assert_eq!(
+            conn("openai", "https://api.example.com/v1").local_url_problem(),
+            None,
+            "only a connection that claims to be local"
+        );
+    }
+
+    #[test]
+    fn private_dir_is_the_owners_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("state");
+        std::fs::create_dir(&p).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        private_dir(&p).unwrap();
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        private_dir(&p.join("deeper/still")).unwrap();
+        assert_eq!(
+            std::fs::metadata(p.join("deeper/still"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
 
     #[test]
     fn user_connections_merge_over_builtins() {

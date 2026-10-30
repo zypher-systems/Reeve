@@ -179,6 +179,8 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), String> {
     let home = config::home_dir();
+    // Reeve's state is the owner's alone, whatever the umask.
+    config::private_dir(&home).map_err(|e| format!("{}: {e}", home.display()))?;
     let cfg = config::load_at(&home).map_err(|e| e.to_string())?;
     match cli.cmd {
         None => {
@@ -612,6 +614,13 @@ fn doctor(cfg: &Config, home: &std::path::Path) {
             .is_ok_and(|o| o.status.success())
     };
     println!("reeve {}", env!("CARGO_PKG_VERSION"));
+    for (name, c) in &cfg.connections {
+        if let Some(host) = c.local_url_problem() {
+            warn(format!(
+                "connection {name:?} is kind = \"local\" but its URL points at {host}: nothing sent there is masked, and it's counted as free"
+            ));
+        }
+    }
 
     println!("binary");
     match std::env::current_exe() {
