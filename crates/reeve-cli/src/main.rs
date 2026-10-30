@@ -526,6 +526,13 @@ fn orders_cmd(cfg: &Config, home: &std::path::Path, cmd: OrdersCmd) -> Result<()
                 .build()
                 .map_err(|e| e.to_string())?;
             let profile = reeve_observer::HostInfo::read().profile();
+            // A start like any other, so the daily limit sees it.
+            let mut states = orders.states();
+            states
+                .entry(id.clone())
+                .or_default()
+                .claim(chrono::Utc::now());
+            orders.save_states(&states).map_err(|e| e.to_string())?;
             let run = rt.block_on(reeve_observer::orders::run(
                 home,
                 cfg,

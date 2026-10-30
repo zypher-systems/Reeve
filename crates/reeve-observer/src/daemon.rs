@@ -332,20 +332,32 @@ impl Observer {
         }
         let orders = Orders::new(&self.home);
         let (list, _) = orders.load();
-        let requests = orders.take_requests();
+        // Asked for by the owner: first come, first served, one a tick; the
+        // rest wait on disk. A request for an order that's gone is dropped.
+        // "Run now" means now: it skips the order's frequency limits.
+        let mut due = None;
+        for id in orders.pending_requests() {
+            match list.iter().find(|o| o.id == id) {
+                Some(o) => {
+                    due = Some((o.clone(), crate::orders::Cause::Manual));
+                    break;
+                }
+                None => {
+                    orders.take_request(&id);
+                }
+            }
+        }
         if list.is_empty() {
             return;
         }
         let mut states = orders.states();
         let now = Utc::now();
         let findings = self.store.list();
-        let mut due = None;
         for o in &list {
-            let st = states.entry(o.id.clone()).or_default();
-            if requests.contains(&o.id) {
-                due = Some((o.clone(), crate::orders::Cause::Manual));
+            if due.is_some() {
                 break;
             }
+            let st = states.entry(o.id.clone()).or_default();
             if !o.enabled {
                 continue;
             }
@@ -380,9 +392,14 @@ impl Observer {
                 break;
             }
         }
-        if let Some((order, _)) = &due {
-            // Claimed before it starts, so a slow run can't be started twice.
-            states.entry(order.id.clone()).or_default().last_run = Some(now);
+        if let Some((order, cause)) = &due {
+            // Claimed before it starts: it holds the cooldown and counts
+            // toward today's limit, so a slow run can't start twice and one
+            // that never comes back still counted.
+            states.entry(order.id.clone()).or_default().claim(now);
+            if matches!(cause, crate::orders::Cause::Manual) {
+                orders.take_request(&order.id);
+            }
         }
         let _ = orders.save_states(&states);
         let Some((order, cause)) = due else { return };

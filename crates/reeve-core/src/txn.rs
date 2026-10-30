@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::distro::quote;
 use crate::policy::{Tier, shell as classify};
-use crate::tools::{ToolCtx, shell_exec_status};
+use crate::tools::{ToolCtx, shell_exec_out, shell_exec_status};
 
 /// One check Reeve runs after the changes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -149,17 +149,16 @@ impl Check {
             }
             Self::JournalQuiet { unit, max, user } => {
                 let flag = if *user { "--user-unit" } else { "-u" };
+                // One JSON object a line, so lines are entries. No `-q`:
+                // journalctl's warning that this user can't see the system
+                // journal is part of the answer.
                 let cmd = format!(
-                    "journalctl {flag} {} --since @{} -p err -q --no-pager | wc -l",
+                    "journalctl {flag} {} --since @{} -p err --no-pager -o json",
                     quote(unit),
                     since.timestamp()
                 );
-                let (_, out) = shell_exec_status(ctx, &cmd).await;
-                let n: u32 = out.trim().parse().unwrap_or(u32::MAX);
-                (
-                    n <= *max,
-                    format!("{n} errors from {unit} since the change"),
-                )
+                let (code, out, err) = shell_exec_out(ctx, &cmd).await;
+                journal_verdict(unit, *max, code, &out, &err)
             }
             Self::DiskBelow { mount, percent } => {
                 let cmd = format!("df --output=pcent {} | tail -n 1", quote(mount));
@@ -174,6 +173,30 @@ impl Check {
             }
         }
     }
+}
+
+/// What a journal read proves. Entries are counted only when journalctl
+/// exited 0 with nothing on stderr: a read that failed, timed out, or
+/// warned that part of the journal is out of reach fails the check and
+/// says why, since "0 errors" from a journal that wasn't read proves
+/// nothing.
+fn journal_verdict(
+    unit: &str,
+    max: u32,
+    code: Option<i32>,
+    out: &str,
+    err: &str,
+) -> (bool, String) {
+    let warned = err.lines().map(str::trim).find(|l| !l.is_empty());
+    if code != Some(0) || warned.is_some() {
+        let why = warned.map(str::to_string).unwrap_or_else(|| match code {
+            Some(c) => format!("journalctl exited {c}"),
+            None => "journalctl didn't finish".into(),
+        });
+        return (false, format!("couldn't read {unit}'s journal: {why}"));
+    }
+    let n = out.lines().filter(|l| !l.trim().is_empty()).count() as u32;
+    (n <= max, format!("{n} errors from {unit} since the change"))
 }
 
 /// An open transaction.
@@ -286,6 +309,34 @@ mod tests {
 
     fn ctx() -> ToolCtx {
         ToolCtx::new(tempfile::tempdir().unwrap().keep(), vec![])
+    }
+
+    #[test]
+    fn a_journal_that_was_not_read_is_not_quiet() {
+        let v =
+            |max, code, out: &str, err: &str| journal_verdict("sshd.service", max, code, out, err);
+        let (ok, why) = v(0, Some(1), "", "");
+        assert!(!ok);
+        assert_eq!(
+            why,
+            "couldn't read sshd.service's journal: journalctl exited 1"
+        );
+        let hint = "Hint: You are currently not seeing messages from other users and the system.\n";
+        let (ok, why) = v(0, Some(0), "", hint);
+        assert!(!ok, "a partial read is not a read");
+        assert!(why.contains("not seeing messages"), "{why}");
+        let (ok, why) = v(0, None, "", "timed out after 30 s");
+        assert!(!ok);
+        assert!(why.contains("timed out"), "{why}");
+        let (ok, why) = v(0, Some(0), "", "");
+        assert!(ok, "a clean empty read is quiet");
+        assert_eq!(why, "0 errors from sshd.service since the change");
+        let two = "{\"MESSAGE\":\"a\"}\n{\"MESSAGE\":\"b\"}\n";
+        assert_eq!(
+            v(1, Some(0), two, ""),
+            (false, "2 errors from sshd.service since the change".into())
+        );
+        assert!(v(2, Some(0), two, "").0);
     }
 
     #[test]

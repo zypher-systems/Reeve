@@ -344,9 +344,9 @@ pub(crate) async fn shell_exec(ctx: &ToolCtx, command: &str, sudo: bool) -> Opti
     (out.code == Some(0)).then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Run a read-only command (a check): its exit code and its output, stdout
-/// then stderr.
-pub(crate) async fn shell_exec_status(ctx: &ToolCtx, command: &str) -> (Option<i32>, String) {
+/// Run a read-only command (a check): its exit code, its stdout, and its
+/// stderr (with the reason, when it couldn't start or timed out).
+pub(crate) async fn shell_exec_out(ctx: &ToolCtx, command: &str) -> (Option<i32>, String, String) {
     let out = shell::run_command(
         ctx,
         shell::RunSpec {
@@ -358,12 +358,23 @@ pub(crate) async fn shell_exec_status(ctx: &ToolCtx, command: &str) -> (Option<i
         },
     )
     .await;
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    let mut err = String::from_utf8_lossy(&out.stderr).into_owned();
     if let Some(f) = out.failure {
-        text.push_str(&f);
+        err.push_str(&f);
     }
-    (out.code, text)
+    (
+        out.code,
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        err,
+    )
+}
+
+/// Run a read-only command (a check): its exit code and its output, stdout
+/// then stderr.
+pub(crate) async fn shell_exec_status(ctx: &ToolCtx, command: &str) -> (Option<i32>, String) {
+    let (code, mut text, err) = shell_exec_out(ctx, command).await;
+    text.push_str(&err);
+    (code, text)
 }
 
 /// Undo receipt `seq` (files, root files, packages, or a unit) and write a
