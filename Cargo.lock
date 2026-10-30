@@ -1171,8 +1171,9 @@ dependencies = [
 
 [[package]]
 name = "reeve-cli"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
+ "async-trait",
  "chrono",
  "clap",
  "crossterm",
@@ -1180,12 +1181,13 @@ dependencies = [
  "reeve-observer",
  "reeve-tui",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
 [[package]]
 name = "reeve-core"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1204,13 +1206,15 @@ dependencies = [
  "tokio",
  "toml",
  "toml_edit",
+ "url",
  "uuid",
  "walkdir",
+ "zeroize",
 ]
 
 [[package]]
 name = "reeve-observer"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1225,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "reeve-tui"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "async-trait",
  "chrono",

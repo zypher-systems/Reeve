@@ -110,6 +110,12 @@ pub async fn pass(home: &Path, cfg: &Config, store: &FindingStore, profile: &str
             d.max_drafts_per_day
         ));
     }
+    // No trusted accounting, no unattended spend.
+    if ledger::totals(home, Local::now()).unreadable {
+        return Pass::Blocked(
+            "this month's spend ledger has records Reeve can't read; the drafter waits until it's fixed (~/.reeve/spend)".into(),
+        );
+    }
     let conn_name = d
         .connection
         .clone()
@@ -172,10 +178,9 @@ pub async fn pass(home: &Path, cfg: &Config, store: &FindingStore, profile: &str
     let spent_now = agent.tally().usd;
     let reply = agent.last_reply().map(str::to_string);
     let _ = agent.write_report();
+    // A reply from before the error isn't a proposal.
     if let Some(msg) = failed.into_inner().ok().flatten() {
-        if reply.is_none() {
-            return block(&mut f, format!("draft failed: {msg}"));
-        }
+        return block(&mut f, format!("draft failed: {msg}"));
     }
     let Some(text) = reply else {
         return block(&mut f, "the drafter produced no proposal".into());

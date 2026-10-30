@@ -10,7 +10,7 @@
 %global __brp_mangle_shebangs_exclude_from ^/usr/src/debug/.*$
 
 Name:           reeve
-Version:        0.7.1
+Version:        0.7.2
 Release:        1%{?dist}
 Summary:        An operator agent that manages this computer, with receipts
 
@@ -77,6 +77,12 @@ install -Dpm 0644 packaging/systemd/reeved.service %{buildroot}%{_userunitdir}/r
 %{_userunitdir}/reeved.service
 
 %changelog
+* Thu Oct 29 2026 Zypher Systems <zypher@zyphersystems.com> - 0.7.2-1
+- The sudo password is asked once per five minutes, not once per root step; [approvals] password_minutes sets it.
+- Standing orders count every start against runs_per_day, and "run now" requests all run, one a tick.
+- A verified change fails when its journal check can't read the journal, instead of passing.
+- Failure paths fail closed: exclusive temp files, no action without a receipt, private state, unreadable ledgers stop unattended spend, a broken config pauses orders.
+
 * Mon Oct 19 2026 Zypher Systems <zypher@zyphersystems.com> - 0.7.1-1
 - Critical: tool calls failed with "stream did not contain valid UTF-8" once the receipt log grew so its last 64 KiB started inside a character.
 

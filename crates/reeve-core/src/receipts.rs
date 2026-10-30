@@ -218,6 +218,27 @@ impl ReceiptBook {
         files
     }
 
+    /// Whether a receipt could be appended now: the directory, its lock,
+    /// the chain's head and this month's file are all reachable. Checked
+    /// before an action runs, so nothing happens that can't be recorded.
+    pub fn writable(&self) -> Result<()> {
+        fs::create_dir_all(&self.dir)?;
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.dir.join(".lock"))?;
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+            .map_err(|e| Error::Io(format!("receipt lock: {e}")))?;
+        self.head()?;
+        let month = chrono::Utc::now().format("%Y-%m").to_string();
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join(format!("{month}.jsonl")))?;
+        Ok(())
+    }
+
     /// Seal and append a receipt: sets `seq`, `prev`, `hash`. Holds a lock
     /// so two Reeve processes can't fork the chain.
     pub fn append(&self, mut r: Receipt) -> Result<Receipt> {

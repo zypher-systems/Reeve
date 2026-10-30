@@ -320,26 +320,91 @@ impl UndoStore {
 
 /// Write via a temp file in the same directory, then rename over.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let dir = path.parent().unwrap_or(Path::new("/"));
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.reeve-{}", std::process::id()));
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+    // A random name, created exclusively: a symlink or file planted under
+    // a guessable name can't redirect the write.
+    let mut opened = None;
+    for _ in 0..16 {
+        let tmp = dir.join(format!(".{name}.reeve-{}", random_hex(6)));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode.map_or(0o666, |m| m & 0o7777))
+            .open(&tmp)
+        {
+            Ok(f) => {
+                opened = Some((tmp, f));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
     }
-    #[cfg(unix)]
+    let Some((tmp, mut f)) = opened else {
+        return Err(Error::Io(format!(
+            "couldn't create a temporary file next to {}",
+            path.display()
+        )));
+    };
+    let written = f.write_all(bytes).and_then(|()| f.sync_all());
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     if let Some(m) = mode {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(m & 0o7777))?;
+        // The open above was masked by the umask; this is the exact mode,
+        // set on the open file, not on a name that could have been swapped.
+        if let Err(e) = f.set_permissions(fs::Permissions::from_mode(m & 0o7777)) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+    }
+    // In a directory others can write to, the name may no longer be this
+    // file. Only this file is put in place.
+    let same = (|| {
+        use std::os::unix::fs::MetadataExt;
+        let (ours, named) = (f.metadata()?, fs::symlink_metadata(&tmp)?);
+        Ok::<_, std::io::Error>(ours.dev() == named.dev() && ours.ino() == named.ino())
+    })();
+    match same {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(Error::Io(format!(
+                "{} was swapped while being written; nothing was put in place",
+                tmp.display()
+            )));
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
     }
     fs::rename(&tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })?;
     Ok(())
+}
+
+/// `n` random bytes as hex, from the kernel.
+pub(crate) fn random_hex(n: usize) -> String {
+    use std::io::Read;
+    let mut buf = vec![0u8; n];
+    if fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_err()
+    {
+        // Never happens on Linux; still never a fixed name.
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        return format!("{:x}{:x}", std::process::id(), t);
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn mode_of(meta: &fs::Metadata) -> u32 {
@@ -358,6 +423,39 @@ fn mode_of(meta: &fs::Metadata) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_atomic_never_writes_through_a_planted_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let victim = d.path().join("victim");
+        fs::write(&victim, "keep").unwrap();
+        let target = d.path().join("target");
+        // The name an earlier Reeve used, planted as a link to the victim.
+        let planted = d
+            .path()
+            .join(format!(".target.reeve-{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        write_atomic(&target, b"new", Some(0o600)).unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+        let meta = fs::symlink_metadata(&target).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "the target is a file, not a link"
+        );
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let left: Vec<String> = fs::read_dir(d.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".target.reeve-"))
+            .collect();
+        assert_eq!(left.len(), 1, "only the plant remains: {left:?}");
+        // Without a mode, the file follows the umask like any new file.
+        write_atomic(&d.path().join("plain"), b"x", None).unwrap();
+        assert!(d.path().join("plain").is_file());
+    }
 
     #[test]
     fn a_write_can_be_undone_and_redone() {

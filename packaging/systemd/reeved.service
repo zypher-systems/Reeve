@@ -2,7 +2,7 @@
 #   systemctl --user enable --now reeved
 # (or `reeve daemon install`, which does the same when this file is present).
 [Unit]
-Description=Reeve observer: watches this machine, never changes it on its own
+Description=Reeve observer: watches this machine and runs the standing orders you set
 Documentation=https://github.com/zypher-systems/reeve
 After=graphical-session.target
 

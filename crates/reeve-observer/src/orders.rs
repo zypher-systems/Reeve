@@ -144,6 +144,22 @@ fn prompt(order: &Order, cause: &Cause) -> String {
     )
 }
 
+/// What a run was. Something outside the scope stopped it: blocked. A fix
+/// failed its checks: rolled back. An error on the way (the provider, the
+/// budget, a receipt), however much was said before it: failed. Only a run
+/// that ended with a report and no error is done.
+fn status_of(blocked: bool, rolled_back: bool, errored: bool, replied: bool) -> &'static str {
+    if blocked {
+        "blocked"
+    } else if rolled_back {
+        "rolled_back"
+    } else if errored || !replied {
+        "failed"
+    } else {
+        "done"
+    }
+}
+
 /// Run one order now. The caller checks frequency limits first.
 pub async fn run(home: &Path, cfg: &Config, order: &Order, cause: Cause, profile: &str) -> Run {
     let started = Utc::now();
@@ -156,6 +172,11 @@ pub async fn run(home: &Path, cfg: &Config, order: &Order, cause: Cause, profile
         usd: None,
         session: None,
     };
+    // No trusted accounting, no unattended spend.
+    if reeve_core::ledger::totals(home, chrono::Local::now()).unreadable {
+        record.summary = "this month's spend ledger has records Reeve can't read, so nothing runs unattended until it's fixed (~/.reeve/spend)".into();
+        return record;
+    }
     let conn_name = order
         .connection
         .clone()
@@ -243,19 +264,19 @@ pub async fn run(home: &Path, cfg: &Config, order: &Order, cause: Cause, profile
         .map(|b| b.clone())
         .unwrap_or_default();
     let err = failed.into_inner().ok().flatten();
-    record.summary = reply
-        .clone()
-        .or_else(|| err.clone())
-        .unwrap_or_else(|| "no report".into());
-    record.status = if !blocked.is_empty() {
-        "blocked".into()
-    } else if !rolled_back.is_empty() {
-        "rolled_back".into()
-    } else if reply.is_none() {
-        "failed".into()
-    } else {
-        "done".into()
+    record.summary = match (&err, &reply) {
+        (Some(e), Some(r)) => format!("{e}\n{r}"),
+        (Some(e), None) => e.clone(),
+        (None, Some(r)) => r.clone(),
+        (None, None) => "no report".into(),
     };
+    record.status = status_of(
+        !blocked.is_empty(),
+        !rolled_back.is_empty(),
+        err.is_some(),
+        reply.is_some(),
+    )
+    .into();
     if !blocked.is_empty() {
         let head = format!(
             "Standing order \"{}\" stopped: it needed things outside its scope.",
@@ -362,6 +383,15 @@ mod tests {
             },
             StreamDelta::Done,
         ]
+    }
+
+    #[test]
+    fn an_error_is_a_failure_whatever_was_said_before() {
+        assert_eq!(status_of(false, false, false, true), "done");
+        assert_eq!(status_of(false, false, true, true), "failed");
+        assert_eq!(status_of(false, false, false, false), "failed");
+        assert_eq!(status_of(false, true, true, true), "rolled_back");
+        assert_eq!(status_of(true, true, true, true), "blocked");
     }
 
     #[tokio::test]

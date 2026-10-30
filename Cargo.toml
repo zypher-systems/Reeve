@@ -4,7 +4,7 @@ members = ["crates/reeve-core", "crates/reeve-observer", "crates/reeve-tui", "cr
 default-members = ["crates/reeve-cli"]
 
 [workspace.package]
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -26,12 +26,14 @@ dirs = "6"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "time", "sync", "process", "net"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+url = "2"
 futures-util = "0.3"
 async-trait = "0.1"
 bytes = "1"
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 rustix = { version = "1", features = ["fs", "process"] }
+zeroize = "1"
 sha2 = "0.10"
 regex = "1"
 walkdir = "2"

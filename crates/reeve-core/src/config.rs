@@ -88,6 +88,38 @@ impl ConnectionConfig {
     pub fn is_local(&self) -> bool {
         self.kind == "local"
     }
+
+    /// The host of a `local` connection that isn't this machine. "Local"
+    /// turns masking off and counts the calls as free, so it has to be true.
+    /// The URL is read by the parser the client dials with (the `url`
+    /// crate, WHATWG), so the host checked is the host called: a hand
+    /// split of the authority disagrees with it on `#`, `?` and `\` before
+    /// an `@`, and on `127.1`, `0x7f000001` or `LOCALHOST`.
+    pub fn local_url_problem(&self) -> Option<String> {
+        if !self.is_local() {
+            return None;
+        }
+        let parsed = match url::Url::parse(&self.base_url) {
+            Ok(u) => u,
+            Err(e) => return Some(format!("nothing Reeve can read as a URL ({e})")),
+        };
+        // A name is local by name only; an address only if it is one of
+        // this machine's. `127.evil.com` is neither.
+        let local = match parsed.host() {
+            Some(url::Host::Domain(d)) => d == "localhost" || d.ends_with(".localhost"),
+            Some(url::Host::Ipv4(v4)) => v4.is_loopback() || v4.is_unspecified(),
+            Some(url::Host::Ipv6(v6)) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
+            None => false,
+        };
+        (!local).then(|| match parsed.host() {
+            Some(h) => h.to_string(),
+            None => format!("no host ({})", self.base_url),
+        })
+    }
 }
 
 /// `[pricing."<model>"]`. Values are USD per million tokens.
@@ -133,7 +165,7 @@ impl Default for SpendConfig {
 }
 
 /// `[approvals]`.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ApprovalConfig {
     /// Start every session in YOLO mode (auto-approve T0–T2). The safeguard
@@ -143,6 +175,20 @@ pub struct ApprovalConfig {
     /// deletes it keeps a copy of) without asking. Changes it can't undo,
     /// system changes, and the floor still ask. Off by default.
     pub undoable: bool,
+    /// How long a typed sudo password answers the root steps that follow,
+    /// in minutes (sudo's own default is 5). It stays in memory only and
+    /// goes when Reeve quits; 0 asks for every step.
+    pub password_minutes: u64,
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            yolo: false,
+            undoable: false,
+            password_minutes: 5,
+        }
+    }
 }
 
 /// `[snapshots]`.
@@ -391,6 +437,14 @@ pub fn connection_template(kind: &str) -> Result<ConnectionConfig> {
     })
 }
 
+/// Create `dir` if needed and make it the owner's alone (0700), whatever
+/// the umask: Reeve's state is private.
+pub fn private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
 /// Where Reeve keeps its state (`REEVE_HOME` or `~/.reeve`).
 pub fn home_dir() -> PathBuf {
     if let Ok(p) = std::env::var("REEVE_HOME") {
@@ -599,6 +653,95 @@ pub fn store_secret_at(home: &Path, connection: &str, secret: &str) -> Result<Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_local_connection_must_point_at_this_machine() {
+        let conn = |kind: &str, url: &str| ConnectionConfig {
+            kind: kind.into(),
+            base_url: url.into(),
+            env_key: None,
+            api_key: None,
+            default_model: None,
+        };
+        for url in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://[::1]:8080/v1",
+            "http://user:pw@localhost/v1",
+            "http://llm.localhost/v1",
+            "http://127.1.2.3:8080/v1",
+            "http://[::ffff:127.0.0.1]:8080/v1",
+            "http://0.0.0.0:8080/v1",
+            // Spellings the client resolves to loopback.
+            "http://127.1:8080/v1",
+            "http://127.0.1:8080/v1",
+            "http://2130706433/v1",
+            "http://0x7f000001/v1",
+            "http://LOCALHOST:11434/v1",
+        ] {
+            assert_eq!(conn("local", url).local_url_problem(), None, "{url}");
+        }
+        for (url, host) in [
+            ("http://127.evil.com/v1", "127.evil.com"),
+            ("http://127.0.0.1.example.com/v1", "127.0.0.1.example.com"),
+            ("http://[fe80::1]:8080/v1", "[fe80::1]"),
+            // The `@` is in the fragment, the query, or the path: the
+            // client dials evil.com.
+            ("http://evil.com#@127.0.0.1/v1", "evil.com"),
+            ("http://evil.com?@127.0.0.1/v1", "evil.com"),
+            ("http://evil.com\\@127.0.0.1/v1", "evil.com"),
+        ] {
+            assert_eq!(
+                conn("local", url).local_url_problem(),
+                Some(host.into()),
+                "{url}: the host checked is the host dialed"
+            );
+        }
+        for url in ["localhost:11434/v1", "not a url"] {
+            let p = conn("local", url).local_url_problem();
+            assert!(
+                p.as_deref()
+                    .is_some_and(|p| p.starts_with("no host") || p.starts_with("nothing")),
+                "{url}: {p:?}"
+            );
+        }
+        assert_eq!(
+            conn("local", "https://api.example.com/v1").local_url_problem(),
+            Some("api.example.com".into())
+        );
+        assert_eq!(
+            conn("local", "http://192.168.1.20:11434/v1").local_url_problem(),
+            Some("192.168.1.20".into())
+        );
+        assert_eq!(
+            conn("openai", "https://api.example.com/v1").local_url_problem(),
+            None,
+            "only a connection that claims to be local"
+        );
+    }
+
+    #[test]
+    fn private_dir_is_the_owners_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("state");
+        std::fs::create_dir(&p).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        private_dir(&p).unwrap();
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        private_dir(&p.join("deeper/still")).unwrap();
+        assert_eq!(
+            std::fs::metadata(p.join("deeper/still"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
 
     #[test]
     fn user_connections_merge_over_builtins() {

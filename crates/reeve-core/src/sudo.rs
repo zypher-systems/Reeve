@@ -9,27 +9,44 @@
 //!
 //! The socket answers only while an approved root action is running
 //! ("armed"), and only to a caller holding this session's token.
+//!
+//! sudo's own five-minute cache is no help here: with no terminal it is
+//! keyed on sudo's parent process, and that is a fresh shell for every
+//! command. So Reeve remembers the typed password itself, in memory, for
+//! `[approvals] password_minutes`, and answers each new sudo with it. The
+//! helper names the sudo process asking (its parent). The same process
+//! asking twice means sudo refused what it got: the memory is dropped and
+//! the person is asked. Any other process asking is simply the next step.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 
 /// Name the askpass link is called by; `main` checks `argv[0]` for it.
 pub const HELPER_NAME: &str = "reeve-askpass";
 
-/// Where a password comes from.
+/// What the person typed.
+pub struct Answer {
+    pub secret: String,
+    /// Keep it for the root steps that follow, within `password_minutes`.
+    pub remember: bool,
+}
+
+/// Where a password comes from when Reeve doesn't remember one.
 #[async_trait]
 pub trait PasswordSource: Send + Sync {
-    /// Ask for the password sudo wants. `None` refuses.
-    async fn password(&self, prompt: String) -> Option<String>;
+    /// Ask the person for the password sudo wants. `None` refuses.
+    async fn password(&self, prompt: String) -> Option<Answer>;
 }
 
 /// A running askpass endpoint.
@@ -39,6 +56,9 @@ pub struct Askpass {
     sock: PathBuf,
     token: String,
     armed: Arc<AtomicUsize>,
+    /// Counts `arm` calls: a sudo process is told apart by its pid and the
+    /// run it asked in.
+    runs: Arc<AtomicU64>,
 }
 
 /// While alive, the socket will ask for a password.
@@ -50,16 +70,42 @@ impl Drop for Armed {
     }
 }
 
+/// The remembered password. Memory only, wiped when dropped or replaced.
+#[derive(Default)]
+struct Remembered {
+    /// The password and when it last answered sudo.
+    secret: Option<(Zeroizing<String>, Instant)>,
+    /// The sudo process (run, pid) that got the last answer.
+    answered: Option<(u64, u32)>,
+}
+
+impl std::fmt::Debug for Remembered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Remembered")
+            .field("secret", &self.secret.as_ref().map(|_| "<held>"))
+            .field("answered", &self.answered)
+            .finish()
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Ask {
     token: String,
     prompt: String,
+    /// The sudo process asking: the helper's parent.
+    #[serde(default)]
+    caller: u32,
 }
 
 impl Askpass {
     /// Set up `bin/` (the helper link and the sudo wrapper) and start
-    /// listening. Needs a tokio runtime.
-    pub fn start(reeve_home: &Path, source: Arc<dyn PasswordSource>) -> Result<Self> {
+    /// listening. A typed password is remembered for `remember_for` (zero:
+    /// never). Needs a tokio runtime.
+    pub fn start(
+        reeve_home: &Path,
+        source: Arc<dyn PasswordSource>,
+        remember_for: Duration,
+    ) -> Result<Self> {
         let bin_dir = reeve_home.join("bin");
         fs::create_dir_all(&bin_dir)?;
         set_mode(&bin_dir, 0o700)?;
@@ -96,15 +142,19 @@ impl Askpass {
 
         let token = random_token()?;
         let armed = Arc::new(AtomicUsize::new(0));
+        let runs = Arc::new(AtomicU64::new(0));
+        let memory = Arc::new(Mutex::new(Remembered::default()));
         let ap = Self {
             bin_dir,
             sock,
             token: token.clone(),
             armed: armed.clone(),
+            runs: runs.clone(),
         };
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let (source, token, armed) = (source.clone(), token.clone(), armed.clone());
+                let (source, token) = (source.clone(), token.clone());
+                let (armed, runs, memory) = (armed.clone(), runs.clone(), memory.clone());
                 tokio::spawn(async move {
                     let (r, mut w) = stream.into_split();
                     let mut line = String::new();
@@ -117,7 +167,8 @@ impl Askpass {
                     }
                     let reply = match serde_json::from_str::<Ask>(&line) {
                         Ok(ask) if ask.token == token && armed.load(Ordering::SeqCst) > 0 => {
-                            match source.password(ask.prompt).await {
+                            let run = runs.load(Ordering::SeqCst);
+                            match answer(ask, &*source, &memory, run, remember_for).await {
                                 Some(pw) => format!("OK {pw}\n"),
                                 None => "NO\n".into(),
                             }
@@ -133,6 +184,7 @@ impl Askpass {
 
     /// Allow password requests until the guard drops.
     pub fn arm(&self) -> Armed {
+        self.runs.fetch_add(1, Ordering::SeqCst);
         self.armed.fetch_add(1, Ordering::SeqCst);
         Armed(self.armed.clone())
     }
@@ -155,6 +207,45 @@ impl Askpass {
     pub fn sudo_path(&self) -> PathBuf {
         self.bin_dir.join("sudo")
     }
+}
+
+/// The password for `ask`: the remembered one when a sudo that hasn't
+/// asked yet wants it and the memory is fresh, otherwise the person's.
+async fn answer(
+    ask: Ask,
+    source: &dyn PasswordSource,
+    memory: &Mutex<Remembered>,
+    run: u64,
+    remember_for: Duration,
+) -> Option<String> {
+    let caller = (run, ask.caller);
+    let remembered = {
+        let mut m = memory.lock().unwrap_or_else(PoisonError::into_inner);
+        if m.answered == Some(caller) {
+            // The same sudo asks again: it refused what it got.
+            m.secret = None;
+            None
+        } else {
+            match m.secret.take() {
+                Some((pw, at)) if at.elapsed() < remember_for => {
+                    // Like sudo's own cache, the clock restarts on each use.
+                    m.secret = Some((pw.clone(), Instant::now()));
+                    m.answered = Some(caller);
+                    Some(pw)
+                }
+                _ => None,
+            }
+        }
+    };
+    if let Some(pw) = remembered {
+        return Some(pw.to_string());
+    }
+    let a = source.password(ask.prompt).await?;
+    let mut m = memory.lock().unwrap_or_else(PoisonError::into_inner);
+    m.secret = (a.remember && !remember_for.is_zero())
+        .then(|| (Zeroizing::new(a.secret.clone()), Instant::now()));
+    m.answered = Some(caller);
+    Some(a.secret)
 }
 
 /// Remove sockets left by Reeve processes that are gone.
@@ -191,7 +282,13 @@ pub fn helper_main() -> i32 {
         eprintln!("reeve-askpass: Reeve isn't running");
         return 1;
     };
-    let ask = serde_json::to_string(&Ask { token, prompt }).unwrap_or_default();
+    let ask = Ask {
+        token,
+        prompt,
+        // sudo runs the helper itself, so this is the sudo asking.
+        caller: std::os::unix::process::parent_id(),
+    };
+    let ask = serde_json::to_string(&ask).unwrap_or_default();
     if writeln!(stream, "{ask}").is_err() {
         return 1;
     }
@@ -236,17 +333,37 @@ fn set_mode(p: &Path, mode: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
-    struct Fixed(Option<&'static str>);
+    const FIVE_MINUTES: Duration = Duration::from_secs(300);
+
+    /// Answers in order, then refuses. Counts how often it was asked.
+    struct Script {
+        answers: Mutex<VecDeque<(&'static str, bool)>>,
+        asked: AtomicUsize,
+    }
+
+    fn script(answers: &[(&'static str, bool)]) -> Arc<Script> {
+        Arc::new(Script {
+            answers: Mutex::new(answers.iter().copied().collect()),
+            asked: AtomicUsize::new(0),
+        })
+    }
 
     #[async_trait]
-    impl PasswordSource for Fixed {
-        async fn password(&self, _prompt: String) -> Option<String> {
-            self.0.map(String::from)
+    impl PasswordSource for Script {
+        async fn password(&self, _prompt: String) -> Option<Answer> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            let (secret, remember) = self.answers.lock().unwrap().pop_front()?;
+            Some(Answer {
+                secret: secret.into(),
+                remember,
+            })
         }
     }
 
-    async fn ask(ap: &Askpass, token: &str) -> String {
+    /// What sudo process `caller` gets when it asks with `token`.
+    async fn ask(ap: &Askpass, token: &str, caller: u32) -> String {
         let sock = ap.sock.clone();
         let token = token.to_string();
         tokio::task::spawn_blocking(move || {
@@ -256,7 +373,8 @@ mod tests {
                 "{}",
                 serde_json::to_string(&Ask {
                     token,
-                    prompt: "pw".into()
+                    prompt: "pw".into(),
+                    caller,
                 })
                 .unwrap()
             )
@@ -272,20 +390,110 @@ mod tests {
     #[tokio::test]
     async fn answers_only_when_armed_and_with_the_token() {
         let home = tempfile::tempdir().unwrap();
-        let ap = Askpass::start(home.path(), Arc::new(Fixed(Some("hunter2")))).unwrap();
-        assert_eq!(ask(&ap, &ap.token).await, "NO\n", "not armed");
+        let src = script(&[("hunter2", true)]);
+        let ap = Askpass::start(home.path(), src.clone(), FIVE_MINUTES).unwrap();
+        assert_eq!(ask(&ap, &ap.token, 1).await, "NO\n", "not armed");
         let guard = ap.arm();
-        assert_eq!(ask(&ap, "wrong").await, "NO\n", "bad token");
-        assert_eq!(ask(&ap, &ap.token).await, "OK hunter2\n");
+        assert_eq!(ask(&ap, "wrong", 1).await, "NO\n", "bad token");
+        assert_eq!(ask(&ap, &ap.token, 1).await, "OK hunter2\n");
         drop(guard);
-        assert_eq!(ask(&ap, &ap.token).await, "NO\n", "disarmed");
+        assert_eq!(ask(&ap, &ap.token, 2).await, "NO\n", "disarmed");
+        assert_eq!(
+            src.asked.load(Ordering::SeqCst),
+            1,
+            "refusals never reach the person"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remembered_password_answers_each_new_sudo_but_not_the_same_one_twice() {
+        let home = tempfile::tempdir().unwrap();
+        let src = script(&[("hunter2", true), ("letmein", true)]);
+        let ap = Askpass::start(home.path(), src.clone(), FIVE_MINUTES).unwrap();
+        let asked = || src.asked.load(Ordering::SeqCst);
+
+        // One command: a pre-snapshot's sudo, then the action's.
+        let run = ap.arm();
+        assert_eq!(ask(&ap, &ap.token, 100).await, "OK hunter2\n");
+        assert_eq!(ask(&ap, &ap.token, 200).await, "OK hunter2\n");
+        assert_eq!(asked(), 1, "the second sudo is answered from memory");
+        drop(run);
+
+        // The next command, whose sudo happens to reuse a pid from before.
+        let run = ap.arm();
+        assert_eq!(ask(&ap, &ap.token, 100).await, "OK hunter2\n");
+        assert_eq!(asked(), 1, "a new run is a new sudo, whatever its pid");
+
+        // The same sudo again: it refused the password. The memory goes
+        // and the person is asked; what they type is remembered instead.
+        assert_eq!(ask(&ap, &ap.token, 100).await, "OK letmein\n");
+        assert_eq!(asked(), 2);
+        assert_eq!(ask(&ap, &ap.token, 300).await, "OK letmein\n");
+        assert_eq!(asked(), 2);
+
+        // Refused again, and the person gives nothing: nothing is kept.
+        assert_eq!(ask(&ap, &ap.token, 300).await, "NO\n");
+        assert_eq!(asked(), 3);
+        assert_eq!(ask(&ap, &ap.token, 400).await, "NO\n");
+        assert_eq!(asked(), 4, "no stale memory answers after a refusal");
+        drop(run);
+    }
+
+    #[tokio::test]
+    async fn not_kept_when_the_person_says_so_or_the_config_forbids_it() {
+        let home = tempfile::tempdir().unwrap();
+        let src = script(&[("a", false), ("b", true)]);
+        let ap = Askpass::start(home.path(), src.clone(), FIVE_MINUTES).unwrap();
+        let _run = ap.arm();
+        assert_eq!(ask(&ap, &ap.token, 1).await, "OK a\n");
+        assert_eq!(
+            ask(&ap, &ap.token, 2).await,
+            "OK b\n",
+            "`a` wasn't to be remembered"
+        );
+        assert_eq!(src.asked.load(Ordering::SeqCst), 2);
+
+        let home = tempfile::tempdir().unwrap();
+        let src = script(&[("a", true), ("b", true)]);
+        let ap = Askpass::start(home.path(), src.clone(), Duration::ZERO).unwrap();
+        let _run = ap.arm();
+        assert_eq!(ask(&ap, &ap.token, 1).await, "OK a\n");
+        assert_eq!(
+            ask(&ap, &ap.token, 2).await,
+            "OK b\n",
+            "password_minutes = 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_memory_expires_and_each_use_restarts_the_clock() {
+        let home = tempfile::tempdir().unwrap();
+        let src = script(&[("a", true), ("b", true)]);
+        let ap = Askpass::start(home.path(), src.clone(), Duration::from_millis(150)).unwrap();
+        let _run = ap.arm();
+        assert_eq!(ask(&ap, &ap.token, 1).await, "OK a\n");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(ask(&ap, &ap.token, 2).await, "OK a\n", "still fresh");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            ask(&ap, &ap.token, 3).await,
+            "OK a\n",
+            "the use restarted the clock"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            ask(&ap, &ap.token, 4).await,
+            "OK b\n",
+            "expired: asked again"
+        );
+        assert_eq!(src.asked.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
     async fn the_socket_and_bin_are_private() {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
-        let ap = Askpass::start(home.path(), Arc::new(Fixed(None))).unwrap();
+        let ap = Askpass::start(home.path(), script(&[]), FIVE_MINUTES).unwrap();
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&ap.sock), 0o600);
         assert_eq!(mode(&home.path().join("bin")), 0o700);

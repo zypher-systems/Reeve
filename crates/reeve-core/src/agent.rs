@@ -699,6 +699,17 @@ impl Agent {
             // Nothing happened, so there's nothing to receipt.
             Err(msg) => return Ok(call_error(call, &msg, emit)),
         };
+        // Nothing runs that can't be recorded: the receipt log must take a
+        // receipt now, or the action is refused before anything happens.
+        if let Err(e) = self.receipts.writable() {
+            return Ok(call_error(
+                call,
+                &format!(
+                    "Reeve can't write its receipts ({e}), so no action runs until that's fixed. Tell the owner."
+                ),
+                emit,
+            ));
+        }
         // What only the owner may say yes to (a standing order, a skill, an
         // AUR build) never happens unattended: an order can't make another,
         // and the drafter can't make one.
@@ -1039,6 +1050,8 @@ impl Agent {
 
     /// `change_commit` (or the end of a turn): run the checks; if one fails,
     /// undo the change's actions newest first. Reeve's own results decide.
+    /// Neither the verdict nor a rollback happens without receipts to write
+    /// them to: the change stays open instead.
     async fn commit(
         &mut self,
         id: &str,
@@ -1069,6 +1082,25 @@ impl Agent {
             summary: format!("check: {}", t.goal),
         });
         let results = t.verify(&self.tools).await;
+        // A failed check rolls the change back, which changes the machine,
+        // and the verdict is a receipt: both need receipts Reeve can write
+        // now. If it can't, nothing is touched, and the change stays open
+        // for the check once the owner has fixed that.
+        if let Err(e) = self.receipts.writable() {
+            let msg = format!(
+                "Reeve can't write its receipts ({e}), so it can't record a verdict on change {} or roll it back; nothing was touched, and the change stays open until that's fixed",
+                t.id
+            );
+            self.txn = Some(t);
+            emit(AgentEvent::ToolFinished {
+                id: id.into(),
+                status: Status::Error,
+                summary: msg.clone(),
+                diff: None,
+                receipt: None,
+            });
+            return Err(Error::Io(msg));
+        }
         let passed = results.iter().all(|r| r.ok);
         let mut rolled = Vec::new();
         let mut stuck: Vec<(u64, String)> = t
@@ -1194,12 +1226,12 @@ impl Agent {
         reported: Option<f64>,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<()> {
-        if usage == Usage::default() && reported.is_none() {
-            return Ok(());
-        }
         let (usd, priced_by) = match reported {
             Some(c) => (Some(c), Some("provider")),
             None if self.local => (Some(0.0), Some("local")),
+            // Neither usage nor a price came back: the call cost something
+            // unknown, which is recorded as unknown, not as nothing.
+            None if usage == Usage::default() => (None, None),
             None => {
                 let c = self.book.cost(&self.model, usage);
                 (c, c.map(|_| "book"))
@@ -1711,6 +1743,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nothing_runs_when_receipts_cannot_be_written() {
+        let (home, mut a) = agent(
+            vec![
+                call(
+                    "fs_write",
+                    serde_json::json!({"path": "~/x", "content": "x"}),
+                ),
+                done("ok"),
+            ],
+            fixed(Decision::Approve, true),
+        );
+        // The receipts directory is taken by a file: nothing can be recorded.
+        std::fs::create_dir_all(&a.home).unwrap();
+        std::fs::write(a.home.join("receipts"), "not a directory").unwrap();
+        run(&mut a).await;
+        assert!(
+            !home.path().join("x").exists(),
+            "the write ran without a receipt"
+        );
+        assert!(
+            a.transcript
+                .iter()
+                .any(|m| m.content.contains("can't write its receipts")),
+            "the model was told why"
+        );
+    }
+
+    #[tokio::test]
     async fn nobody_to_ask_means_no() {
         let (home, mut a) = agent(
             vec![
@@ -1925,6 +1985,60 @@ mod tests {
         assert!(rs.iter().all(|r| r.txn == rs[0].txn && r.txn.is_some()));
         assert_eq!(rs[2].outcome.status, Status::Ok, "{:?}", rs[2].outcome);
         assert!(rs[2].outcome.summary.starts_with("verified"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_is_not_rolled_back_without_receipts() {
+        let home = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in(home.path()).unwrap();
+        let other = tmp.path().canonicalize().unwrap().join("other.txt");
+        std::fs::write(&other, "old\n").unwrap();
+        let (_home, mut a) = agent_at(home, vec![], fixed(Decision::Approve, false));
+        let events = Mutex::new(Vec::new());
+        let emit = |e: AgentEvent| events.lock().unwrap().push(e);
+        let tc = |n: u32, (name, args): (&str, serde_json::Value)| AssistantToolCall {
+            id: format!("c{n}"),
+            name: name.into(),
+            arguments: args.to_string(),
+        };
+        a.run_call(&tc(1, begin("false")), &emit).await.unwrap();
+        a.run_call(
+            &tc(
+                2,
+                (
+                    "fs_edit",
+                    serde_json::json!({"path": other, "old": "old", "new": "new"}),
+                ),
+            ),
+            &emit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "new\n");
+        // The receipts go before the check. The rollback that a failed check
+        // calls for couldn't be recorded, so it doesn't happen.
+        let receipts = a.home.join("receipts");
+        std::fs::remove_dir_all(&receipts).unwrap();
+        std::fs::write(&receipts, "not a directory").unwrap();
+        let out = a
+            .run_call(&tc(3, ("change_commit", serde_json::json!({}))), &emit)
+            .await;
+        assert!(out.is_err(), "{out:?}");
+        assert_eq!(
+            std::fs::read_to_string(&other).unwrap(),
+            "new\n",
+            "nothing is rolled back without a receipt for it"
+        );
+        assert!(a.txn.is_some(), "the change stays open");
+        let events = events.into_inner().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolFinished { status: Status::Error, summary, .. }
+                    if summary.contains("can't write its receipts")
+            )),
+            "{events:?}"
+        );
     }
 
     #[tokio::test]

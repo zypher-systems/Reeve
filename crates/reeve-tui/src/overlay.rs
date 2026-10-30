@@ -997,6 +997,8 @@ pub struct PasswordEntry {
     pub secret: String,
     /// Keep it in memory for a few minutes.
     pub remember: bool,
+    /// How many minutes Reeve would keep it (0: it never does).
+    pub minutes: u64,
 }
 
 impl std::fmt::Debug for PasswordEntry {
@@ -1019,7 +1021,9 @@ impl PasswordEntry {
                 Action::Password(Some((std::mem::take(&mut self.secret), self.remember)))
             }
             KeyCode::Tab => {
-                self.remember = !self.remember;
+                if self.minutes > 0 {
+                    self.remember = !self.remember;
+                }
                 Action::None
             }
             KeyCode::Char('u') if ctrl => {

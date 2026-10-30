@@ -332,20 +332,41 @@ impl Observer {
         }
         let orders = Orders::new(&self.home);
         let (list, _) = orders.load();
-        let requests = orders.take_requests();
+        // Asked for by the owner: first come, first served, one a tick; the
+        // rest wait on disk. A request for an order that's gone is dropped.
+        // "Run now" means now: it skips the order's frequency limits.
+        let mut due = None;
+        for id in orders.pending_requests() {
+            match list.iter().find(|o| o.id == id) {
+                Some(o) => {
+                    due = Some((o.clone(), crate::orders::Cause::Manual));
+                    break;
+                }
+                None => {
+                    orders.take_request(&id);
+                }
+            }
+        }
         if list.is_empty() {
             return;
         }
-        let mut states = orders.states();
+        // A state file that can't be read means forgotten limits: nothing
+        // starts until it's fixed.
+        let mut states = match orders.states_checked() {
+            Ok(s) => s,
+            Err(e) => {
+                self.status.last_error =
+                    Some(format!("orders: {e}; nothing starts until it's fixed"));
+                return;
+            }
+        };
         let now = Utc::now();
         let findings = self.store.list();
-        let mut due = None;
         for o in &list {
-            let st = states.entry(o.id.clone()).or_default();
-            if requests.contains(&o.id) {
-                due = Some((o.clone(), crate::orders::Cause::Manual));
+            if due.is_some() {
                 break;
             }
+            let st = states.entry(o.id.clone()).or_default();
             if !o.enabled {
                 continue;
             }
@@ -380,9 +401,14 @@ impl Observer {
                 break;
             }
         }
-        if let Some((order, _)) = &due {
-            // Claimed before it starts, so a slow run can't be started twice.
-            states.entry(order.id.clone()).or_default().last_run = Some(now);
+        if let Some((order, cause)) = &due {
+            // Claimed before it starts: it holds the cooldown and counts
+            // toward today's limit, so a slow run can't start twice and one
+            // that never comes back still counted.
+            states.entry(order.id.clone()).or_default().claim(now);
+            if matches!(cause, crate::orders::Cause::Manual) {
+                orders.take_request(&order.id);
+            }
         }
         let _ = orders.save_states(&states);
         let Some((order, cause)) = due else { return };
@@ -403,7 +429,6 @@ impl Observer {
             }
             let run = crate::orders::run(&home, &cfg, &order, cause, &profile).await;
             let orders = Orders::new(&home);
-            let mut states = orders.states();
             let summary_line = run
                 .summary
                 .lines()
@@ -412,8 +437,20 @@ impl Observer {
                 .to_string();
             let status = run.status.clone();
             let receipts = run.receipts.len();
-            states.entry(order.id.clone()).or_default().push(run);
-            let _ = orders.save_states(&states);
+            // A state that stopped parsing while the run was on isn't
+            // replaced with one that remembers only this run: the file
+            // stays as it is, the tick reports it, and this run is known
+            // by its receipts alone.
+            match orders.states_checked() {
+                Ok(mut states) => {
+                    states.entry(order.id.clone()).or_default().push(run);
+                    let _ = orders.save_states(&states);
+                }
+                Err(e) => eprintln!(
+                    "reeved: orders: {e}; the run of \"{}\" ({status}) isn't in its history",
+                    order.name
+                ),
+            }
             // A blocked run left a proposal: that's worth a popup. A finished
             // or failed one only if the order asks for it.
             let proposal = status == "blocked" || status == "rolled_back";
@@ -576,7 +613,12 @@ pub async fn run_observer(home: PathBuf, once: bool) -> Result<(), String> {
             tokio::time::sleep(Duration::from_secs(10)).await;
         }
     });
-    let mut cfg = config::load_at(&home).unwrap_or_default();
+    // With no config that loads there are no trusted limits: the observer
+    // watches on defaults, and nothing starts until it loads.
+    let (mut cfg, mut cfg_error) = match config::load_at(&home) {
+        Ok(c) => (c, None),
+        Err(e) => (config::Config::default(), Some(e.to_string())),
+    };
     obs.sample();
     if once {
         for _ in 0..3 {
@@ -619,8 +661,12 @@ pub async fn run_observer(home: PathBuf, once: bool) -> Result<(), String> {
             _ = sample.tick() => obs.sample(),
             _ = minute.tick() => {
                 // Settings change while it runs (the drafter toggle, thresholds).
-                if let Ok(c) = config::load_at(&home) {
-                    cfg = c;
+                match config::load_at(&home) {
+                    Ok(c) => {
+                        cfg = c;
+                        cfg_error = None;
+                    }
+                    Err(e) => cfg_error = Some(e.to_string()),
                 }
                 obs.minute_tick(&cfg);
             }
@@ -637,10 +683,17 @@ pub async fn run_observer(home: PathBuf, once: bool) -> Result<(), String> {
             _ = beat.tick() => {
                 obs.beat(&cfg);
                 // Every 10 s, so "run now" in /orders doesn't wait a minute.
-                obs.orders_tick(&cfg, &profile);
+                match &cfg_error {
+                    Some(e) => {
+                        obs.status.last_error = Some(format!(
+                            "config.toml: {e}. Standing orders and the drafter are paused until it loads."
+                        ));
+                    }
+                    None => obs.orders_tick(&cfg, &profile),
+                }
             }
             _ = draft.tick() => {
-                if cfg.observer.drafter.enabled {
+                if cfg.observer.drafter.enabled && cfg_error.is_none() {
                     match drafter::pass(&home, &cfg, &obs.store, &profile).await {
                         drafter::Pass::Blocked(why) => obs.status.last_error = Some(why),
                         drafter::Pass::Drafted(id) => {

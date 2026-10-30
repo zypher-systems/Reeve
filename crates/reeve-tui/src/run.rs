@@ -38,7 +38,7 @@ use reeve_core::receipts::Receipt;
 use reeve_core::receipts::ReceiptBook;
 use reeve_core::settings::Settings;
 use reeve_core::spend::format_rates;
-use reeve_core::sudo::{Askpass, PasswordSource};
+use reeve_core::sudo::{Answer, Askpass, PasswordSource};
 use reeve_core::tools::{ToolCtx, undo_receipt};
 use reeve_observer::{HostInfo, Sampler, failed_units};
 
@@ -101,7 +101,7 @@ enum UiMsg {
     /// The agent needs a yes or no.
     Approval(Box<ApprovalRequest>, tokio::sync::oneshot::Sender<Decision>),
     /// sudo needs the password.
-    Password(String, tokio::sync::oneshot::Sender<Option<String>>),
+    Password(String, tokio::sync::oneshot::Sender<Option<Answer>>),
     /// Memory changed on disk (survey, reflection, a tool).
     MemoryChanged,
     /// An undo finished.
@@ -134,15 +134,12 @@ impl Approver for TuiApprover {
 
 #[async_trait::async_trait]
 impl PasswordSource for TuiApprover {
-    async fn password(&self, prompt: String) -> Option<String> {
+    async fn password(&self, prompt: String) -> Option<Answer> {
         let (reply, answer) = tokio::sync::oneshot::channel();
         self.tx.send(UiMsg::Password(prompt, reply)).ok()?;
         answer.await.ok().flatten()
     }
 }
-
-/// How long a remembered sudo password lives (sudo's own default).
-const PASSWORD_TTL: Duration = Duration::from_secs(300);
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -159,11 +156,7 @@ struct App {
     /// Session id for receipts the TUI writes itself (undo).
     session: String,
     /// Where to send the password on screen.
-    pw_reply: Option<tokio::sync::oneshot::Sender<Option<String>>>,
-    /// A remembered sudo password, and when it was typed. Memory only.
-    pw_cache: Option<(String, Instant)>,
-    /// When the cache last answered (a quick second ask means it was wrong).
-    pw_used: Option<Instant>,
+    pw_reply: Option<tokio::sync::oneshot::Sender<Option<Answer>>>,
     /// The approved action a password request belongs to.
     last_action: String,
     memory: Memory,
@@ -241,8 +234,6 @@ pub fn run(cfg: Config, home: PathBuf) -> io::Result<()> {
         reply: None,
         session: format!("tui-{}", std::process::id()),
         pw_reply: None,
-        pw_cache: None,
-        pw_used: None,
         last_action: String::new(),
         memory: Memory::new(&home_for_memory),
         started: chrono::Utc::now(),
@@ -1020,10 +1011,7 @@ impl App {
             },
             Action::Password(answer) => {
                 view.overlays.retain(|o| !matches!(o, Overlay::Password(_)));
-                let pw = answer.map(|(pw, remember)| {
-                    self.pw_cache = remember.then(|| (pw.clone(), Instant::now()));
-                    pw
-                });
+                let pw = answer.map(|(secret, remember)| Answer { secret, remember });
                 if pw.is_none() {
                     view.push(
                         Speaker::System,
@@ -1589,39 +1577,22 @@ impl App {
 }
 
 impl App {
-    /// sudo wants a password: answer from memory, or ask.
+    /// sudo wants a password Reeve doesn't remember: ask the person.
     fn password_asked(
         &mut self,
         view: &mut View,
         prompt: String,
-        reply: tokio::sync::oneshot::Sender<Option<String>>,
+        reply: tokio::sync::oneshot::Sender<Option<Answer>>,
     ) {
-        let fresh = self
-            .pw_cache
-            .as_ref()
-            .is_some_and(|(_, at)| at.elapsed() < PASSWORD_TTL);
-        // Asked again right after the cache answered: it was wrong.
-        let just_used = self
-            .pw_used
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(15));
-        if fresh && !just_used {
-            if let Some((pw, _)) = &self.pw_cache {
-                self.pw_used = Some(Instant::now());
-                let _ = reply.send(Some(pw.clone()));
-                return;
-            }
-        }
-        if just_used {
-            self.pw_cache = None;
-        }
-        self.pw_used = None;
         self.pw_reply = Some(reply);
+        let minutes = self.cfg.approvals.password_minutes;
         view.overlays
             .push(Overlay::Password(crate::overlay::PasswordEntry {
                 prompt,
                 action: self.last_action.clone(),
                 secret: String::new(),
-                remember: true,
+                remember: minutes > 0,
+                minutes,
             }));
     }
 
@@ -2430,7 +2401,20 @@ fn spawn_worker(
             return;
         };
         rt.block_on(async move {
-            let askpass = match Askpass::start(&home, passwords) {
+            let cfg = config::load_at(&home).unwrap_or_default();
+            if let Ok((name, conn, _)) = cfg.route() {
+                if let Some(host) = conn.local_url_problem() {
+                    let _ = tx.send(UiMsg::Notice(
+                        Speaker::Error,
+                        format!(
+                            "connection {name:?} is kind = \"local\" but its URL points at {host}: nothing sent there is masked, and it's counted as free. Fix [connections.{name}] in config.toml."
+                        ),
+                    ));
+                }
+            }
+            let remember_for =
+                Duration::from_secs(cfg.approvals.password_minutes.saturating_mul(60));
+            let askpass = match Askpass::start(&home, passwords, remember_for) {
                 Ok(a) => Some(a),
                 Err(e) => {
                     let _ = tx.send(UiMsg::Notice(
@@ -2440,7 +2424,6 @@ fn spawn_worker(
                     None
                 }
             };
-            let cfg = config::load_at(&home).unwrap_or_default();
             let mut tools = ToolCtx::new(home.clone(), reeve_core::agent::secret_env(&cfg));
             tools.askpass = askpass.clone();
             if cfg.memory.survey && reeve_core::memory::survey::due(&tools.memory) {

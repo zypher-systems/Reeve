@@ -179,6 +179,8 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), String> {
     let home = config::home_dir();
+    // Reeve's state is the owner's alone, whatever the umask.
+    config::private_dir(&home).map_err(|e| format!("{}: {e}", home.display()))?;
     let cfg = config::load_at(&home).map_err(|e| e.to_string())?;
     match cli.cmd {
         None => {
@@ -419,13 +421,24 @@ fn daemon(home: &std::path::Path, cmd: DaemonCmd) -> Result<(), String> {
     }
 }
 
+/// Every order's state, for showing. A state file that can't be read is
+/// said so and shows as empty; reeved starts nothing on it.
+fn states_or_warn(
+    orders: &reeve_core::orders::Orders,
+) -> std::collections::BTreeMap<String, reeve_core::orders::OrderState> {
+    orders.states_checked().unwrap_or_else(|e| {
+        println!("warning: {e}; reeved starts nothing until it's fixed");
+        Default::default()
+    })
+}
+
 fn orders_cmd(cfg: &Config, home: &std::path::Path, cmd: OrdersCmd) -> Result<(), String> {
     use reeve_core::orders::Orders;
     let orders = Orders::new(home);
     match cmd {
         OrdersCmd::List | OrdersCmd::Check => {
             let (list, bad) = orders.load();
-            let states = orders.states();
+            let states = states_or_warn(&orders);
             if list.is_empty() && bad.is_empty() {
                 println!(
                     "No standing orders. `reeve orders examples` writes three (disabled) to start from, in {}.",
@@ -495,8 +508,7 @@ fn orders_cmd(cfg: &Config, home: &std::path::Path, cmd: OrdersCmd) -> Result<()
                 "budget: ${:.2} a run, {} runs a day, {}h apart",
                 o.budget.per_run_usd, o.budget.runs_per_day, o.budget.cooldown_hours
             );
-            for r in orders
-                .states()
+            for r in states_or_warn(&orders)
                 .get(&id)
                 .map(|s| s.runs.clone())
                 .unwrap_or_default()
@@ -516,6 +528,12 @@ fn orders_cmd(cfg: &Config, home: &std::path::Path, cmd: OrdersCmd) -> Result<()
         }
         OrdersCmd::Run { id } => {
             let o = orders.get(&id).map_err(|e| e.to_string())?;
+            // A start like any other, so the daily limit sees it. A state
+            // file that can't be read means forgotten limits: nothing runs,
+            // and the file isn't replaced.
+            let mut states = orders
+                .states_checked()
+                .map_err(|e| format!("{e}; nothing runs until it's fixed"))?;
             println!(
                 "running \"{}\" as reeved would: unattended, inside its scope…",
                 o.name
@@ -526,6 +544,11 @@ fn orders_cmd(cfg: &Config, home: &std::path::Path, cmd: OrdersCmd) -> Result<()
                 .build()
                 .map_err(|e| e.to_string())?;
             let profile = reeve_observer::HostInfo::read().profile();
+            states
+                .entry(id.clone())
+                .or_default()
+                .claim(chrono::Utc::now());
+            orders.save_states(&states).map_err(|e| e.to_string())?;
             let run = rt.block_on(reeve_observer::orders::run(
                 home,
                 cfg,
@@ -539,7 +562,12 @@ fn orders_cmd(cfg: &Config, home: &std::path::Path, cmd: OrdersCmd) -> Result<()
                 run.receipts,
                 reeve_core::spend::format_usd(run.usd)
             );
-            let mut states = orders.states();
+            // The run happened, and its receipts stand. A state that stopped
+            // parsing meanwhile isn't replaced with one that remembers only
+            // this run.
+            let mut states = orders
+                .states_checked()
+                .map_err(|e| format!("{e}; the run isn't in the order's history"))?;
             states.entry(id).or_default().push(run);
             orders.save_states(&states).map_err(|e| e.to_string())
         }
@@ -605,6 +633,13 @@ fn doctor(cfg: &Config, home: &std::path::Path) {
             .is_ok_and(|o| o.status.success())
     };
     println!("reeve {}", env!("CARGO_PKG_VERSION"));
+    for (name, c) in &cfg.connections {
+        if let Some(host) = c.local_url_problem() {
+            warn(format!(
+                "connection {name:?} is kind = \"local\" but its URL points at {host}: nothing sent there is masked, and it's counted as free"
+            ));
+        }
+    }
 
     println!("binary");
     match std::env::current_exe() {

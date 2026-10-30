@@ -429,6 +429,13 @@ pub struct Run {
     pub session: Option<String>,
 }
 
+/// Runs started on one (local) day.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DayCount {
+    pub date: chrono::NaiveDate,
+    pub runs: u32,
+}
+
 /// What the daemon remembers about each order.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OrderState {
@@ -437,22 +444,53 @@ pub struct OrderState {
     /// Finding episodes already handled: id → first_seen of that episode.
     #[serde(default)]
     pub handled: BTreeMap<String, DateTime<Utc>>,
-    /// Newest last, at most 20.
+    /// Newest last, at most 20: what the owner reads, not what the limit
+    /// counts.
     #[serde(default)]
     pub runs: Vec<Run>,
+    /// Runs started today, counted as each is claimed: the daily limit
+    /// holds however many runs the history keeps, and a run that never
+    /// came back still counts.
+    #[serde(default)]
+    pub today: Option<DayCount>,
 }
 
 impl OrderState {
     /// Runs started today.
     pub fn runs_today(&self) -> u32 {
-        let today = Local::now().date_naive();
-        self.runs
-            .iter()
-            .filter(|r| r.status != "skipped" && r.ts.with_timezone(&Local).date_naive() == today)
-            .count() as u32
+        self.runs_on(Local::now())
     }
 
-    /// Record a run.
+    /// Runs started on `now`'s day: the counter, or the history where a
+    /// state written before the counter existed lists today's runs.
+    fn runs_on(&self, now: DateTime<Local>) -> u32 {
+        let day = now.date_naive();
+        let counted = self
+            .today
+            .as_ref()
+            .filter(|d| d.date == day)
+            .map_or(0, |d| d.runs);
+        let listed = self
+            .runs
+            .iter()
+            .filter(|r| r.status != "skipped" && r.ts.with_timezone(&Local).date_naive() == day)
+            .count() as u32;
+        counted.max(listed)
+    }
+
+    /// A run starts now. It holds the cooldown and counts toward today's
+    /// limit before anything happens, so a slow run isn't started twice and
+    /// one that never comes back still counted.
+    pub fn claim(&mut self, now: DateTime<Utc>) {
+        self.last_run = Some(now);
+        let local = now.with_timezone(&Local);
+        self.today = Some(DayCount {
+            date: local.date_naive(),
+            runs: self.runs_on(local) + 1,
+        });
+    }
+
+    /// Record a run in the history.
     pub fn push(&mut self, run: Run) {
         if run.status != "skipped" {
             self.last_run = Some(run.ts);
@@ -783,12 +821,24 @@ impl Orders {
         self.dir.join(".state.json")
     }
 
-    /// Every order's state.
+    /// Every order's state, for reading. A state that can't be read shows
+    /// as empty here; [`Orders::states_checked`] says so instead.
     pub fn states(&self) -> BTreeMap<String, OrderState> {
-        fs::read_to_string(self.state_path())
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+        self.states_checked().unwrap_or_default()
+    }
+
+    /// Every order's state, or why the state file can't be read. No file is
+    /// an empty state; a file that doesn't parse is an error, since running
+    /// on forgotten limits is worse than not running.
+    pub fn states_checked(&self) -> Result<BTreeMap<String, OrderState>> {
+        let path = self.state_path();
+        match fs::read_to_string(&path) {
+            Ok(t) => {
+                serde_json::from_str(&t).map_err(|e| Error::Io(format!("{}: {e}", path.display())))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(e) => Err(Error::Io(format!("{}: {e}", path.display()))),
+        }
     }
 
     /// Save every order's state.
@@ -806,18 +856,31 @@ impl Orders {
         Ok(())
     }
 
-    /// Take the pending run requests.
-    pub fn take_requests(&self) -> Vec<String> {
+    /// The pending run requests, oldest first. They stay until each is
+    /// taken with [`Orders::take_request`], so asking for three orders runs
+    /// all three, one a tick.
+    pub fn pending_requests(&self) -> Vec<String> {
         let d = self.dir.join(".run-now");
         let Ok(rd) = fs::read_dir(&d) else {
             return Vec::new();
         };
-        rd.flatten()
-            .filter_map(|e| {
-                let id = e.file_name().to_string_lossy().into_owned();
-                fs::remove_file(e.path()).ok().map(|()| id)
+        let mut found: Vec<(std::time::SystemTime, String)> = rd
+            .flatten()
+            .map(|e| {
+                let at = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                (at, e.file_name().to_string_lossy().into_owned())
             })
-            .collect()
+            .collect();
+        found.sort();
+        found.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// A request was taken up (or is for an order that's gone): drop it.
+    pub fn take_request(&self, id: &str) -> bool {
+        fs::remove_file(self.dir.join(".run-now").join(id)).is_ok()
     }
 
     /// Write the example orders (disabled) if there are no orders yet.
@@ -1780,6 +1843,91 @@ paths = ["~/.cache/**"]
             session: None,
         });
         assert!(o.can_run(&st, now).unwrap_err().contains("cooling"));
+    }
+
+    fn run_at(ts: DateTime<Utc>, status: &str) -> Run {
+        Run {
+            ts,
+            trigger: "schedule".into(),
+            status: status.into(),
+            summary: String::new(),
+            receipts: vec![],
+            usd: None,
+            session: None,
+        }
+    }
+
+    #[test]
+    fn the_daily_limit_counts_every_start_not_the_history_it_keeps() {
+        let mut o = order(JOURNAL);
+        o.budget.runs_per_day = 30;
+        o.budget.cooldown_hours = 0.0;
+        let now = Utc::now();
+        let mut st = OrderState::default();
+        for _ in 0..25 {
+            st.claim(now);
+            st.push(run_at(now, "done"));
+        }
+        assert_eq!(st.runs.len(), 20, "the history is capped");
+        assert_eq!(st.runs_today(), 25, "the count isn't");
+        assert!(o.can_run(&st, now).is_ok());
+        // Runs that started and never came back count too.
+        for _ in 0..5 {
+            st.claim(now);
+        }
+        assert_eq!(st.runs_today(), 30);
+        assert!(o.can_run(&st, now).unwrap_err().contains("30 times"));
+        // Skipped attempts never count, however many fill the history.
+        for _ in 0..30 {
+            st.push(run_at(now, "skipped"));
+        }
+        assert_eq!(st.runs_today(), 30);
+        // The state round-trips, and yesterday's count doesn't carry.
+        let json = serde_json::to_string(&st).unwrap();
+        let back: OrderState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.runs_today(), 30);
+        let mut st = OrderState::default();
+        st.claim(now - chrono::Duration::days(1));
+        st.claim(now - chrono::Duration::days(1));
+        assert_eq!(st.runs_today(), 0);
+        st.claim(now);
+        assert_eq!(st.runs_today(), 1);
+    }
+
+    #[test]
+    fn a_state_from_before_the_counter_still_counts_its_history() {
+        // Written by an older Reeve: runs in the history, no counter.
+        let now = Utc::now();
+        let json = serde_json::to_string(&OrderState {
+            last_run: Some(now),
+            handled: BTreeMap::new(),
+            runs: vec![run_at(now, "done"), run_at(now, "failed")],
+            today: None,
+        })
+        .unwrap()
+        .replace(",\"today\":null", "");
+        let mut st: OrderState = serde_json::from_str(&json).unwrap();
+        assert_eq!(st.runs_today(), 2);
+        st.claim(now);
+        assert_eq!(st.today.as_ref().unwrap().runs, 3);
+        assert_eq!(st.runs_today(), 3);
+    }
+
+    #[test]
+    fn run_requests_wait_until_each_is_taken() {
+        let d = tempfile::tempdir().unwrap();
+        let orders = Orders::new(d.path());
+        assert!(orders.pending_requests().is_empty());
+        orders.request_run("first").unwrap();
+        orders.request_run("second").unwrap();
+        let pending = orders.pending_requests();
+        assert_eq!(pending.len(), 2);
+        assert!(pending.contains(&"first".to_string()) && pending.contains(&"second".to_string()));
+        assert!(orders.take_request("first"));
+        assert_eq!(orders.pending_requests(), vec!["second".to_string()]);
+        assert!(!orders.take_request("first"), "already taken");
+        assert!(orders.take_request("second"));
+        assert!(orders.pending_requests().is_empty());
     }
 
     #[test]

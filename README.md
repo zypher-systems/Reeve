@@ -4,7 +4,7 @@ An **operator harness**: an agent that runs on your computer and manages it for 
 coding agent. It keeps the machine healthy, tidy, and configured. It gives receipts for everything
 it does, and it learns how your system behaves.
 
-> **Status: M5 (standing orders).** Reeve manages this machine with you:
+> **Status: 0.7 (Fedora, Arch, and Debian; standing orders; skills).** Reeve manages this machine with you:
 > - files anywhere, including root-owned ones
 > - packages, services, logs, and processes
 > - shell, with `sudo` through its own password prompt
@@ -67,7 +67,9 @@ cargo build --release --locked -p reeve-cli && ./target/release/reeve
 | **T2** system change | system files, packages, system services, anything with sudo | yes, every time |
 | **T3** floor | formatting disks, partition tables, bootloader, `rm -rf` of top-level dirs, protected packages, secrets | you type `yes`, even in YOLO |
 
-Reeve's own keys can't be read, and its receipts and undo store can't be written, by any tool, in any mode.
+Reeve's own keys can't be read, and its receipts and undo store can't be written, by any command Reeve can
+read: those paths are refused in every mode. A program Reeve can't read (`python3 -c …`, a script) that names
+them needs your typed yes, and one that reaches them some other way is held only by the tier of running it.
 
 **Reading never asks.** Commands are read the way the shell will run them: `if`, `for … do … done`, `case`, functions,
 and builtins like `cd` and `export` are structure, not programs; awk and sed programs that only print are reads (one
@@ -95,8 +97,10 @@ The approval card shows when a step is part of a verified change, and whether th
 ## Root
 
 When an approved action needs root, Reeve asks for your password in a masked panel. The password goes to
-sudo and nowhere else: not to the model, a log, or a receipt. You can let Reeve remember it in memory for
-5 minutes (`tab` in the panel). The prompt only works while an approved root action is running.
+sudo and nowhere else: not to the model, a log, or a receipt. Reeve remembers it in memory for 5 minutes
+after its last use, like sudo would in a terminal, so the root steps that follow don't ask again
+(`password_minutes` under `[approvals]` changes that; `tab` in the panel keeps one password out of memory).
+The prompt only works while an approved root action is running.
 
 - Root-owned files are changed in place by `sudo reeve root`, so owner, mode, and SELinux label are kept.
   Undo copies go to `/var/lib/reeve/undo` (root-only). Edits to `/etc/sudoers*` and `/etc/fstab` must pass

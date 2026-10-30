@@ -406,13 +406,17 @@ mod tests {
         struct Never;
         #[async_trait::async_trait]
         impl crate::sudo::PasswordSource for Never {
-            async fn password(&self, _prompt: String) -> Option<String> {
+            async fn password(&self, _prompt: String) -> Option<crate::sudo::Answer> {
                 None
             }
         }
         let (d, mut c) = ctx();
-        let ap =
-            crate::sudo::Askpass::start(&c.paths.reeve_home, std::sync::Arc::new(Never)).unwrap();
+        let ap = crate::sudo::Askpass::start(
+            &c.paths.reeve_home,
+            std::sync::Arc::new(Never),
+            std::time::Duration::from_secs(300),
+        )
+        .unwrap();
         let wrapper = ap.sudo_path().display().to_string();
         c.askpass = Some(ap);
         let helper = d.path().join("yay");

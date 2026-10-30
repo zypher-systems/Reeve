@@ -35,6 +35,10 @@ New for an operator:
 
 ## 2. Architecture
 
+*As shipped (0.7): reeved and the TUI are the same binary and share files under `~/.reeve`
+(findings, proposals, `observer/status.json`, `orders/.run-now`); there is no `reeved.sock`. The
+askpass socket is the only socket. The diagram is the original plan.*
+
 ```
  ┌──────────────── reeve (TUI, your user) ────────────────┐      ┌──── reeved (systemd --user) ────┐
  │ UI thread ── View/draw ◄── AgentEvent ── worker thread │◄────►│ samplers → baselines            │
@@ -199,11 +203,15 @@ Reads that would send secrets to a model provider are T3: `~/.ssh/id_*`, `~/.gnu
 
 ### 5.6 Root: `sudo -A`
 
-Reeve always runs as you. A root action runs `sudo -A` with `SUDO_ASKPASS=reeve askpass`.
+Reeve always runs as you. A root action runs `sudo -A` with `SUDO_ASKPASS=reeve-askpass`.
 The askpass helper connects to the running TUI over a private socket
 (`$XDG_RUNTIME_DIR/reeve/askpass-<pid>.sock`, 0600), and the TUI shows a masked password modal.
-The password is never sent to the model, never logged, and never kept after sudo reads it.
-sudo's own timestamp cache applies as usual.
+The password is never sent to the model and never logged. sudo's own timestamp cache is no help
+(commands run with no terminal, so it is keyed on each command's own shell), so Reeve remembers
+the typed password in memory for `[approvals] password_minutes` (5 by default, 0 never) and
+answers each new sudo with it; the helper names the sudo asking, and the same one asking twice
+means it was refused, so the modal comes back. `tab` in the modal keeps that one password out
+of memory.
 
 `reeved` has no terminal and no password. A standing order that needs root works only if you
 install the narrow sudoers drop-in that `reeve orders sudoers <order>` prints. The drop-in lists
@@ -554,6 +562,10 @@ trait Distro {
 
 ## 11. The TUI: the ledger, and tabs for the rest
 
+*As shipped (0.7): the TUI is the board of tiles (DECISIONS 2026-09-29), F1–F8 open tiles from
+anywhere, esc returns to the board, the composer stays at the bottom. This section describes the
+earlier ledger-and-tabs design; the approval card and receipt semantics below still hold.*
+
 ```
  reeve   F1 ledger   F2 findings 7   F3 orders   F4 spend   F5 memory   F6 system   nexus · all quiet, except swap 99%
 ─────────━━━━━━━━──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -708,3 +720,79 @@ today; an open one is not, or not yet proven.
   drafter, and this design describes what shipped (§11 still shows the ledger UI, not the board).
 
 **Not needed for 1.0:** timeshift, and macOS or Windows.
+
+---
+
+## 15. Road to the next releases
+
+Written 2026-10-29 against 0.7.1, from a day of field use and a 25-finding review of the code
+(referred to below as G01–G25). The review's own words: this is not a missing-feature problem; the
+gaps are between the guarantees Reeve states and what happens under failure. The order below puts
+what stops daily use first, what makes unattended work trustworthy second, and the 1.0 gate (§14)
+last. Sizes: S is under half a day, M one or two days, L a week or more. Every fix lands with a
+regression test that fails on 0.7.1.
+
+**Release A, fixes only (a PATCH): in dev as of 2026-10-29, ships when the owner cuts it**
+
+- The sudo password is asked once per `password_minutes`, not every other root step (the remembered
+  password is keyed on the sudo asking; DECISIONS 2026-10-29).
+- Orders count every start against `runs_per_day`, run-now requests wait their turn, and a journal
+  that wasn't read fails the `journal_quiet` check instead of passing it (G05, G08, G09).
+- Failure paths fail closed (DECISIONS 2026-10-29, "Failure paths fail closed"): temp files are
+  created exclusively under random names, as is the root helper's check file (G02, part of G17);
+  no tool call runs when a receipt can't be written (G03, the cheap half); `~/.reeve`, sessions,
+  ledgers and transcripts are private whatever the umask, and a torn ledger line can't swallow the
+  next record (G06); an unreadable ledger is a floor, not zero, and stops unattended spend (G07);
+  reeved with a config or order state that doesn't load watches and starts nothing (G11); an
+  errored run or draft is a failure (G12); `fs_read` and search cap what they load (G20); a
+  `local` connection must point at this machine (G06); interpreter one-liners that name Reeve's
+  keys are refused and ones that name its receipts or undo store take the typed yes, and the README
+  says what is true (G01, the part a parser can do); change ids can't collide (part of G04); the
+  unit description, the permission-denied message and design §2 and §11 tell the truth (G25).
+
+Done when: `cargo test --workspace`, clippy and fmt pass (they do), the live container tests for
+pacman and apt pass, and the dev → main PR has its two external reviews.
+
+**Release B, features (a MINOR)**
+
+1. **The observer loop never blocks** (G10). Slow checks and the drafter run as supervised tasks
+   with deadlines, like orders already do; sampling, the heartbeat and the scheduler keep their
+   cadence while a model call takes minutes. M.
+2. **Snapshots out of the box** (G14, §14). The once-only offer to create the snapper root config;
+   a failed pre-snapshot shown on the card and the receipt; the coverage a T2 action has, shown
+   before it runs. M.
+3. **Long sessions** (G18). When the transcript nears the model's context length, older rounds are
+   compacted; the owner's constraints, pending approvals and the open change are kept. M.
+4. **A .deb** in the release workflow, since the servers it's wanted on are Debian; install.sh stays.
+   M.
+5. **A runbook "worked" only with evidence** (G19): reflection counts a success only when the
+   session has a verified change or no failed receipt. S.
+6. **Locked updates for shared files** (G17): settings and order state use the lock the receipts
+   already use. S.
+
+**The 1.0 gate (§14), with the findings that bear on each**
+
+- The floor is proven: a real execution boundary for shell programs (Landlock or bubblewrap masking
+  Reeve's state; or, if neither is available, an honest statement of the trust model) and tests
+  that execute, not only classify (G01, G23). L.
+- Receipts cover every change: an intent record before the action and a completion after, with
+  reconciliation at startup; an open verified change survives a crash or cancel (G03, G04). L.
+- Undo covers what it claims: moves and units record a post-state and refuse when it changed;
+  partial multi-file restores leave their inverse (G13). M.
+- reeved stays small: retention for sessions, undo objects and findings; a 90-day soak with
+  measured disk, memory and query time (G15). M.
+- Upgrades never lose data: a version in every file format, fixtures from each shipped release,
+  and a migration test (G16). M.
+- `reeve update` and rollback behave the same on every install method, or the docs say where they
+  don't; a signed release manifest if that becomes a requirement (G22). M.
+- Arch as solid as Fedora, and packages published: the live tests run on a schedule in disposable
+  containers; COPR and AUR publish from the release workflow (G21). M.
+- First run teaches itself, and the TUI degrades: the screenshot harness asserts 80×24, 16 colors,
+  mono and no-reeved, and a fresh-home walk-through is part of each release (G24). M.
+
+**Reviewed and not planned**
+
+- Retrying a finding occurrence skipped for cooldown (noted under G09): each episode is handled
+  once, on purpose.
+- Local transcript redaction and atomic budget reservations, as above.
+

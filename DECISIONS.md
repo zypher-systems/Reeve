@@ -2,6 +2,64 @@
 
 Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / Where / Residual risk.
 
+### 2026-10-29: Failure paths fail closed, before the next release
+- **Decision:**
+  - `write_atomic` creates its temporary file exclusively (`create_new`) under a random name, with the mode on the open and the exact mode set after, so a name planted next to the target can't redirect the write. `settings.toml` goes through it. The root helper's check file for `visudo -cf` / `findmnt --verify` is created the same way: it runs as root in `/tmp`.
+  - Before any tool call runs, `ReceiptBook::writable` takes the receipt lock, reads the chain's head and opens this month's file. If that fails, the call is refused with the reason and no receipt (nothing happened), so no change can run unrecorded the way 0.7.1's actions failed after running. `change_commit` runs the same check after its checks and before any rollback: a rollback that couldn't be recorded doesn't happen, and the change stays open. The crash window between an action and its receipt remains (the 1.0 item: an intent record first).
+  - `~/.reeve` is made 0700 at every start (`config::private_dir`), and so are session directories; ledger and transcript files are 0600 (`append_jsonl`), whatever the umask. `append_jsonl` locks the file and deals with a line torn by a crash first: a whole record that only lacks its newline gets it, a fragment is cut off. So a torn line never swallows the next record and never becomes, once sealed, a record that doesn't parse.
+  - `ledger::Totals.unreadable`: a month file that can't be read, or a record that doesn't parse (a torn last line excepted), marks the totals partial and unreadable; reeved starts no order and no draft while they are. A call that returned neither usage nor a price is recorded with unknown cost, not dropped.
+  - reeved whose `config.toml` doesn't load watches on defaults and starts nothing: orders and the drafter pause, and the status says so, until it loads. A `.state.json` that doesn't parse stops the orders tick and is never replaced with an empty state: not by the tick, not by a run that finishes on it, and not by `reeve orders run`, which refuses to start.
+  - An order run or a draft that saw an agent error is `failed` (or blocked), whatever the model said before; the error leads the summary.
+  - `fs_read` loads at most 8 MiB of a file and says when there was more; search reads at most 4 MiB a file.
+  - A `kind = "local"` connection whose host isn't `localhost`, a `.localhost` name, or an address that parses as loopback (a name that starts with `127.` isn't one) is flagged by `reeve doctor` and at TUI start: "local" turns masking off and counts calls as free. The URL is parsed with the `url` crate, which reqwest dials with: a hand split of the authority disagrees with it on `#`, `?` and `\` before an `@` (the client calls `evil.com`, the split saw `127.0.0.1`), and on `127.1`, `0x7f000001` or `LOCALHOST`.
+  - An interpreter one-liner (`python3 -c`, `perl -e`, `node -e`, …) that spells a path to Reeve's keys is refused, in any argument, the code glued to its flag and the script path included; one that names its receipts or undo store, or mentions its state directory together with `keys`, `receipts` or `undo`, is T3. The README says what is true: spelled paths are refused in every mode, a program that names them needs the typed yes, one that reaches them another way is held only by the tier of running it.
+  - Change ids are `t<seconds>-<4 hex>`, so two begun in the same second stay apart.
+  - Docs: the unit description says reeved runs standing orders; the permission-denied message says how root files are changed; design §2 and §11 are marked as planned where the shipped product differs.
+- **Chosen vs rejected:**
+  - Rejected a private umask for the process: files Reeve writes for the owner must follow the owner's umask; only Reeve's own directories and records are forced private.
+  - Rejected flagging a torn last line as unreadable: that is the crash case, repaired on the next append; a record that doesn't parse elsewhere is another matter. Rejected sealing a torn fragment with a bare newline: the next append would turn it into exactly such a record and stop unattended spend for the month. Nothing could ever have counted the fragment, so cutting it off loses nothing.
+  - Rejected redacting the owner's transcripts on the owner's disk: they are protected by mode, and the owner reads them.
+  - Rejected a sandbox (Landlock, bubblewrap) for this release: it is the 1.0 boundary. The text scan closes the spellings the review reproduced, and the README no longer claims more.
+  - Rejected refusing every program that mentions Reeve's state: an assembled path can't be read, so it over-asks (T3) rather than refuses, and `print(1 + 1)` stays T1.
+- **Why:** The 2026-10-29 review reproduced writes through a planted temp name, a change with no receipt, a 0644 transcript, a corrupt ledger read as $0, and `python3 -c` reading a key at T1; the owner asked for these before the next release.
+- **Where:** `reeve-core/src/undo.rs` (`write_atomic`, `random_hex`), `root.rs`, `receipts.rs` (`writable`), `agent.rs` (the preflight, `charge`), `config.rs` (`private_dir`, `local_url_problem`), `ledger.rs`, `session.rs`, `settings.rs`, `orders.rs` (`states_checked`), `txn.rs`, `tools/fs.rs` (`read_capped`), `policy/shell.rs` (`names_reeve_state`), `reeve-observer/src/daemon.rs`, `orders.rs` (`status_of`), `drafter.rs`, `reeve-cli/src/main.rs`, `reeve-tui/src/run.rs`
+- **Residual risk:**
+  - A program that assembles a path to Reeve's state without mentioning `.reeve`, `REEVE_HOME` or `/var/lib/reeve` runs at T1, as does a script file whose contents name them.
+  - `unreadable` stops unattended work until the owner repairs the ledger file by hand; the TUI keeps working and shows the totals as a floor (≥).
+  - The receipt preflight is a check, not a transaction: a crash between the action and its receipt still loses the receipt.
+
+### 2026-10-29: Orders count every start, run-now requests wait their turn, and a journal that wasn't read isn't quiet
+- **Decision:**
+  - `OrderState.today` counts the runs started on the current local day, incremented by `OrderState::claim` when a run is claimed (reeved's tick, and `reeve orders run`), before anything happens. `runs_today` is the larger of that counter and what the 20-entry history shows, so a state written before the counter still counts its day. The history stays at 20 and is for reading.
+  - `Orders::pending_requests` lists the `.run-now` requests oldest first and leaves them; reeved takes the first whose order exists (`take_request`) when it claims the run, one a tick, and drops requests for orders that no longer exist. "Run now" skips the order's frequency limits on purpose: the owner asked for now.
+  - `Check::JournalQuiet` runs `journalctl … -p err -o json` (one entry a line) without `-q`, and counts only when journalctl exited 0 with nothing on stderr. A failed read, a timeout, or journalctl's warning that this user can't see the system journal fails the check with the reason. `shell_exec_out` returns stdout and stderr apart for this.
+- **Chosen vs rejected:**
+  - Rejected keeping more history instead of a counter: a limit of 200 a day would need 200 records a day in a file read on every tick, and a run that started but never came back (reeved killed mid-run) would still be missing from it.
+  - Rejected taking all requests and running them in turn from memory: a daemon restart would lose the rest. On disk until claimed, they survive it.
+  - Rejected failing the journal check only on a non-zero exit: with `-q`, a user who can't read the system journal gets exit 0 and no entries, which is "0 errors".
+  - Rejected keeping `| wc -l`: the pipe hid journalctl's exit status and counted lines of multi-line messages as entries.
+- **Why:** The gap analysis of 2026-10-29 reproduced all three: 30 runs counted as 20 (so a `runs_per_day` above 20 was never enforced), three requests consumed and one run, and a stub journalctl exiting 1 passing a verified change.
+- **Where:** `reeve-core/src/orders.rs` (`DayCount`, `claim`, `pending_requests`, `take_request`), `reeve-observer/src/daemon.rs` (`orders_tick`), `reeve-cli/src/main.rs` (`orders run`), `reeve-core/src/txn.rs` (`journal_verdict`), `reeve-core/src/tools/mod.rs` (`shell_exec_out`)
+- **Residual risk:**
+  - Any line on journalctl's stderr fails the check, including a warning about a corrupt journal file: the change is rolled back and the reason shown. That is the conservative side.
+  - A finding episode is still marked handled before the frequency check, so an occurrence skipped for cooldown isn't retried when the cooldown ends (unchanged, and deliberate: each episode is handled once).
+
+### 2026-10-29: The remembered password answers every new sudo; only the same sudo asking twice means it was wrong
+- **Decision:**
+  - The remembered password moves from the TUI into `Askpass` (`reeve-core/src/sudo.rs`). It answers any sudo that hasn't asked yet, for `[approvals] password_minutes` (default 5, like sudo; 0 never remembers), and like sudo's own cache the clock restarts on each use. It is held in a `Zeroizing<String>` and wiped when dropped or replaced.
+  - The askpass helper sends the pid of its parent, which is the sudo that ran it. The same (run, pid) asking a second time means sudo refused what it got: the memory is dropped and the person is asked. A different pid, or the same pid in a later run, is simply the next root step.
+  - The panel is only for a password Reeve doesn't have; `tab` still says "don't remember this one". With `password_minutes = 0` the panel says so and `tab` does nothing.
+- **Chosen vs rejected:**
+  - Replaced the 15-second rule ("asked again within 15 s of a remembered answer: it was wrong"). It could not tell a refusal from the next sudo, and the next sudo is the common case: a snapper pre-snapshot, the action, and the post-snapshot are three sudos within seconds, each in its own shell, and a request's root steps follow each other the same way. The memory was thrown away every other step, so a patch install asked for the password many times in a row.
+  - Rejected reading sudo's "Sorry, try again" from stderr: translated, and the earlier pacman work already ruled out reading sudo's text.
+  - Rejected sudo's own timestamp cache once more. Running commands in Reeve's own terminal session would make it work, but the whole point of `setsid` is that nothing a command runs can reach the TUI's terminal. A private pty behind a long-lived runner process would keep that and still share one session with sudo; it is the right design if the in-memory password ever has to go, and a much bigger change.
+- **Why:** The owner typed the password five to fifteen times for one request, "which makes no sense because if I type it once it should allow sudo commands for the next 5 minutes".
+- **Where:** `reeve-core/src/sudo.rs` (`answer`, `Ask.caller`, `helper_main`), `reeve-core/src/config.rs` (`password_minutes`), `reeve-tui/src/run.rs` (`password_asked`), `reeve-tui/src/panels.rs`, `reeve-cli/tests/askpass.rs` (the built binary as the helper, against a sudo stand-in)
+- **Residual risk:**
+  - A wrong remembered password reaches sudo once per sudo process before the person is asked, so at most one failed attempt per root step and a corrected one right after; `pam_faillock` counts that one.
+  - A command whose sudo processes change pid between tries (none known) would be answered from memory again.
+  - The password lives in process memory for `password_minutes` after its last use, which a busy session keeps extending.
+
 ### 2026-10-10: Debian (M7): apt-get through the same tools, undo from dpkg's log in one simulated-first transaction
 - **Decision:**
   - `Distro::Debian { id }` for `ID=debian` or an `ID_LIKE` naming debian or ubuntu (Ubuntu, Mint, Raspberry Pi OS…). The `pkg_*` tools speak `apt-get`, `apt-cache`, `apt-mark`, and `dpkg-query`; `apt` (the friendly front end) only for `list --upgradable`.

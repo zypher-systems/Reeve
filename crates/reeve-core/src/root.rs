@@ -274,8 +274,19 @@ fn validate(p: &Path, bytes: &[u8]) -> Result<(), String> {
         None
     };
     let Some(mut argv) = check else { return Ok(()) };
-    let tmp = std::env::temp_dir().join(format!("reeve-check-{}", std::process::id()));
-    fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+    // Created exclusively under a random name: this runs as root in a
+    // directory anyone can write to, so a planted link must not be followed.
+    let tmp = std::env::temp_dir().join(format!("reeve-check-{}", crate::undo::random_hex(8)));
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| e.to_string())?;
+        std::io::Write::write_all(&mut f, bytes).map_err(|e| e.to_string())?;
+    }
     argv.push(tmp.to_string_lossy().into_owned());
     let out = Command::new(&argv[0]).args(&argv[1..]).output();
     let _ = fs::remove_file(&tmp);
