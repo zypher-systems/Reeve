@@ -94,7 +94,8 @@ impl ConnectionConfig {
     /// The URL is read by the parser the client dials with (the `url`
     /// crate, WHATWG), so the host checked is the host called: a hand
     /// split of the authority disagrees with it on `#`, `?` and `\` before
-    /// an `@`, and on `127.1`, `0x7f000001` or `LOCALHOST`.
+    /// an `@`, and on `127.1`, `0x7f000001` or `LOCALHOST`. A name may end
+    /// in the DNS root dot: `localhost.` is `localhost`.
     pub fn local_url_problem(&self) -> Option<String> {
         if !self.is_local() {
             return None;
@@ -106,7 +107,15 @@ impl ConnectionConfig {
         // A name is local by name only; an address only if it is one of
         // this machine's. `127.evil.com` is neither.
         let local = match parsed.host() {
-            Some(url::Host::Domain(d)) => d == "localhost" || d.ends_with(".localhost"),
+            Some(url::Host::Domain(d)) => {
+                // One trailing dot is the DNS root. `localhost..` and `.`
+                // are left as they are, and so flagged.
+                let d = match d.strip_suffix('.') {
+                    Some(rest) if !rest.is_empty() && !rest.ends_with('.') => rest,
+                    _ => d,
+                };
+                d == "localhost" || d.ends_with(".localhost")
+            }
             Some(url::Host::Ipv4(v4)) => v4.is_loopback() || v4.is_unspecified(),
             Some(url::Host::Ipv6(v6)) => {
                 v6.is_loopback()
@@ -678,6 +687,10 @@ mod tests {
             "http://2130706433/v1",
             "http://0x7f000001/v1",
             "http://LOCALHOST:11434/v1",
+            // The DNS root dot.
+            "http://localhost.:11434/v1",
+            "http://llm.localhost./v1",
+            "http://127.0.0.1./v1",
         ] {
             assert_eq!(conn("local", url).local_url_problem(), None, "{url}");
         }
@@ -690,6 +703,11 @@ mod tests {
             ("http://evil.com#@127.0.0.1/v1", "evil.com"),
             ("http://evil.com?@127.0.0.1/v1", "evil.com"),
             ("http://evil.com\\@127.0.0.1/v1", "evil.com"),
+            // Only one trailing dot is the root; a name that is nothing but
+            // dots or a dot short of empty names nothing local.
+            ("http://evil.com./v1", "evil.com."),
+            ("http://localhost..:11434/v1", "localhost.."),
+            ("http://./v1", "."),
         ] {
             assert_eq!(
                 conn("local", url).local_url_problem(),
