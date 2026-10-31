@@ -2,8 +2,9 @@ name: release
 
 # Pushing a tag like v0.1.0 builds the Linux binaries, the RPMs and .debs,
 # and the source and vendor tarballs, and opens a *draft* release with them,
-# the installer, the checksums, a ready AUR PKGBUILD, and the Fedora spec
-# with its sources' checksums filled in. A person reviews and publishes it.
+# the installer, the checksums signed with the release key, a ready AUR
+# PKGBUILD, and the Fedora spec with its sources' checksums filled in. A
+# person reviews and publishes it.
 #
 # Running it by hand (Actions → release → Run workflow), or a pull request
 # that changes packaging, builds everything the release would carry as the
@@ -18,6 +19,7 @@ on:
       - .github/workflows/release.yml
       - install.sh
       - packaging/**
+      - release/**
       - Cargo.toml
       - Cargo.lock
       - crates/reeve-cli/Cargo.toml
@@ -131,8 +133,9 @@ jobs:
 
   assemble:
     # Everything the release carries, in one place: checksums over all of
-    # it, the AUR PKGBUILD and the Fedora spec filled in. Runs on dry runs
-    # too, so a broken fill shows up before release day.
+    # it, signed with the release key, the AUR PKGBUILD and the Fedora spec
+    # filled in, and the installer run against the lot. Runs on dry runs
+    # too, so a broken fill or signature shows up before release day.
     needs: [build, source]
     runs-on: ubuntu-latest
     steps:
@@ -163,6 +166,49 @@ jobs:
           grep -Eq "^%global source[01]_sha256 [0-9a-f]{64}\$" dist/reeve.spec
           rm -rf dist/third-party
           cat dist/SHA256SUMS
+      - name: sign the checksums
+        # Reeve installs a release only when this signature matches the key
+        # built into it (release/reeve-release.pub.pem). No key, no release.
+        env:
+          REEVE_SIGNING_KEY: ${{ secrets.REEVE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REEVE_SIGNING_KEY:-}" ]; then
+            echo "::error::the REEVE_SIGNING_KEY secret is not set; releases must be signed"
+            exit 1
+          fi
+          umask 077
+          key="$RUNNER_TEMP/release.pem"
+          printf '%s\n' "$REEVE_SIGNING_KEY" > "$key"
+          openssl pkeyutl -sign -inkey "$key" -rawin -in dist/SHA256SUMS -out "$RUNNER_TEMP/sums.sig"
+          rm -f "$key"
+          # The signature must match the public key every Reeve is built with.
+          openssl pkeyutl -verify -pubin -inkey release/reeve-release.pub.pem -rawin \
+            -in dist/SHA256SUMS -sigfile "$RUNNER_TEMP/sums.sig"
+          base64 -w0 "$RUNNER_TEMP/sums.sig" > dist/SHA256SUMS.sig
+      - name: installer, from the signed release files
+        # dist/ served as a release mirror: install from it as a user would,
+        # signature and checksums checked, into a scratch home. Then the same
+        # files with one checksum changed after signing must be refused.
+        run: |
+          set -eu
+          (cd dist && exec python3 -m http.server 8765 --bind 127.0.0.1) >/dev/null 2>&1 &
+          good=$!
+          cp -r dist "$RUNNER_TEMP/tampered"
+          sed -i '1s/^./0/' "$RUNNER_TEMP/tampered/SHA256SUMS"
+          (cd "$RUNNER_TEMP/tampered" && exec python3 -m http.server 8766 --bind 127.0.0.1) >/dev/null 2>&1 &
+          bad=$!
+          sleep 2
+          export HOME="$RUNNER_TEMP/home"
+          mkdir -p "$HOME"
+          REEVE_DOWNLOAD_URL=http://127.0.0.1:8765 ./install.sh --user --no-start
+          "$HOME/.local/bin/reeve" --version
+          ./install.sh --user --uninstall
+          if REEVE_DOWNLOAD_URL=http://127.0.0.1:8766 ./install.sh --user --no-start; then
+            echo "::error::the installer took checksums changed after signing"; exit 1
+          fi
+          test ! -e "$HOME/.local/bin/reeve"
+          kill "$good" "$bad"
       - uses: actions/upload-artifact@v4
         with:
           name: release-files
@@ -189,4 +235,5 @@ jobs:
           notes="docs/releases/${tag}.md"
           if [ -f "$notes" ]; then flag=(--notes-file "$notes"); else flag=(--generate-notes); fi
           gh release create "$tag" --draft --title "Reeve ${tag}" "${flag[@]}" \
-            dist/*.tar.gz dist/*.rpm dist/*.deb dist/*.tar.xz dist/SHA256SUMS dist/install.sh dist/PKGBUILD dist/reeve.spec
+            dist/*.tar.gz dist/*.rpm dist/*.deb dist/*.tar.xz dist/SHA256SUMS dist/SHA256SUMS.sig \
+            dist/install.sh dist/PKGBUILD dist/reeve.spec

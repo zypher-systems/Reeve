@@ -427,6 +427,14 @@ Everything shown is escaped. Log lines and finding text are data.
   but this window predates it. `/update` and ⌃K say what's out and how to get it. There's no desktop
   notification: a new version isn't a proposed fix.
 - **Installing:** `reeve update` works out how this copy got here and does the same again:
+  - **First, the signature:** the release's `SHA256SUMS` must carry `SHA256SUMS.sig`, an ed25519
+    signature made with Reeve's release key. The public half is in the repository
+    (`release/reeve-release.pub.pem`), built into every Reeve and pinned in `install.sh`; the
+    private half is a secret of the release workflow, which signs and then verifies against the
+    committed key before drafting. A release that isn't signed (every one before 0.8.0), is signed
+    with another key, or whose checksums changed after signing is refused before anything is
+    downloaded. Rotating the key means releasing a build with the new public key before the new
+    key signs anything.
   - **install.sh** (a `bin/` under some prefix): download the release tarball and `SHA256SUMS`,
     refuse a mismatch, check that the archive's binary is the expected version, then run that
     release's own `install.sh --from` with flags matching this install. The installer never starts
@@ -800,7 +808,8 @@ pacman and apt pass, and the dev → main PR has its two external reviews.
 - Upgrades never lose data: a version in every file format, fixtures from each shipped release,
   and a migration test (G16). M.
 - `reeve update` and rollback behave the same on every install method, or the docs say where they
-  don't; a signed release manifest if that becomes a requirement (G22). M.
+  don't; a signed release manifest if that becomes a requirement (G22). M. *The signed manifest is
+  in dev as of 2026-10-30: `SHA256SUMS.sig` (§8.2); the rest of the item stays open.*
 - Arch as solid as Fedora, and packages published: the live tests run on a schedule in disposable
   containers; COPR and AUR publish from the release workflow (G21). M.
 - First run teaches itself, and the TUI degrades: the screenshot harness asserts 80×24, 16 colors,

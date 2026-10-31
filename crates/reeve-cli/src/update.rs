@@ -369,19 +369,31 @@ async fn execute(plan: &Plan, to: Version, dir: &Path) -> Result<String, String>
     }
 }
 
-/// Download `name` and the release's `SHA256SUMS` into `dir`, and refuse the
-/// file unless it matches.
+/// Download the release's `SHA256SUMS` and its signature into `dir`, refuse
+/// them unless Reeve's release key signed them, then download `name` and
+/// refuse it unless it matches.
 async fn fetch_checked(dir: &Path, to: Version, name: &str) -> Result<PathBuf, String> {
     let _ = fs::remove_dir_all(dir);
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let base = update::download_base(to);
     let sums = dir.join("SHA256SUMS");
+    let sig = dir.join("SHA256SUMS.sig");
     let file = dir.join(name);
     println!("downloading {name}…");
     update::download(&format!("{base}/SHA256SUMS"), &sums).await?;
+    update::download(&format!("{base}/SHA256SUMS.sig"), &sig)
+        .await
+        .map_err(|e| {
+            format!(
+                "the {to} release isn't signed ({e}); releases before 0.8.0 aren't, and nothing was installed"
+            )
+        })?;
+    let listed = fs::read(&sums).map_err(|e| e.to_string())?;
+    let sig = fs::read_to_string(&sig).map_err(|e| e.to_string())?;
+    update::signed_sums(&listed, &sig)?;
+    println!("SHA256SUMS is signed with Reeve's release key");
     update::download(&format!("{base}/{name}"), &file).await?;
-    let listed = fs::read_to_string(&sums).map_err(|e| e.to_string())?;
-    update::verify(&file, &listed)?;
+    update::verify(&file, &String::from_utf8_lossy(&listed))?;
     println!("{name} matches the release's SHA256SUMS");
     Ok(file)
 }

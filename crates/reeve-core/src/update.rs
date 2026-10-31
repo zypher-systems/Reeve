@@ -101,6 +101,67 @@ pub fn parse_release(json: &str) -> std::result::Result<Release, String> {
     })
 }
 
+/// The public half of the release signing key. The release workflow signs
+/// each release's `SHA256SUMS` with the private half and checks the
+/// signature against this file before drafting, so every Reeve carries the
+/// key it will verify its updates with.
+const RELEASE_KEY_PEM: &str = include_str!("../../../release/reeve-release.pub.pem");
+
+/// The key a release must be signed with: the release key, or
+/// `REEVE_UPDATE_PUBKEY` at build time (the raw key, base64: a fork).
+pub fn release_key() -> Option<ed25519_dalek::VerifyingKey> {
+    use base64::Engine;
+    let raw: [u8; 32] = match option_env!("REEVE_UPDATE_PUBKEY") {
+        Some(b64) => base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .ok()?
+            .try_into()
+            .ok()?,
+        None => key_from_pem(RELEASE_KEY_PEM)?,
+    };
+    ed25519_dalek::VerifyingKey::from_bytes(&raw).ok()
+}
+
+/// The raw key in an ed25519 `PUBLIC KEY` PEM (what `openssl pkey -pubout`
+/// writes): SubjectPublicKeyInfo is a fixed 12-byte prefix, then the key.
+pub fn key_from_pem(pem: &str) -> Option<[u8; 32]> {
+    use base64::Engine;
+    const PREFIX: [u8; 12] = [
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    let body: String = pem
+        .lines()
+        .skip_while(|l| !l.starts_with("-----BEGIN PUBLIC KEY-----"))
+        .skip(1)
+        .take_while(|l| !l.starts_with("-----END"))
+        .collect();
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(body.trim())
+        .ok()?;
+    der.strip_prefix(&PREFIX[..])?.try_into().ok()
+}
+
+/// `sums` (the release's `SHA256SUMS`) carries `sig` (`SHA256SUMS.sig`, the
+/// ed25519 signature in base64) made with Reeve's release key. Anything
+/// else is refused: a release that isn't signed, one signed with another
+/// key, or checksums changed after signing.
+pub fn signed_sums(sums: &[u8], sig: &str) -> std::result::Result<(), String> {
+    use base64::Engine;
+    let key = release_key().ok_or(
+        "this build has no release key to check releases with; install with the script: \
+         curl -fsSL https://raw.githubusercontent.com/zypher-systems/reeve/main/install.sh | sh",
+    )?;
+    let refused = || {
+        "the release's signature doesn't match Reeve's release key; nothing was installed"
+            .to_string()
+    };
+    let sig = base64::engine::general_purpose::STANDARD
+        .decode(sig.trim())
+        .map_err(|_| refused())?;
+    let sig = ed25519_dalek::Signature::from_slice(&sig).map_err(|_| refused())?;
+    key.verify_strict(sums, &sig).map_err(|_| refused())
+}
+
 /// GitHub's latest-release endpoint, or `REEVE_RELEASES_API`.
 fn api_url() -> String {
     std::env::var("REEVE_RELEASES_API")
@@ -571,6 +632,38 @@ mod tests {
             UpdateState::load(&d.path().join("nowhere")),
             UpdateState::default()
         );
+    }
+
+    #[test]
+    fn a_release_is_taken_only_on_its_signature() {
+        use base64::Engine;
+        use ed25519_dalek::{Signer, SigningKey};
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let sums = b"abc  reeve-x86_64-unknown-linux-musl.tar.gz\n";
+        // The committed key reads as one.
+        let key = key_from_pem(RELEASE_KEY_PEM).expect("release/reeve-release.pub.pem");
+        assert!(release_key().is_some());
+        assert_eq!(
+            key_from_pem("-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----"),
+            None
+        );
+        // A signature from some other key is refused, however well formed.
+        let other = SigningKey::from_bytes(&[7u8; 32]);
+        let sig = b64(&other.sign(sums).to_bytes());
+        let e = signed_sums(sums, &sig).unwrap_err();
+        assert!(e.contains("doesn't match"), "{e}");
+        assert!(signed_sums(sums, "not base64!").is_err());
+        assert!(signed_sums(sums, &b64(b"short")).is_err());
+        // The check itself: the right key passes, and only over the same bytes.
+        let verifying = other.verifying_key();
+        let sig = other.sign(sums);
+        assert!(verifying.verify_strict(sums, &sig).is_ok());
+        assert!(
+            verifying
+                .verify_strict(b"abd  reeve-x86_64-unknown-linux-musl.tar.gz\n", &sig)
+                .is_err()
+        );
+        assert_ne!(key, other.verifying_key().to_bytes());
     }
 
     #[test]

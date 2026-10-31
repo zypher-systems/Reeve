@@ -21,8 +21,9 @@ curl -fsSL https://raw.githubusercontent.com/zypher-systems/reeve/main/install.s
 ```
 
 This installs `/usr/local/bin/reeve` (using sudo for the copy) and the `reeved` user service, starts the
-observer, and checks every download against the release's `SHA256SUMS`. Options: `--user` (everything under
-`~/.local`, no sudo), `--no-start`, `--version v0.1.0`, `--uninstall`. Your data in `~/.reeve` is never touched.
+observer, and checks the release's `SHA256SUMS` against Reeve's release key (`release/reeve-release.pub.pem`,
+with OpenSSL) and every download against those sums. Options: `--user` (everything under `~/.local`, no sudo),
+`--no-start`, `--version v0.1.0`, `--uninstall`. Your data in `~/.reeve` is never touched.
 
 Packages:
 
@@ -41,7 +42,8 @@ Then run `reeve`, type `/providers`, and paste your API key. `reeve doctor` chec
 
 Updating: when a newer release is out, the header shows `↑ <version>`. `reeve update` installs it the same way
 Reeve was installed (the release's installer, dnf, apt-get, or your AUR helper), checked against the release's
-`SHA256SUMS` and with a receipt. `reeve update --rollback` goes back.
+signed `SHA256SUMS` and with a receipt. `reeve update --rollback` goes back. Releases before 0.8.0 aren't
+signed, so neither the installer nor `reeve update` will install one; that release's own `install.sh` still does.
 
 From source:
 

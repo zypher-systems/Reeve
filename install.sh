@@ -16,15 +16,21 @@
 #
 # Environment: REEVE_VERSION, REEVE_DOWNLOAD_URL (a mirror of the release files).
 #
-# Every download is checked against the release's SHA256SUMS before anything
-# is installed. The default system install matters: `sudo reeve root` runs
-# the binary as root to edit root-owned files, so it should live somewhere
-# only root can write.
+# The release's SHA256SUMS must carry a signature (SHA256SUMS.sig) made with
+# Reeve's release key, pinned below, and every download is checked against
+# those sums before anything is installed. Releases before 0.8.0 aren't
+# signed: to install one, use that release's own install.sh. The default
+# system install matters: `sudo reeve root` runs the binary as root to edit
+# root-owned files, so it should live somewhere only root can write.
 
 set -eu
 
 REPO="zypher-systems/reeve"
 MARK="Reeve observer"
+# The public half of the release key (release/reeve-release.pub.pem).
+RELEASE_KEY='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA8St8UQSfn0WcPWATAZbb+2TPahk2nDLTbqw9zFXMgMY=
+-----END PUBLIC KEY-----'
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'reeve install: %s\n' "$*" >&2; }
@@ -118,6 +124,20 @@ asset="reeve-$target.tar.gz"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
+# SHA256SUMS.sig is the ed25519 signature over SHA256SUMS, base64. OpenSSL
+# 1.1.1 or newer knows ed25519.
+check_signature() {
+    need openssl
+    printf '%s\n' "$RELEASE_KEY" > "$tmp/release-key.pem"
+    tr -d '\r\n' < "$tmp/SHA256SUMS.sig" > "$tmp/signature.b64"
+    openssl base64 -d -A -in "$tmp/signature.b64" -out "$tmp/signature.bin" 2>/dev/null \
+        || die "the release's signature isn't readable; refusing to install"
+    openssl pkeyutl -verify -pubin -inkey "$tmp/release-key.pem" -rawin \
+        -in "$tmp/SHA256SUMS" -sigfile "$tmp/signature.bin" >/dev/null 2>&1 \
+        || die "the release's signature doesn't match Reeve's release key; refusing to install"
+    say "signature ok"
+}
+
 if [ -n "$from" ]; then
     [ -f "$from" ] || die "no such file $from"
     cp "$from" "$tmp/$asset"
@@ -125,6 +145,12 @@ if [ -n "$from" ]; then
     [ -f "$sums" ] || sums="$from.sha256"
     if [ -f "$sums" ]; then
         cp "$sums" "$tmp/SHA256SUMS"
+        if [ -f "$sums.sig" ]; then
+            cp "$sums.sig" "$tmp/SHA256SUMS.sig"
+            check_signature
+        else
+            warn "no SHA256SUMS.sig next to $from; the checksums aren't signed"
+        fi
     else
         warn "no SHA256SUMS next to $from; not verified"
     fi
@@ -144,8 +170,10 @@ else
         base="https://github.com/$REPO/releases/latest/download"
     fi
     say "downloading $asset ${version:-(latest)}"
-    fetch "$base/$asset" "$tmp/$asset" || die "couldn't download $base/$asset"
     fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" || die "couldn't download the checksums; refusing to install unverified"
+    fetch "$base/SHA256SUMS.sig" "$tmp/SHA256SUMS.sig" || die "this release has no signature (releases before 0.8.0 aren't signed; use that release's own install.sh); refusing to install"
+    check_signature
+    fetch "$base/$asset" "$tmp/$asset" || die "couldn't download $base/$asset"
 fi
 
 if [ -f "$tmp/SHA256SUMS" ]; then
