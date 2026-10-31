@@ -645,6 +645,7 @@ renders each screen to colored HTML (with `REEVE_SHOTS_HOME`, from a real Reeve 
   memory/{facts,baselines,runbooks,preferences}/
   skills/<id>.md         # the owner's skills
   findings/  proposals/  orders/*.toml
+  .settings.lock  orders/.state.lock  receipts/.lock  observer/.update.lock   # held while a shared file is read, changed and written
   observer/metrics/YYYY-MM-DD.jsonl
   observer/update.json   # newest release seen, version installed, version replaced
   themes/*.toml
@@ -780,7 +781,7 @@ pacman and apt pass, and the dev → main PR has its two external reviews.
 5. **A runbook "worked" only with evidence** (G19): reflection counts a success only when the
    session has a verified change or no failed receipt. S. *In dev as of 2026-10-30 (§7, step 4).*
 6. **Locked updates for shared files** (G17): settings and order state use the lock the receipts
-   already use. S.
+   already use. S. *In dev as of 2026-10-30 (`lockfile::hold`; DECISIONS 2026-10-30).*
 
 **The 1.0 gate (§14), with the findings that bear on each**
 

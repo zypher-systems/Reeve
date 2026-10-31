@@ -50,8 +50,18 @@ impl Settings {
         }
     }
 
+    /// Read, change and write under a lock, so two TUIs never drop each
+    /// other's choices. Use this to change what's there.
+    pub fn modify(home: &Path, f: impl FnOnce(&mut Self)) -> Result<Self> {
+        let _lock = crate::lockfile::hold(&home.join(".settings.lock"))?;
+        let mut s = Self::load(home)?;
+        f(&mut s);
+        s.save(home)?;
+        Ok(s)
+    }
+
     /// Write atomically (temp file, then rename). Never holds a key: keys
-    /// live in `keys/`.
+    /// live in `keys/`. [`Settings::modify`] changes what's there.
     pub fn save(&self, home: &Path) -> Result<()> {
         fs::create_dir_all(home)?;
         let mut clean = self.clone();
@@ -139,6 +149,34 @@ mod tests {
         Settings::load(home.path()).unwrap().apply(&mut cfg);
         let (name, _, model) = cfg.route().unwrap();
         assert_eq!((name.as_str(), model.as_str()), ("groq", "llama-4"));
+    }
+
+    #[test]
+    fn two_edits_keep_each_others_choices() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().to_path_buf();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let p = path.clone();
+        let first = std::thread::spawn(move || {
+            Settings::modify(&p, |s| {
+                s.default_connection = Some("groq".into());
+                entered_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            })
+            .unwrap();
+        });
+        entered_rx.recv().unwrap();
+        // Begins while the first edit is open. Without the lock it would
+        // read the file from before it, and one of the two saves would be
+        // lost.
+        Settings::modify(&path, |s| {
+            s.models.insert("groq".into(), "llama-4".into());
+        })
+        .unwrap();
+        first.join().unwrap();
+        let s = Settings::load(&path).unwrap();
+        assert_eq!(s.default_connection.as_deref(), Some("groq"));
+        assert_eq!(s.models.get("groq").map(String::as_str), Some("llama-4"));
     }
 
     #[test]

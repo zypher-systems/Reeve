@@ -391,67 +391,71 @@ impl Observer {
         if list.is_empty() {
             return;
         }
-        // A state file that can't be read means forgotten limits: nothing
-        // starts until it's fixed.
-        let mut states = match orders.states_checked() {
-            Ok(s) => s,
+        let now = Utc::now();
+        let findings = self.store.list();
+        // Picked and claimed under the state's lock, so a run finishing or
+        // `reeve orders run` meanwhile doesn't drop the claim, nor this the
+        // run. A state file that can't be read means forgotten limits:
+        // nothing starts until it's fixed.
+        let picked = orders.modify_states(|states| {
+            for o in &list {
+                if due.is_some() {
+                    break;
+                }
+                let st = states.entry(o.id.clone()).or_default();
+                if !o.enabled {
+                    continue;
+                }
+                if let Some(f) = findings
+                    .iter()
+                    .find(|f| o.wants(f) && st.handled.get(&f.id) != Some(&f.first_seen))
+                {
+                    // Each episode of a finding is handled once, run or not.
+                    st.handled.insert(f.id.clone(), f.first_seen);
+                    match o.can_run(st, now) {
+                        Ok(()) => {
+                            due = Some((
+                                o.clone(),
+                                crate::orders::Cause::Finding(Box::new(f.clone())),
+                            ));
+                            break;
+                        }
+                        Err(why) => st.push(Run {
+                            ts: now,
+                            trigger: format!("finding:{}", f.id),
+                            status: "skipped".into(),
+                            summary: why,
+                            receipts: vec![],
+                            usd: None,
+                            session: None,
+                        }),
+                    }
+                    continue;
+                }
+                if o.schedule_due(st, now) && o.can_run(st, now).is_ok() {
+                    due = Some((o.clone(), crate::orders::Cause::Schedule));
+                    break;
+                }
+            }
+            if let Some((order, cause)) = &due {
+                // Claimed before it starts: it holds the cooldown and counts
+                // toward today's limit, so a slow run can't start twice and
+                // one that never comes back still counted.
+                states.entry(order.id.clone()).or_default().claim(now);
+                if matches!(cause, crate::orders::Cause::Manual) {
+                    orders.take_request(&order.id);
+                }
+            }
+            due
+        });
+        let due = match picked {
+            Ok(d) => d,
             Err(e) => {
                 self.status.last_error =
                     Some(format!("orders: {e}; nothing starts until it's fixed"));
                 return;
             }
         };
-        let now = Utc::now();
-        let findings = self.store.list();
-        for o in &list {
-            if due.is_some() {
-                break;
-            }
-            let st = states.entry(o.id.clone()).or_default();
-            if !o.enabled {
-                continue;
-            }
-            if let Some(f) = findings
-                .iter()
-                .find(|f| o.wants(f) && st.handled.get(&f.id) != Some(&f.first_seen))
-            {
-                // Each episode of a finding is handled once, run or not.
-                st.handled.insert(f.id.clone(), f.first_seen);
-                match o.can_run(st, now) {
-                    Ok(()) => {
-                        due = Some((
-                            o.clone(),
-                            crate::orders::Cause::Finding(Box::new(f.clone())),
-                        ));
-                        break;
-                    }
-                    Err(why) => st.push(Run {
-                        ts: now,
-                        trigger: format!("finding:{}", f.id),
-                        status: "skipped".into(),
-                        summary: why,
-                        receipts: vec![],
-                        usd: None,
-                        session: None,
-                    }),
-                }
-                continue;
-            }
-            if o.schedule_due(st, now) && o.can_run(st, now).is_ok() {
-                due = Some((o.clone(), crate::orders::Cause::Schedule));
-                break;
-            }
-        }
-        if let Some((order, cause)) = &due {
-            // Claimed before it starts: it holds the cooldown and counts
-            // toward today's limit, so a slow run can't start twice and one
-            // that never comes back still counted.
-            states.entry(order.id.clone()).or_default().claim(now);
-            if matches!(cause, crate::orders::Cause::Manual) {
-                orders.take_request(&order.id);
-            }
-        }
-        let _ = orders.save_states(&states);
         let Some((order, cause)) = due else { return };
         self.order_running.store(true, Ordering::SeqCst);
         let (home, cfg, profile, running) = (
@@ -482,15 +486,13 @@ impl Observer {
             // replaced with one that remembers only this run: the file
             // stays as it is, the tick reports it, and this run is known
             // by its receipts alone.
-            match orders.states_checked() {
-                Ok(mut states) => {
-                    states.entry(order.id.clone()).or_default().push(run);
-                    let _ = orders.save_states(&states);
-                }
-                Err(e) => eprintln!(
+            if let Err(e) =
+                orders.modify_states(|s| s.entry(order.id.clone()).or_default().push(run))
+            {
+                eprintln!(
                     "reeved: orders: {e}; the run of \"{}\" ({status}) isn't in its history",
                     order.name
-                ),
+                );
             }
             // A blocked run left a proposal: that's worth a popup. A finished
             // or failed one only if the order asks for it.

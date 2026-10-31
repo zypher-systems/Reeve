@@ -238,19 +238,10 @@ impl UpdateState {
     /// `reeve update` never drop each other's fields (the rollback target
     /// above all).
     pub fn modify(reeve_home: &Path, f: impl FnOnce(&mut Self)) -> Result<Self> {
-        let dir = reeve_home.join("observer");
-        fs::create_dir_all(&dir)?;
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join(".update.lock"))?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
-            .map_err(|e| Error::Io(format!("update lock: {e}")))?;
+        let _lock = crate::lockfile::hold(&reeve_home.join("observer").join(".update.lock"))?;
         let mut s = Self::load(reeve_home);
         f(&mut s);
         s.save(reeve_home)?;
-        drop(lock);
         Ok(s)
     }
 

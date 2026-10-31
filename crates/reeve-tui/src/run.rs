@@ -1492,15 +1492,7 @@ impl App {
     }
 
     fn edit_settings(&mut self, view: &mut View, f: impl FnOnce(&mut Settings)) {
-        let mut s = match Settings::load(&self.home) {
-            Ok(s) => s,
-            Err(e) => {
-                view.push(Speaker::Error, e.to_string());
-                return;
-            }
-        };
-        f(&mut s);
-        if let Err(e) = s.save(&self.home) {
+        if let Err(e) = Settings::modify(&self.home, f) {
             view.push(Speaker::Error, format!("couldn't save settings: {e}"));
             return;
         }

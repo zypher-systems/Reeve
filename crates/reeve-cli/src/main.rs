@@ -542,8 +542,8 @@ fn orders_cmd(cfg: &Config, home: &std::path::Path, cmd: OrdersCmd) -> Result<()
             // A start like any other, so the daily limit sees it. A state
             // file that can't be read means forgotten limits: nothing runs,
             // and the file isn't replaced.
-            let mut states = orders
-                .states_checked()
+            orders
+                .modify_states(|s| s.entry(id.clone()).or_default().claim(chrono::Utc::now()))
                 .map_err(|e| format!("{e}; nothing runs until it's fixed"))?;
             println!(
                 "running \"{}\" as reeved would: unattended, inside its scope…",
@@ -555,11 +555,6 @@ fn orders_cmd(cfg: &Config, home: &std::path::Path, cmd: OrdersCmd) -> Result<()
                 .build()
                 .map_err(|e| e.to_string())?;
             let profile = reeve_observer::HostInfo::read().profile();
-            states
-                .entry(id.clone())
-                .or_default()
-                .claim(chrono::Utc::now());
-            orders.save_states(&states).map_err(|e| e.to_string())?;
             let run = rt.block_on(reeve_observer::orders::run(
                 home,
                 cfg,
@@ -576,11 +571,9 @@ fn orders_cmd(cfg: &Config, home: &std::path::Path, cmd: OrdersCmd) -> Result<()
             // The run happened, and its receipts stand. A state that stopped
             // parsing meanwhile isn't replaced with one that remembers only
             // this run.
-            let mut states = orders
-                .states_checked()
-                .map_err(|e| format!("{e}; the run isn't in the order's history"))?;
-            states.entry(id).or_default().push(run);
-            orders.save_states(&states).map_err(|e| e.to_string())
+            orders
+                .modify_states(|s| s.entry(id).or_default().push(run))
+                .map_err(|e| format!("{e}; the run isn't in the order's history"))
         }
         OrdersCmd::Sudoers { id } => {
             let o = orders.get(&id).map_err(|e| e.to_string())?;
