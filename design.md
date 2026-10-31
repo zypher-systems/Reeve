@@ -376,6 +376,15 @@ Windows will need their own observer design later.
   - **Over budget:** the finding stays undrafted and says why ("drafter budget reached for today").
   - **Unknown price:** a model with no known price can't be used for the drafter while any cap is
     set; it fails closed.
+- **Nothing waits on slow work.** The 6-hourly checks (package queries) and a draft (model calls,
+  minutes) run as tasks beside the loop and report back on a channel it listens to, so sampling,
+  the heartbeat, the journal and standing orders keep their cadence meanwhile. Each has a deadline:
+  the checks get 10 minutes, and past it they resolve nothing (a finding they didn't see isn't
+  gone); a draft stops itself between model calls after 15 minutes, with every call it made in
+  the ledger, and reeved cuts off one stuck in a call that never returned at 35. A draft that
+  didn't finish leaves its note on the finding, so the next pass doesn't pick it again. One of
+  each at a time; the heartbeat says what's running and since when (`/observer`, `reeve daemon
+  status`).
 - **Sharing state:** `reeved` and the TUI share files, not a socket. Findings are one JSON file each in
   `~/.reeve/findings/`, and `~/.reeve/observer/status.json` holds a heartbeat every 10 s. The TUI polls
   them each second and shows "observer ○ off" when the heartbeat is stale. The service runs
@@ -757,7 +766,8 @@ pacman and apt pass, and the dev → main PR has its two external reviews.
 
 1. **The observer loop never blocks** (G10). Slow checks and the drafter run as supervised tasks
    with deadlines, like orders already do; sampling, the heartbeat and the scheduler keep their
-   cadence while a model call takes minutes. M.
+   cadence while a model call takes minutes. M. *In dev as of 2026-10-30 (§8, "Nothing waits on
+   slow work"; DECISIONS 2026-10-30).*
 2. **Snapshots out of the box** (G14, §14). The once-only offer to create the snapper root config;
    a failed pre-snapshot shown on the card and the receipt; the coverage a T2 action has, shown
    before it runs. M.

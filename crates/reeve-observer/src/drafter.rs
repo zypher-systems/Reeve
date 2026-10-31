@@ -7,8 +7,12 @@
 //! - Read-only: its approver says no to everything past T0, so it can
 //!   investigate but never change anything. The proposal waits for the owner.
 //! - A model with no known price can't be used while a cap is set.
+//! - Bounded: a draft stops between model calls once it has run for
+//!   `DEADLINE`, and the finding keeps the note. reeved runs each draft
+//!   beside its loop and cuts off one stuck in a call that never returns.
 
 use std::path::Path;
+use std::time::Duration;
 
 use chrono::{Local, Utc};
 use reeve_core::agent::{Agent, AgentEvent};
@@ -16,6 +20,10 @@ use reeve_core::config::{self, Config};
 use reeve_core::findings::{Finding, FindingStatus, FindingStore, Proposal, Severity};
 use reeve_core::ledger;
 use reeve_core::llm::{HttpProvider, Provider};
+
+/// How long a draft may run. Past it, the agent stops between model
+/// calls, so the calls made are all recorded.
+pub const DEADLINE: Duration = Duration::from_secs(15 * 60);
 
 /// What one pass did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,15 +90,35 @@ fn prompt(f: &Finding) -> String {
     )
 }
 
-/// One pass: draft at most one finding.
-pub async fn pass(home: &Path, cfg: &Config, store: &FindingStore, profile: &str) -> Pass {
+/// The finding the next pass would draft: the drafter is on and one has
+/// settled. The caller starts the draft, so it knows which finding to
+/// write the note on if the draft never comes back.
+pub fn next(store: &FindingStore, cfg: &Config) -> Option<Finding> {
     let d = &cfg.observer.drafter;
     if !d.enabled {
-        return Pass::Idle;
+        return None;
     }
-    let Some(mut f) = candidate(store, Severity::parse(&d.min_severity)) else {
-        return Pass::Idle;
-    };
+    candidate(store, Severity::parse(&d.min_severity))
+}
+
+/// One pass: draft at most one finding.
+pub async fn pass(home: &Path, cfg: &Config, store: &FindingStore, profile: &str) -> Pass {
+    match next(store, cfg) {
+        Some(f) => draft(home, cfg, store, profile, f).await,
+        None => Pass::Idle,
+    }
+}
+
+/// Draft a proposal for `f`, within the drafter's budgets and `DEADLINE`.
+pub async fn draft(
+    home: &Path,
+    cfg: &Config,
+    store: &FindingStore,
+    profile: &str,
+    mut f: Finding,
+) -> Pass {
+    let started = std::time::Instant::now();
+    let d = &cfg.observer.drafter;
     let block = |f: &mut Finding, why: String| {
         f.draft_note = Some(why.clone());
         let _ = store.put(f);
@@ -154,6 +182,7 @@ pub async fn pass(home: &Path, cfg: &Config, store: &FindingStore, profile: &str
         Err(e) => return block(&mut f, format!("drafter: {e}")),
     };
     agent.set_role("drafter");
+    agent.set_deadline(started + DEADLINE);
     let _ = agent.refresh_models().await;
     let any_cap = d.daily_usd > 0.0
         || d.per_draft_usd > 0.0

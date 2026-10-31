@@ -190,6 +190,8 @@ pub struct Agent {
     /// The owner said yes to the rest of this request (T1 only).
     turn_allowed: bool,
     role: Option<String>,
+    /// Past this, the turn stops between model calls (the drafter's).
+    deadline: Option<std::time::Instant>,
     txn: Option<crate::txn::Txn>,
     /// The owner said yes to the rest of the open change.
     change_allowed: bool,
@@ -292,6 +294,7 @@ impl Agent {
             allowed: HashSet::new(),
             turn_allowed: false,
             role: None,
+            deadline: None,
             txn: None,
             change_allowed: false,
         })
@@ -306,6 +309,13 @@ impl Agent {
     pub fn set_role(&mut self, role: &str) {
         self.role = Some(role.to_string());
         self.apply_privacy();
+    }
+
+    /// Stop the turn between model calls once this instant has passed. A
+    /// call already running finishes (the HTTP layer bounds it), so what it
+    /// cost is recorded.
+    pub fn set_deadline(&mut self, at: std::time::Instant) {
+        self.deadline = Some(at);
     }
 
     fn apply_privacy(&mut self) {
@@ -537,11 +547,19 @@ impl Agent {
         self.session.append(&msg)?;
         self.transcript.push(msg);
 
-        for _ in 0..MAX_ROUNDS {
+        for round in 0..MAX_ROUNDS {
             let totals = ledger::totals(&self.home, Local::now());
             if let Some(why) = ledger::over_cap(&self.cfg.spend, &self.tally, &totals) {
                 return Err(Error::Budget(format!(
                     "{why}. Raise it in [spend] to continue."
+                )));
+            }
+            if self
+                .deadline
+                .is_some_and(|at| std::time::Instant::now() >= at)
+            {
+                return Err(Error::Provider(format!(
+                    "out of time after {round} rounds of tool calls; the turn stops here"
                 )));
             }
             let req = CompletionRequest {
@@ -2390,6 +2408,31 @@ mod tests {
         assert!(
             matches!(events.last(), Some(AgentEvent::Error(e)) if e.contains("session cap")),
             "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deadline_stops_the_turn_between_calls() {
+        // A reply with one tool call, then a reply with none: two calls'
+        // worth of script, none of it used.
+        let (_home, mut a) = agent(
+            vec![
+                call("fs_read", serde_json::json!({"path": "/etc/hostname"})),
+                done("done"),
+            ],
+            fixed(Decision::Approve, false),
+        );
+        a.set_deadline(std::time::Instant::now());
+        let events = run(&mut a).await;
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Error(e)) if e.contains("out of time after 0 rounds")),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolStarted { .. })),
+            "nothing was called past the deadline: {events:?}"
         );
     }
 }

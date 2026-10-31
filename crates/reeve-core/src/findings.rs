@@ -350,6 +350,12 @@ pub struct ObserverStatus {
     pub drafts_today: u32,
     /// Last problem it hit, if any.
     pub last_error: Option<String>,
+    /// The drafter has been working on a proposal since then.
+    #[serde(default)]
+    pub drafting_since: Option<DateTime<Utc>>,
+    /// The 6-hourly checks have been running since then.
+    #[serde(default)]
+    pub checking_since: Option<DateTime<Utc>>,
 }
 
 impl ObserverStatus {

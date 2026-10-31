@@ -378,19 +378,30 @@ fn daemon(home: &std::path::Path, cmd: DaemonCmd) -> Result<(), String> {
         }
         DaemonCmd::Status => {
             println!("service: {}", service::state());
+            let now = chrono::Utc::now();
             match ObserverStatus::load(home) {
-                Some(s) if s.alive(chrono::Utc::now()) => println!(
-                    "reeved: running (pid {}), system journal {}, drafter {} (${:.2} today, {} drafts)",
-                    s.pid,
-                    if s.journal {
-                        "readable"
-                    } else {
-                        "NOT readable (add yourself to the systemd-journal group)"
-                    },
-                    if s.drafter { "on" } else { "off" },
-                    s.drafter_usd_today,
-                    s.drafts_today
-                ),
+                Some(s) if s.alive(now) => {
+                    println!(
+                        "reeved: running (pid {}), system journal {}, drafter {} (${:.2} today, {} drafts)",
+                        s.pid,
+                        if s.journal {
+                            "readable"
+                        } else {
+                            "NOT readable (add yourself to the systemd-journal group)"
+                        },
+                        if s.drafter { "on" } else { "off" },
+                        s.drafter_usd_today,
+                        s.drafts_today
+                    );
+                    for (since, what) in [
+                        (s.drafting_since, "drafting a proposal"),
+                        (s.checking_since, "running the 6-hourly checks"),
+                    ] {
+                        if let Some(t) = since {
+                            println!("reeved: {what} for {} min", (now - t).num_minutes());
+                        }
+                    }
+                }
                 Some(_) => println!("reeved: not running (last heartbeat is old)"),
                 None => println!("reeved: has never run"),
             }
