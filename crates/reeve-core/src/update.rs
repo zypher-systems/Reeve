@@ -378,11 +378,18 @@ pub enum Install {
     Rpm {
         /// Its name.
         package: String,
+        /// The dnf repository it came from; `None` for a file installed by
+        /// hand (`@commandline`). A repository's build is updated through
+        /// that repository, never replaced with the release's own RPM.
+        repo: Option<String>,
     },
     /// Owned by a Debian package.
     Deb {
         /// Its name.
         package: String,
+        /// The apt repository it came from, with the versions on offer;
+        /// `None` for a `.deb` installed by hand.
+        repo: Option<AptRepo>,
     },
     /// Owned by a pacman package.
     Pacman {
@@ -395,8 +402,39 @@ pub enum Install {
     Unknown(PathBuf),
 }
 
+/// An apt repository a package is available from, and the versions of it
+/// the repository offers as of the last `apt-get update`, newest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AptRepo {
+    /// The repository's host.
+    pub name: String,
+    /// Its versions of the package (`0.8.1-1`), newest first.
+    pub versions: Vec<String>,
+}
+
+/// Where a package came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Repo {
+    /// A dnf repository, by id (`fedora`, `kinetic`).
+    Dnf(String),
+    /// An apt repository.
+    Apt(AptRepo),
+}
+
+/// Who owns a path: the package manager, the package, and the repository
+/// the package came from (`None` for a package file installed by hand).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Owned {
+    /// `rpm`, `dpkg` or `pacman`.
+    pub manager: &'static str,
+    /// The package's name.
+    pub package: String,
+    /// Its repository, when it came from one.
+    pub repo: Option<Repo>,
+}
+
 /// The package manager that owns a path, and the package.
-pub type Owner = Option<(&'static str, String)>;
+pub type Owner = Option<Owned>;
 
 /// Work out how `bin` was installed. `home` is the person's home directory
 /// (empty when there's none: then nothing counts as a home install);
@@ -411,11 +449,23 @@ pub fn classify(bin: &Path, home: &Path, owner: impl Fn(&Path) -> Owner) -> Inst
     {
         return Install::Source(bin.into());
     }
-    if let Some((pm, package)) = owner(bin) {
-        return match pm {
-            "rpm" => Install::Rpm { package },
-            "dpkg" => Install::Deb { package },
-            _ => Install::Pacman { package },
+    if let Some(o) = owner(bin) {
+        return match o.manager {
+            "rpm" => Install::Rpm {
+                package: o.package,
+                repo: match o.repo {
+                    Some(Repo::Dnf(r)) => Some(r),
+                    _ => None,
+                },
+            },
+            "dpkg" => Install::Deb {
+                package: o.package,
+                repo: match o.repo {
+                    Some(Repo::Apt(a)) => Some(a),
+                    _ => None,
+                },
+            },
+            _ => Install::Pacman { package: o.package },
         };
     }
     let Some(dir) = bin.parent() else {
@@ -431,30 +481,127 @@ pub fn classify(bin: &Path, home: &Path, owner: impl Fn(&Path) -> Owner) -> Inst
     }
 }
 
-/// Ask rpm, then dpkg, then pacman, who owns `path`.
+/// What `prog args…` prints, when it runs and succeeds.
+fn output_of(prog: &str, args: &[&str]) -> Option<String> {
+    let o = std::process::Command::new(prog)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    o.status
+        .success()
+        .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// Ask rpm, then dpkg, then pacman, who owns `path`, and the package
+/// manager which repository the package came from.
 pub fn package_owner(path: &Path) -> Owner {
+    let path = path.to_string_lossy();
     let ask = |prog: &str, args: &[&str]| -> Option<String> {
-        let o = std::process::Command::new(prog)
-            .args(args)
-            .arg(path)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        let out = String::from_utf8_lossy(&o.stdout);
+        let mut args = args.to_vec();
+        args.push(&path);
+        let out = output_of(prog, &args)?;
         let first = out.lines().next()?.trim();
-        (o.status.success() && !first.is_empty()).then(|| first.to_string())
+        (!first.is_empty()).then(|| first.to_string())
     };
-    if let Some(p) = ask("rpm", &["-qf", "--qf", "%{NAME}\\n"]) {
-        return Some(("rpm", p));
+    if let Some(package) = ask("rpm", &["-qf", "--qf", "%{NAME}\\n"]) {
+        let repo = rpm_repo(&package).map(Repo::Dnf);
+        return Some(Owned {
+            manager: "rpm",
+            package,
+            repo,
+        });
     }
     // `reeve: /usr/bin/reeve`
     if let Some(p) = ask("dpkg", &["-S"]) {
         if let Some((package, _)) = p.split_once(':') {
-            return Some(("dpkg", package.trim().to_string()));
+            let package = package.trim().to_string();
+            let repo = apt_repo(&package).map(Repo::Apt);
+            return Some(Owned {
+                manager: "dpkg",
+                package,
+                repo,
+            });
         }
     }
-    ask("pacman", &["-Qoq"]).map(|p| ("pacman", p))
+    ask("pacman", &["-Qoq"]).map(|package| Owned {
+        manager: "pacman",
+        package,
+        repo: None,
+    })
+}
+
+/// The dnf repository an installed RPM came from, from dnf's own record
+/// (dnf5 or dnf, from its cache: no network).
+fn rpm_repo(package: &str) -> Option<String> {
+    ["dnf5", "dnf"].iter().find_map(|dnf| {
+        let out = output_of(
+            dnf,
+            &[
+                "-q",
+                "-C",
+                "repoquery",
+                "--installed",
+                "--queryformat",
+                "%{from_repo}\\n",
+                package,
+            ],
+        )?;
+        dnf_repo(&out)
+    })
+}
+
+/// The repository in dnf's `%{from_repo}` answer: `@commandline` is a file
+/// installed by hand, `@System` and nothing are unknown; neither is one.
+pub fn dnf_repo(out: &str) -> Option<String> {
+    let repo = out.lines().map(str::trim).find(|l| !l.is_empty())?;
+    (!repo.starts_with('@')).then(|| repo.to_string())
+}
+
+/// The apt repository an installed package is available from, with its
+/// versions, from `apt-cache policy` (the last `apt-get update`'s lists).
+fn apt_repo(package: &str) -> Option<AptRepo> {
+    apt_policy(&output_of("apt-cache", &["policy", package])?)
+}
+
+/// Read `apt-cache policy <package>`: the versions its table lists from a
+/// repository (a source with a URL, not `/var/lib/dpkg/status`), newest
+/// first, and the first such repository's host. `None` when no repository
+/// offers the package.
+pub fn apt_policy(text: &str) -> Option<AptRepo> {
+    let mut name = None;
+    let mut versions: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    let mut listed = false;
+    for line in text
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with("Version table:"))
+    {
+        let t = line.trim_start().trim_start_matches("***").trim_start();
+        let mut words = t.split_whitespace();
+        let (Some(first), Some(second)) = (words.next(), words.next()) else {
+            continue;
+        };
+        if first.chars().all(|c| c.is_ascii_digit()) {
+            // A source line: `500 https://host/path suite/component arch Packages`.
+            if let Some((_, rest)) = second.split_once("://") {
+                let host = rest.split('/').next().unwrap_or(rest);
+                if name.is_none() {
+                    name = Some(host.to_string());
+                }
+                if let (Some(v), false) = (&current, listed) {
+                    versions.push(v.clone());
+                    listed = true;
+                }
+            }
+        } else if second.chars().all(|c| c.is_ascii_digit()) {
+            // A version line: `0.8.1-1 500`.
+            current = Some(first.to_string());
+            listed = false;
+        }
+    }
+    name.map(|name| AptRepo { name, versions })
 }
 
 /// The unit install.sh writes for an install under `prefix` (its own rule).
@@ -635,6 +782,31 @@ mod tests {
     }
 
     #[test]
+    fn a_package_remembers_its_repository() {
+        assert_eq!(dnf_repo("kinetic\n"), Some("kinetic".into()));
+        assert_eq!(dnf_repo("\nfedora\n\n"), Some("fedora".into()));
+        for by_hand in ["@commandline\n", "@System", "", "\n"] {
+            assert_eq!(dnf_repo(by_hand), None, "{by_hand:?}");
+        }
+        let policy = "reeve:\n  Installed: 0.8.0-1\n  Candidate: 0.8.1-1\n  Version table:\n     \
+                      0.8.1-1 500\n        500 https://repo.example.org/debian stable/main amd64 Packages\n \
+                      *** 0.8.0-1 100\n        100 /var/lib/dpkg/status\n     0.7.2-1 500\n        500 \
+                      https://repo.example.org/debian stable/main amd64 Packages\n";
+        assert_eq!(
+            apt_policy(policy),
+            Some(AptRepo {
+                name: "repo.example.org".into(),
+                versions: vec!["0.8.1-1".into(), "0.7.2-1".into()],
+            }),
+            "the installed version is local only; the other two are the repository's"
+        );
+        let by_hand = "reeve:\n  Installed: 0.8.0-1\n  Candidate: 0.8.0-1\n  Version table:\n \
+                       *** 0.8.0-1 100\n        100 /var/lib/dpkg/status\n";
+        assert_eq!(apt_policy(by_hand), None);
+        assert_eq!(apt_policy("N: Unable to locate package reeve\n"), None);
+    }
+
+    #[test]
     fn a_release_is_taken_only_on_its_signature() {
         use base64::Engine;
         use ed25519_dalek::{Signer, SigningKey};
@@ -686,25 +858,67 @@ mod tests {
                 user: true
             }
         );
-        let rpm = |_: &Path| Some(("rpm", "reeve".to_string()));
+        let owned = |manager: &'static str, repo: Option<Repo>| {
+            move |_: &Path| {
+                Some(Owned {
+                    manager,
+                    package: "reeve".into(),
+                    repo: repo.clone(),
+                })
+            }
+        };
+        let rpm = owned("rpm", None);
         assert_eq!(
-            classify(Path::new("/usr/bin/reeve"), home, rpm),
+            classify(Path::new("/usr/bin/reeve"), home, &rpm),
             Install::Rpm {
-                package: "reeve".into()
+                package: "reeve".into(),
+                repo: None
             }
         );
-        let pac = |_: &Path| Some(("pacman", "reeve-bin".to_string()));
+        assert_eq!(
+            classify(
+                Path::new("/usr/bin/reeve"),
+                home,
+                owned("rpm", Some(Repo::Dnf("kinetic".into())))
+            ),
+            Install::Rpm {
+                package: "reeve".into(),
+                repo: Some("kinetic".into())
+            }
+        );
+        let pac = |_: &Path| {
+            Some(Owned {
+                manager: "pacman",
+                package: "reeve-bin".into(),
+                repo: None,
+            })
+        };
         assert_eq!(
             classify(Path::new("/usr/bin/reeve"), home, pac),
             Install::Pacman {
                 package: "reeve-bin".into()
             }
         );
-        let deb = |_: &Path| Some(("dpkg", "reeve".to_string()));
         assert_eq!(
-            classify(Path::new("/usr/bin/reeve"), home, deb),
+            classify(Path::new("/usr/bin/reeve"), home, owned("dpkg", None)),
             Install::Deb {
-                package: "reeve".into()
+                package: "reeve".into(),
+                repo: None
+            }
+        );
+        let apt = AptRepo {
+            name: "repo.example.org".into(),
+            versions: vec!["0.8.1-1".into()],
+        };
+        assert_eq!(
+            classify(
+                Path::new("/usr/bin/reeve"),
+                home,
+                owned("dpkg", Some(Repo::Apt(apt.clone())))
+            ),
+            Install::Deb {
+                package: "reeve".into(),
+                repo: Some(apt)
             }
         );
         // Source builds win even if something claims to own them.
@@ -712,7 +926,10 @@ mod tests {
             "/home/me/src/reeve/target/release/reeve",
             "/home/me/.cargo/bin/reeve",
         ] {
-            assert_eq!(classify(Path::new(p), home, rpm), Install::Source(p.into()));
+            assert_eq!(
+                classify(Path::new(p), home, &rpm),
+                Install::Source(p.into())
+            );
         }
         assert_eq!(
             classify(Path::new("/opt/tools/reeve"), home, none),

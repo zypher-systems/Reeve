@@ -3,7 +3,12 @@
 //!
 //! - Copied by install.sh: download the release tarball, check it against the
 //!   release's `SHA256SUMS`, and run *that release's* installer over this copy.
-//! - An RPM: download the release RPM, check it, and hand it to dnf.
+//! - An RPM or a .deb from a repository (a distribution's build, signed its
+//!   way): updated through that repository, by version, so the release's own
+//!   package never replaces it; if the repository doesn't have the version,
+//!   nothing changes.
+//! - An RPM or .deb installed by hand: download the release's, check it, and
+//!   hand it to dnf or apt-get.
 //! - A pacman package: hand off to the AUR helper.
 //! - A cargo build: refuse, and say how to rebuild.
 //!
@@ -44,12 +49,19 @@ enum Kind {
     Rpm { dnf: String, downgrade: bool },
     /// The release .deb, through apt-get.
     Deb { downgrade: bool },
+    /// The repository the package came from, through its package manager.
+    Repo {
+        /// `dnf5 upgrade -y reeve-0.8.1`, run with sudo.
+        command: Vec<String>,
+        repo: String,
+    },
     /// The AUR helper.
     Aur { helper: String, package: String },
 }
 
 struct Plan {
-    /// For the receipt: `install.sh (/usr/local)`, `rpm`, `deb`, `aur`.
+    /// For the receipt: `install.sh (/usr/local)`, `rpm`, `rpm (kinetic)`,
+    /// `deb`, `deb (repo.example.org)`, `aur`.
     method: String,
     tier: Tier,
     /// What will happen, in plain words, before asking.
@@ -109,7 +121,7 @@ pub fn run(home: &Path, opts: Opts) -> Result<(), String> {
         .map_err(|e| format!("can't tell where this reeve is: {e}"))?;
     let me = update::user_home().unwrap_or_default();
     let install = update::classify(&bin, &me, update::package_owner);
-    let plan = plan(&install, &me, running, to, latest)?;
+    let plan = plan(&install, &me, running, to, latest, &Distro::detect())?;
     println!("{}", plan.describe);
     if let Some(u) = &notes {
         println!("What's new: {u}");
@@ -202,6 +214,7 @@ fn plan(
     running: Version,
     to: Version,
     latest: bool,
+    distro: &Distro,
 ) -> Result<Plan, String> {
     let head = format!("Reeve {running} → {to}");
     match install {
@@ -238,19 +251,34 @@ fn plan(
                 },
             })
         }
-        Install::Rpm { package } => {
-            let distro = Distro::detect();
+        Install::Rpm { package, repo } => {
             // Image-based Fedora layers packages with rpm-ostree; the package
             // tools refuse there, and so does this.
             if let Some(why) = distro.package_block() {
                 return Err(format!("{package} is an RPM, but {why}"));
             }
             let dnf = match distro {
-                Distro::Fedora { dnf, .. } => dnf,
+                Distro::Fedora { dnf, .. } => dnf.clone(),
                 _ => "dnf".into(),
             };
             let downgrade = to < running;
             let verb = if downgrade { "downgrade" } else { "upgrade" };
+            if let Some(repo) = repo {
+                // A repository's build stays the one installed: the version
+                // comes from the repository, signed its way, or nothing changes.
+                let spec = format!("{package}-{to}");
+                return Ok(Plan {
+                    method: format!("rpm ({repo})"),
+                    tier: Tier::T2,
+                    describe: format!(
+                        "{head} ({package} comes from the {repo} repository)\nRun: sudo {dnf} {verb} -y {spec}. If {repo} doesn't have {to} yet, nothing changes."
+                    ),
+                    kind: Kind::Repo {
+                        command: vec![dnf, verb.into(), "-y".into(), spec],
+                        repo: repo.clone(),
+                    },
+                });
+            }
             Ok(Plan {
                 method: "rpm".into(),
                 tier: Tier::T2,
@@ -262,9 +290,46 @@ fn plan(
                 kind: Kind::Rpm { dnf, downgrade },
             })
         }
-        Install::Deb { package } => {
+        Install::Deb { package, repo } => {
             let downgrade = to < running;
             let allow = if downgrade { " --allow-downgrades" } else { "" };
+            if let Some(repo) = repo {
+                // apt installs an exact version: the repository's build of
+                // `to`, whatever revision it gave it.
+                let Some(version) = repo
+                    .versions
+                    .iter()
+                    .find(|v| **v == to.to_string() || v.starts_with(&format!("{to}-")))
+                else {
+                    let has = if repo.versions.is_empty() {
+                        "nothing listed".to_string()
+                    } else {
+                        repo.versions.join(", ")
+                    };
+                    return Err(format!(
+                        "{package} comes from the {} repository, which doesn't have {to} in what apt last fetched ({has}); run `sudo apt-get update` and try again, or wait for the repository",
+                        repo.name
+                    ));
+                };
+                let spec = format!("{package}={version}");
+                let mut command = vec!["apt-get".to_string(), "install".into(), "-y".into()];
+                if downgrade {
+                    command.push("--allow-downgrades".into());
+                }
+                command.push(spec.clone());
+                return Ok(Plan {
+                    method: format!("deb ({})", repo.name),
+                    tier: Tier::T2,
+                    describe: format!(
+                        "{head} ({package} comes from the {} repository)\nRun: sudo apt-get install -y{allow} {spec}",
+                        repo.name
+                    ),
+                    kind: Kind::Repo {
+                        command,
+                        repo: repo.name.clone(),
+                    },
+                });
+            }
             Ok(Plan {
                 method: "deb".into(),
                 tier: Tier::T2,
@@ -282,8 +347,8 @@ fn plan(
                     "{package} comes from pacman, which installs a chosen version from its cache: ls /var/cache/pacman/pkg/{package}-*, then sudo pacman -U <file>"
                 ));
             }
-            let helper = match Distro::detect() {
-                Distro::Arch { aur } => aur,
+            let helper = match distro {
+                Distro::Arch { aur } => aur.clone(),
                 _ => None,
             };
             let Some(helper) = helper else {
@@ -361,6 +426,22 @@ async fn execute(plan: &Plan, to: Version, dir: &Path) -> Result<String, String>
             }
             status(cmd.arg(&deb), "apt-get")?;
             Ok(format!("Reeve {to} installed with apt-get"))
+        }
+        Kind::Repo { command, repo } => {
+            let tool = command
+                .first()
+                .map(String::as_str)
+                .unwrap_or("the package manager");
+            let mut cmd = Command::new("sudo");
+            cmd.args(command);
+            status(&mut cmd, tool).map_err(|e| {
+                format!(
+                    "{e}; the {repo} repository may not have Reeve {to} yet, in which case nothing changed"
+                )
+            })?;
+            Ok(format!(
+                "Reeve {to} installed from the {repo} repository with {tool}"
+            ))
         }
         Kind::Aur { helper, package } => {
             status(Command::new(helper).args(["-S", package.as_str()]), helper)?;
@@ -458,5 +539,94 @@ fn restart_reeved(bin: &Path) {
     match sc(&["restart", "reeved.service"]) {
         Some(o) if o.status.success() => println!("reeved restarted on the new version."),
         _ => println!("couldn't restart reeved; run: systemctl --user restart reeved"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reeve_core::update::AptRepo;
+
+    fn v(s: &str) -> Version {
+        Version::parse(s).unwrap()
+    }
+
+    fn fedora() -> Distro {
+        Distro::Fedora {
+            dnf: "dnf5".into(),
+            atomic: false,
+        }
+    }
+
+    #[test]
+    fn a_package_from_a_repository_updates_through_it() {
+        let me = Path::new("/home/me");
+        let (running, to) = (v("0.8.0"), v("0.8.1"));
+        let from_repo = Install::Rpm {
+            package: "reeve".into(),
+            repo: Some("kinetic".into()),
+        };
+        let p = plan(&from_repo, me, running, to, true, &fedora()).unwrap();
+        assert_eq!(p.method, "rpm (kinetic)");
+        assert!(p.describe.contains("kinetic repository"), "{}", p.describe);
+        match &p.kind {
+            Kind::Repo { command, repo } => {
+                assert_eq!(command, &["dnf5", "upgrade", "-y", "reeve-0.8.1"]);
+                assert_eq!(repo, "kinetic");
+            }
+            _ => panic!("not through the repository"),
+        }
+        // Going back goes back through the repository too.
+        let back = plan(&from_repo, me, to, running, false, &fedora()).unwrap();
+        assert!(
+            matches!(&back.kind, Kind::Repo { command, .. } if command[1] == "downgrade" && command[3] == "reeve-0.8.0")
+        );
+        // A file installed by hand gets the release's own RPM, as before.
+        let by_hand = Install::Rpm {
+            package: "reeve".into(),
+            repo: None,
+        };
+        let p = plan(&by_hand, me, running, to, true, &fedora()).unwrap();
+        assert_eq!(p.method, "rpm");
+        assert!(p.describe.contains(&update::rpm_name(to)), "{}", p.describe);
+        assert!(matches!(p.kind, Kind::Rpm { .. }));
+
+        let debian = Distro::Debian {
+            id: "debian".into(),
+        };
+        let repo = AptRepo {
+            name: "repo.example.org".into(),
+            versions: vec!["0.8.1-1".into(), "0.7.2-1".into()],
+        };
+        let from_repo = Install::Deb {
+            package: "reeve".into(),
+            repo: Some(repo.clone()),
+        };
+        let p = plan(&from_repo, me, running, to, true, &debian).unwrap();
+        assert_eq!(p.method, "deb (repo.example.org)");
+        assert!(
+            matches!(&p.kind, Kind::Repo { command, .. } if command == &["apt-get", "install", "-y", "reeve=0.8.1-1"])
+        );
+        // The repository's revision, whatever it is, and a downgrade allowed
+        // only when going back.
+        let back = plan(&from_repo, me, to, v("0.7.2"), false, &debian).unwrap();
+        assert!(
+            matches!(&back.kind, Kind::Repo { command, .. } if command == &["apt-get", "install", "-y", "--allow-downgrades", "reeve=0.7.2-1"])
+        );
+        // Not in the repository yet: nothing runs, and the reason says what is.
+        let e = plan(&from_repo, me, running, v("0.9.0"), true, &debian)
+            .err()
+            .expect("not in the repository");
+        assert!(
+            e.contains("doesn't have 0.9.0") && e.contains("0.8.1-1, 0.7.2-1"),
+            "{e}"
+        );
+        let by_hand = Install::Deb {
+            package: "reeve".into(),
+            repo: None,
+        };
+        let p = plan(&by_hand, me, running, to, true, &debian).unwrap();
+        assert_eq!(p.method, "deb");
+        assert!(p.describe.contains(&update::deb_name(to)), "{}", p.describe);
     }
 }

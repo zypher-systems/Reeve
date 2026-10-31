@@ -439,9 +439,16 @@ Everything shown is escaped. Log lines and finding text are data.
     refuse a mismatch, check that the archive's binary is the expected version, then run that
     release's own `install.sh --from` with flags matching this install. The installer never starts
     reeved; `reeve update` restarts it only when it runs the binary just replaced.
-  - **An RPM:** the release RPM, checked the same way, through `sudo dnf upgrade` (or `downgrade`).
-  - **A .deb:** the release .deb, checked the same way, through `sudo apt-get install` (with
-    `--allow-downgrades` for a rollback).
+  - **An RPM or .deb from a repository** (dnf's record of the source repository isn't
+    `@commandline`; apt's policy lists the package from a URL): updated through that repository,
+    by version (`sudo dnf upgrade -y reeve-<version>`, `sudo apt-get install -y
+    reeve=<the repository's version>`), never with the release's own package, so a distribution's
+    signed build stays the one installed. If the repository doesn't have the version yet, Reeve
+    says so and nothing changes.
+  - **An RPM installed by hand:** the release RPM, checked the same way, through `sudo dnf upgrade`
+    (or `downgrade`).
+  - **A .deb installed by hand:** the release .deb, checked the same way, through
+    `sudo apt-get install` (with `--allow-downgrades` for a rollback).
   - **A pacman package:** the AUR helper.
   - **A cargo build, or a binary somewhere no installer puts it:** refused, with what to do instead.
 - **Receipts and rollback:** every attempt leaves a `reeve_update` receipt (T1 under your home, T2

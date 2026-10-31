@@ -42,7 +42,9 @@ Then run `reeve`, type `/providers`, and paste your API key. `reeve doctor` chec
 
 Updating: when a newer release is out, the header shows `↑ <version>`. `reeve update` installs it the same way
 Reeve was installed (the release's installer, dnf, apt-get, or your AUR helper), checked against the release's
-signed `SHA256SUMS` and with a receipt. `reeve update --rollback` goes back. Releases before 0.8.0 aren't
+signed `SHA256SUMS` and with a receipt. A package that came from a distribution's repository is updated through
+that repository instead, so its signed build stays the one installed; if the repository doesn't have the new
+version yet, nothing changes. `reeve update --rollback` goes back. Releases before 0.8.0 aren't
 signed, so neither the installer nor `reeve update` will install one; that release's own `install.sh` still does.
 
 From source:
