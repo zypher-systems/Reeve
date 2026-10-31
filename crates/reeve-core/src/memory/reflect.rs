@@ -3,6 +3,11 @@
 //! from fixes that were checked, and preferences only from the owner's
 //! own words. Facts and runbooks are written as `new`; preferences wait as
 //! `pending` until the owner says yes.
+//!
+//! A runbook's "worked" is the model's reading of the log. It counts as a
+//! success only when the session's receipts bear it out (`Evidence`): a
+//! verified change passed its checks, or something ran and nothing failed.
+//! Otherwise the runbook is left out and the summary says so.
 
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -72,6 +77,39 @@ struct PrefP {
     rule: Option<String>,
 }
 
+/// What the receipts say a session did, for weighing a runbook's outcome.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Evidence {
+    /// A verified change passed its checks.
+    pub verified: bool,
+    /// An action failed.
+    pub failed: bool,
+    /// Anything ran at all: an action that finished or failed, not one the
+    /// owner or the policy said no to.
+    pub acted: bool,
+}
+
+impl Evidence {
+    /// Read off a session's receipts.
+    pub fn of(receipts: &[Receipt]) -> Self {
+        Self {
+            verified: receipts
+                .iter()
+                .any(|r| r.tool == "change_commit" && r.outcome.status == Status::Ok),
+            failed: receipts.iter().any(|r| r.outcome.status == Status::Error),
+            acted: receipts
+                .iter()
+                .any(|r| matches!(r.outcome.status, Status::Ok | Status::Error)),
+        }
+    }
+
+    /// "worked" is a success only on this: a verified change, or actions
+    /// that all went through. A session that ran nothing fixed nothing.
+    pub fn supports_success(self) -> bool {
+        self.verified || (self.acted && !self.failed)
+    }
+}
+
 /// What a reflection wrote.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Reflected {
@@ -79,6 +117,8 @@ pub struct Reflected {
     pub facts: usize,
     /// Runbooks added or updated.
     pub runbooks: usize,
+    /// Runbooks said to have worked that the receipts don't bear out; left out.
+    pub unproven: usize,
     /// Preferences proposed.
     pub preferences: usize,
     /// Tokens used.
@@ -102,6 +142,12 @@ impl Reflected {
             parts.push(format!(
                 "{} to confirm",
                 plural(self.preferences, "preference")
+            ));
+        }
+        if self.unproven > 0 {
+            parts.push(format!(
+                "{} left out (said to work; no receipt shows it)",
+                plural(self.unproven, "runbook")
             ));
         }
         if parts.is_empty() {
@@ -217,7 +263,7 @@ pub async fn reflect(
         }
     }
     let props = parse(&text)?;
-    apply(mem, props, session, os, &mut out);
+    apply(mem, props, session, os, Evidence::of(receipts), &mut out);
     Ok(out)
 }
 
@@ -248,7 +294,7 @@ fn valid_rule(r: &str) -> bool {
         && r.split_once(':').is_some_and(|(_, g)| g.trim().len() >= 2)
 }
 
-fn apply(mem: &Memory, p: Proposals, session: &str, os: &str, out: &mut Reflected) {
+fn apply(mem: &Memory, p: Proposals, session: &str, os: &str, ev: Evidence, out: &mut Reflected) {
     let source = format!("reflect:{session}");
     let os = (!os.is_empty()).then(|| os.to_string());
     for f in p.facts.into_iter().take(8) {
@@ -286,6 +332,12 @@ fn apply(mem: &Memory, p: Proposals, session: &str, os: &str, out: &mut Reflecte
         let worked = r.outcome == "worked";
         let failed = r.outcome == "failed";
         if !(worked || failed) || r.title.trim().is_empty() {
+            continue;
+        }
+        // The model read "worked" into the log; the receipts have to show
+        // it, or the runbook isn't kept on the model's word alone.
+        if worked && !ev.supports_success() {
+            out.unproven += 1;
             continue;
         }
         let existing = r
@@ -357,7 +409,7 @@ mod tests {
             &p,
             "m",
             &[Message::new("user", "hi")],
-            &[],
+            &[receipt("svc_restart", Status::Ok)],
             &mem,
             "s1",
             "Fedora 44",
@@ -416,9 +468,99 @@ mod tests {
             },
             "s",
             "",
+            Evidence::default(),
             &mut out,
         );
         assert_eq!(mem.get("gpu").unwrap().body, "my words");
         assert_eq!(mem.get("gpu-2").unwrap().body, "model's words");
+    }
+
+    fn receipt(tool: &str, status: Status) -> Receipt {
+        let mut r = Receipt::draft("s", tool, serde_json::json!({}), crate::policy::Tier::T1);
+        r.outcome.status = status;
+        r
+    }
+
+    fn worked(title: &str) -> RunbookP {
+        RunbookP {
+            title: title.into(),
+            problem: "p".into(),
+            steps: "s".into(),
+            tags: vec![],
+            outcome: "worked".into(),
+            update: None,
+        }
+    }
+
+    #[test]
+    fn a_runbook_worked_only_when_the_receipts_show_it() {
+        let home = tempfile::tempdir().unwrap();
+        let mem = Memory::new(home.path());
+        let count = |ev: Evidence, title: &str| {
+            let mut out = Reflected::default();
+            apply(
+                &mem,
+                Proposals {
+                    runbooks: vec![worked(title)],
+                    ..Default::default()
+                },
+                "s",
+                "",
+                ev,
+                &mut out,
+            );
+            (out.runbooks, out.unproven)
+        };
+        // Nothing ran: nothing was fixed, whatever the model read.
+        assert_eq!(count(Evidence::of(&[]), "a"), (0, 1));
+        assert!(mem.get("a").is_none(), "not kept on the model's word");
+        // An action failed and no change was verified.
+        let failed = Evidence::of(&[receipt("sh", Status::Ok), receipt("sh", Status::Error)]);
+        assert_eq!(count(failed, "b"), (0, 1));
+        // A verified change passed its checks: the failed probe before it
+        // doesn't matter.
+        let verified = Evidence::of(&[
+            receipt("sh", Status::Error),
+            receipt("change_commit", Status::Ok),
+        ]);
+        assert_eq!(count(verified, "c"), (1, 0));
+        assert_eq!(mem.get("c").unwrap().successes, 1);
+        // A change rolled back is a failed commit, not a verified one.
+        let rolled = Evidence::of(&[receipt("change_commit", Status::Error)]);
+        assert!(!rolled.supports_success());
+        // Everything ran and nothing failed.
+        let clean = Evidence::of(&[receipt("svc_restart", Status::Ok)]);
+        assert_eq!(count(clean, "d"), (1, 0));
+        // An action the owner declined, or the policy refused, never ran.
+        for never_ran in [Status::Denied, Status::Refused] {
+            let ev = Evidence::of(&[receipt("svc_restart", never_ran)]);
+            assert!(!ev.acted && !ev.supports_success(), "{never_ran:?}");
+        }
+        // "failed" needs no evidence: it only lowers confidence.
+        let mut out = Reflected::default();
+        apply(
+            &mem,
+            Proposals {
+                runbooks: vec![RunbookP {
+                    outcome: "failed".into(),
+                    ..worked("e")
+                }],
+                ..Default::default()
+            },
+            "s",
+            "",
+            Evidence::of(&[]),
+            &mut out,
+        );
+        assert_eq!((out.runbooks, out.unproven), (1, 0));
+        assert_eq!(mem.get("e").unwrap().failures, 1);
+        assert!(
+            Reflected {
+                unproven: 1,
+                ..Default::default()
+            }
+            .summary()
+            .contains("1 runbook left out")
+        );
     }
 }

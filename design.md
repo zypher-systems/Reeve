@@ -302,7 +302,9 @@ confidence, tags, OS version).
 3. **Verify.** Reeve checks that the symptom is gone: the unit is active, the error rate is back
    to baseline, or the disk is below its threshold.
 4. **Reflect.** At session end, a cheap model reads the session and proposes new facts, a
-   new or updated runbook with its outcome, and preference candidates.
+   new or updated runbook with its outcome, and preference candidates. A runbook's "worked"
+   counts only when the receipts bear it out: a verified change passed its checks, or something
+   ran and nothing failed. Otherwise the runbook is left out, and the summary says so.
 5. **Review.** Facts and runbooks are written with provenance and show as "new" in the Memory
    panel. Preferences wait for your yes.
 
@@ -376,6 +378,15 @@ Windows will need their own observer design later.
   - **Over budget:** the finding stays undrafted and says why ("drafter budget reached for today").
   - **Unknown price:** a model with no known price can't be used for the drafter while any cap is
     set; it fails closed.
+- **Nothing waits on slow work.** The 6-hourly checks (package queries) and a draft (model calls,
+  minutes) run as tasks beside the loop and report back on a channel it listens to, so sampling,
+  the heartbeat, the journal and standing orders keep their cadence meanwhile. Each has a deadline:
+  the checks get 10 minutes, and past it they resolve nothing (a finding they didn't see isn't
+  gone); a draft stops itself between model calls after 15 minutes, with every call it made in
+  the ledger, and reeved cuts off one stuck in a call that never returned at 35. A draft that
+  didn't finish leaves its note on the finding, so the next pass doesn't pick it again. One of
+  each at a time; the heartbeat says what's running and since when (`/observer`, `reeve daemon
+  status`).
 - **Sharing state:** `reeved` and the TUI share files, not a socket. Findings are one JSON file each in
   `~/.reeve/findings/`, and `~/.reeve/observer/status.json` holds a heartbeat every 10 s. The TUI polls
   them each second and shows "observer ○ off" when the heartbeat is stale. The service runs
@@ -416,11 +427,28 @@ Everything shown is escaped. Log lines and finding text are data.
   but this window predates it. `/update` and ⌃K say what's out and how to get it. There's no desktop
   notification: a new version isn't a proposed fix.
 - **Installing:** `reeve update` works out how this copy got here and does the same again:
+  - **First, the signature:** the release's `SHA256SUMS` must carry `SHA256SUMS.sig`, an ed25519
+    signature made with Reeve's release key. The public half is in the repository
+    (`release/reeve-release.pub.pem`), built into every Reeve and pinned in `install.sh`; the
+    private half is a secret of the release workflow, which signs and then verifies against the
+    committed key before drafting. A release that isn't signed (every one before 0.8.0), is signed
+    with another key, or whose checksums changed after signing is refused before anything is
+    downloaded. Rotating the key means releasing a build with the new public key before the new
+    key signs anything.
   - **install.sh** (a `bin/` under some prefix): download the release tarball and `SHA256SUMS`,
     refuse a mismatch, check that the archive's binary is the expected version, then run that
     release's own `install.sh --from` with flags matching this install. The installer never starts
     reeved; `reeve update` restarts it only when it runs the binary just replaced.
-  - **An RPM:** the release RPM, checked the same way, through `sudo dnf upgrade` (or `downgrade`).
+  - **An RPM or .deb from a repository** (dnf's record of the source repository isn't
+    `@commandline`; apt's policy lists the package from a URL): updated through that repository,
+    by version (`sudo dnf upgrade -y reeve-<version>`, `sudo apt-get install -y
+    reeve=<the repository's version>`), never with the release's own package, so a distribution's
+    signed build stays the one installed. If the repository doesn't have the version yet, Reeve
+    says so and nothing changes.
+  - **An RPM installed by hand:** the release RPM, checked the same way, through `sudo dnf upgrade`
+    (or `downgrade`).
+  - **A .deb installed by hand:** the release .deb, checked the same way, through
+    `sudo apt-get install` (with `--allow-downgrades` for a rollback).
   - **A pacman package:** the AUR helper.
   - **A cargo build, or a binary somewhere no installer puts it:** refused, with what to do instead.
 - **Receipts and rollback:** every attempt leaves a `reeve_update` receipt (T1 under your home, T2
@@ -634,6 +662,7 @@ renders each screen to colored HTML (with `REEVE_SHOTS_HOME`, from a real Reeve 
   memory/{facts,baselines,runbooks,preferences}/
   skills/<id>.md         # the owner's skills
   findings/  proposals/  orders/*.toml
+  .settings.lock  orders/.state.lock  receipts/.lock  observer/.update.lock   # held while a shared file is read, changed and written
   observer/metrics/YYYY-MM-DD.jsonl
   observer/update.json   # newest release seen, version installed, version replaced
   themes/*.toml
@@ -732,7 +761,7 @@ what stops daily use first, what makes unattended work trustworthy second, and t
 last. Sizes: S is under half a day, M one or two days, L a week or more. Every fix lands with a
 regression test that fails on 0.7.1.
 
-**Release A, fixes only (a PATCH): in dev as of 2026-10-29, ships when the owner cuts it**
+**Release A, fixes only (a PATCH): shipped as 0.7.2 on 2026-10-30**
 
 - The sudo password is asked once per `password_minutes`, not every other root step (the remembered
   password is keyed on the sudo asking; DECISIONS 2026-10-29).
@@ -753,22 +782,25 @@ regression test that fails on 0.7.1.
 Done when: `cargo test --workspace`, clippy and fmt pass (they do), the live container tests for
 pacman and apt pass, and the dev → main PR has its two external reviews.
 
-**Release B, features (a MINOR)**
+**Release B, features (a MINOR): items 1, 4, 5 and 6 ship as 0.8.0 (2026-10-31), with signed releases
+and repository-aware updates besides; 2 and 3 remain**
 
 1. **The observer loop never blocks** (G10). Slow checks and the drafter run as supervised tasks
    with deadlines, like orders already do; sampling, the heartbeat and the scheduler keep their
-   cadence while a model call takes minutes. M.
+   cadence while a model call takes minutes. M. *In dev as of 2026-10-30 (§8, "Nothing waits on
+   slow work"; DECISIONS 2026-10-30).*
 2. **Snapshots out of the box** (G14, §14). The once-only offer to create the snapper root config;
    a failed pre-snapshot shown on the card and the receipt; the coverage a T2 action has, shown
    before it runs. M.
 3. **Long sessions** (G18). When the transcript nears the model's context length, older rounds are
    compacted; the owner's constraints, pending approvals and the open change are kept. M.
 4. **A .deb** in the release workflow, since the servers it's wanted on are Debian; install.sh stays.
-   M.
+   M. *In dev as of 2026-10-30, with the source tarball, the filled spec and the third-party
+   notices (DECISIONS 2026-10-30, "The release carries every package").*
 5. **A runbook "worked" only with evidence** (G19): reflection counts a success only when the
-   session has a verified change or no failed receipt. S.
+   session has a verified change or no failed receipt. S. *In dev as of 2026-10-30 (§7, step 4).*
 6. **Locked updates for shared files** (G17): settings and order state use the lock the receipts
-   already use. S.
+   already use. S. *In dev as of 2026-10-30 (`lockfile::hold`; DECISIONS 2026-10-30).*
 
 **The 1.0 gate (§14), with the findings that bear on each**
 
@@ -784,7 +816,8 @@ pacman and apt pass, and the dev → main PR has its two external reviews.
 - Upgrades never lose data: a version in every file format, fixtures from each shipped release,
   and a migration test (G16). M.
 - `reeve update` and rollback behave the same on every install method, or the docs say where they
-  don't; a signed release manifest if that becomes a requirement (G22). M.
+  don't; a signed release manifest if that becomes a requirement (G22). M. *The signed manifest is
+  in dev as of 2026-10-30: `SHA256SUMS.sig` (§8.2); the rest of the item stays open.*
 - Arch as solid as Fedora, and packages published: the live tests run on a schedule in disposable
   containers; COPR and AUR publish from the release workflow (G21). M.
 - First run teaches itself, and the TUI degrades: the screenshot harness asserts 80×24, 16 colors,

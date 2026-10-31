@@ -13,6 +13,7 @@ pub mod error;
 pub mod findings;
 pub mod ledger;
 pub mod llm;
+pub mod lockfile;
 pub mod memory;
 pub mod orders;
 pub mod pacman;

@@ -3,24 +3,68 @@
 //! asks GitHub for a newer Reeve every 12 h, follows the journal the whole
 //! time, and (only if enabled) lets the drafter prepare a proposal. It never
 //! changes the machine.
+//!
+//! Nothing waits on slow work. The 6-hourly checks (package queries) and a
+//! draft (model calls, minutes) run as tasks beside the loop, each with a
+//! deadline, and report back on a channel the loop listens to; sampling,
+//! the heartbeat, the journal and standing orders keep their cadence
+//! meanwhile. Checks that didn't finish resolve nothing; a draft that
+//! didn't finish leaves its note on the finding.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 
 use chrono::{Local, Utc};
 use reeve_core::config;
-use reeve_core::findings::{FindingStore, ObserverStatus, Signal};
+use reeve_core::findings::{Finding, FindingStore, ObserverStatus, Signal};
 use reeve_core::memory::Memory;
 use serde::Serialize;
 use tokio::sync::mpsc;
+use tokio::time::Interval;
 
 use crate::baselines::Baselines;
 use crate::{HostInfo, Sampler, Snapshot, detect, drafter, failed_units, journal, notify};
 
 /// Five-second samples kept for "sustained" rules (10 minutes).
 const WINDOW: usize = 120;
+
+/// The 6-hourly checks have this long. Past it they resolve nothing, and
+/// the next round is in 6 hours.
+const CHECKS_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
+/// A draft stops itself after `drafter::DEADLINE`, between model calls. This
+/// is the backstop for one stuck in a call that never returned: the deadline,
+/// a local model's longest allowed stall, and a margin.
+const DRAFT_BACKSTOP: Duration = Duration::from_secs(35 * 60);
+
+/// A piece of work run beside the loop.
+type Task<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// What the 6-hourly checks found, and which kinds of finding they can
+/// speak for: a kind whose probe didn't run gets no verdict, so its
+/// findings are left as they were.
+struct Checks {
+    signals: Vec<Signal>,
+    verdicts: Vec<&'static str>,
+}
+
+/// The kinds the checks maintain, and how to name each.
+const CHECK_KINDS: [(&str, &str); 2] = [
+    ("reboot-pending", "a pending reboot"),
+    ("updates-security", "security updates"),
+];
+
+/// Work that ran beside the loop, reporting back.
+enum Done {
+    /// The 6-hourly checks; `None` when they didn't finish.
+    Checks(Option<Checks>),
+    /// A draft.
+    Draft(drafter::Pass),
+}
 
 #[derive(Serialize)]
 struct MinuteRow<'a> {
@@ -127,6 +171,10 @@ struct Observer {
     last_notify: Option<chrono::DateTime<Utc>>,
     /// A standing order is running (one at a time).
     order_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The 6-hourly checks are running, since then.
+    checking: Option<chrono::DateTime<Utc>>,
+    /// A draft is running, since then.
+    drafting: Option<chrono::DateTime<Utc>>,
 }
 
 fn push<T>(q: &mut VecDeque<T>, v: T) {
@@ -160,6 +208,8 @@ impl Observer {
             pending_notify: Vec::new(),
             last_notify: None,
             order_running: Default::default(),
+            checking: None,
+            drafting: None,
             home,
         }
     }
@@ -350,67 +400,71 @@ impl Observer {
         if list.is_empty() {
             return;
         }
-        // A state file that can't be read means forgotten limits: nothing
-        // starts until it's fixed.
-        let mut states = match orders.states_checked() {
-            Ok(s) => s,
+        let now = Utc::now();
+        let findings = self.store.list();
+        // Picked and claimed under the state's lock, so a run finishing or
+        // `reeve orders run` meanwhile doesn't drop the claim, nor this the
+        // run. A state file that can't be read means forgotten limits:
+        // nothing starts until it's fixed.
+        let picked = orders.modify_states(|states| {
+            for o in &list {
+                if due.is_some() {
+                    break;
+                }
+                let st = states.entry(o.id.clone()).or_default();
+                if !o.enabled {
+                    continue;
+                }
+                if let Some(f) = findings
+                    .iter()
+                    .find(|f| o.wants(f) && st.handled.get(&f.id) != Some(&f.first_seen))
+                {
+                    // Each episode of a finding is handled once, run or not.
+                    st.handled.insert(f.id.clone(), f.first_seen);
+                    match o.can_run(st, now) {
+                        Ok(()) => {
+                            due = Some((
+                                o.clone(),
+                                crate::orders::Cause::Finding(Box::new(f.clone())),
+                            ));
+                            break;
+                        }
+                        Err(why) => st.push(Run {
+                            ts: now,
+                            trigger: format!("finding:{}", f.id),
+                            status: "skipped".into(),
+                            summary: why,
+                            receipts: vec![],
+                            usd: None,
+                            session: None,
+                        }),
+                    }
+                    continue;
+                }
+                if o.schedule_due(st, now) && o.can_run(st, now).is_ok() {
+                    due = Some((o.clone(), crate::orders::Cause::Schedule));
+                    break;
+                }
+            }
+            if let Some((order, cause)) = &due {
+                // Claimed before it starts: it holds the cooldown and counts
+                // toward today's limit, so a slow run can't start twice and
+                // one that never comes back still counted.
+                states.entry(order.id.clone()).or_default().claim(now);
+                if matches!(cause, crate::orders::Cause::Manual) {
+                    orders.take_request(&order.id);
+                }
+            }
+            due
+        });
+        let due = match picked {
+            Ok(d) => d,
             Err(e) => {
                 self.status.last_error =
                     Some(format!("orders: {e}; nothing starts until it's fixed"));
                 return;
             }
         };
-        let now = Utc::now();
-        let findings = self.store.list();
-        for o in &list {
-            if due.is_some() {
-                break;
-            }
-            let st = states.entry(o.id.clone()).or_default();
-            if !o.enabled {
-                continue;
-            }
-            if let Some(f) = findings
-                .iter()
-                .find(|f| o.wants(f) && st.handled.get(&f.id) != Some(&f.first_seen))
-            {
-                // Each episode of a finding is handled once, run or not.
-                st.handled.insert(f.id.clone(), f.first_seen);
-                match o.can_run(st, now) {
-                    Ok(()) => {
-                        due = Some((
-                            o.clone(),
-                            crate::orders::Cause::Finding(Box::new(f.clone())),
-                        ));
-                        break;
-                    }
-                    Err(why) => st.push(Run {
-                        ts: now,
-                        trigger: format!("finding:{}", f.id),
-                        status: "skipped".into(),
-                        summary: why,
-                        receipts: vec![],
-                        usd: None,
-                        session: None,
-                    }),
-                }
-                continue;
-            }
-            if o.schedule_due(st, now) && o.can_run(st, now).is_ok() {
-                due = Some((o.clone(), crate::orders::Cause::Schedule));
-                break;
-            }
-        }
-        if let Some((order, cause)) = &due {
-            // Claimed before it starts: it holds the cooldown and counts
-            // toward today's limit, so a slow run can't start twice and one
-            // that never comes back still counted.
-            states.entry(order.id.clone()).or_default().claim(now);
-            if matches!(cause, crate::orders::Cause::Manual) {
-                orders.take_request(&order.id);
-            }
-        }
-        let _ = orders.save_states(&states);
         let Some((order, cause)) = due else { return };
         self.order_running.store(true, Ordering::SeqCst);
         let (home, cfg, profile, running) = (
@@ -441,15 +495,13 @@ impl Observer {
             // replaced with one that remembers only this run: the file
             // stays as it is, the tick reports it, and this run is known
             // by its receipts alone.
-            match orders.states_checked() {
-                Ok(mut states) => {
-                    states.entry(order.id.clone()).or_default().push(run);
-                    let _ = orders.save_states(&states);
-                }
-                Err(e) => eprintln!(
+            if let Err(e) =
+                orders.modify_states(|s| s.entry(order.id.clone()).or_default().push(run))
+            {
+                eprintln!(
                     "reeved: orders: {e}; the run of \"{}\" ({status}) isn't in its history",
                     order.name
-                ),
+                );
             }
             // A blocked run left a proposal: that's worth a popup. A finished
             // or failed one only if the order asks for it.
@@ -488,77 +540,132 @@ impl Observer {
         crate::report::drift::save_daily(&self.home, &reeve_core::distro::Distro::detect());
     }
 
-    async fn slow_checks(&mut self) {
-        let now = Utc::now();
-        let mut signals = Vec::new();
-        let running = run("uname -r").await;
-        use reeve_core::distro::Distro;
-        let adv = match Distro::detect() {
-            Distro::Arch { .. } => {
-                let present = run("test -d \"/usr/lib/modules/$(uname -r)\" && echo yes").await;
-                signals.extend(detect::kernel_replaced(
-                    running.trim(),
-                    present.trim() == "yes",
-                ));
-                // arch-audit (when installed) knows the advisories with a fix out.
-                run("command -v arch-audit >/dev/null && timeout 120 arch-audit -u 2>/dev/null")
-                    .await
-            }
-            Distro::Debian { .. } => {
-                // A newer kernel package (a new ABI is a new name; debug
-                // symbols aren't kernels, and the unsigned build is the same
-                // ABI), or the running one rebuilt under the same name (its
-                // package version no longer matches /proc/version's build),
-                // or the flag the kernel's postinst leaves.
-                let newest = run(
-                    "dpkg-query -W -f='${db:Status-Status} ${Package}\\n' 'linux-image-[0-9]*' 2>/dev/null \
-                     | awk '$1==\"installed\" && $2 !~ /-dbg(sym)?$/ {sub(/-unsigned$/, \"\", $2); print substr($2, 13)}' | sort -V | tail -n 1",
-                )
-                .await;
-                signals.extend(detect::reboot_pending(running.trim(), newest.trim()));
-                let installed =
-                    run("dpkg-query -W -f='${Version}' \"linux-image-$(uname -r)\" 2>/dev/null")
-                        .await;
-                let proc = run("cat /proc/version").await;
-                signals.extend(detect::kernel_rebuilt(
-                    running.trim(),
-                    installed.trim(),
-                    &proc,
-                ));
-                let flagged = run(
-                    "test -f /var/run/reboot-required && cat /var/run/reboot-required.pkgs 2>/dev/null; \
-                     test -f /var/run/reboot-required && echo",
-                )
-                .await;
-                signals.extend(detect::reboot_required(&flagged));
-                // Updates from a security suite, as of the last apt-get
-                // update: the archive in the parentheses says, not the name.
-                run(
-                    "timeout 120 apt-get -s -q upgrade --with-new-pkgs 2>/dev/null \
-                     | awk '/^Inst / {s=$0; sub(/^[^(]*\\(/, \"\", s); if (s ~ /[Ss]ecurity/) print $2}'",
-                )
+    /// Start the 6-hourly checks beside the loop, unless they're running.
+    fn start_checks<F>(&mut self, tx: &mpsc::Sender<Done>, gather: F)
+    where
+        F: Future<Output = Option<Checks>> + Send + 'static,
+    {
+        if self.checking.is_some() {
+            return;
+        }
+        self.checking = Some(Utc::now());
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let out = tokio::time::timeout(CHECKS_DEADLINE, gather)
                 .await
-            }
-            Distro::Fedora { .. } | Distro::Other(_) => {
-                let newest = run("rpm -q kernel-core --last 2>/dev/null | head -n 1 | awk '{print $1}' | sed 's/^kernel-core-//'").await;
-                signals.extend(detect::reboot_pending(running.trim(), newest.trim()));
-                run("command -v dnf5 >/dev/null && timeout 120 dnf5 -q advisory list --security --updates 2>/dev/null | tail -n +2").await
-            }
+                .ok()
+                .flatten();
+            let _ = tx.send(Done::Checks(out)).await;
+        });
+    }
+
+    /// Record what the checks found. A kind whose probe didn't run, or a
+    /// round that didn't finish, resolves nothing of its own: a finding the
+    /// checks didn't see isn't gone.
+    fn finish_checks(&mut self, out: Option<Checks>) {
+        self.checking = None;
+        let now = Utc::now();
+        let Some(c) = out else {
+            self.status.last_error = Some(format!(
+                "the 6-hourly checks didn't finish in {} minutes, or no probe ran; nothing was resolved",
+                CHECKS_DEADLINE.as_secs() / 60
+            ));
+            return;
         };
-        let lines: Vec<String> = adv
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(String::from)
-            .collect();
-        signals.extend(detect::security_updates(lines.len(), &lines));
-        let ids: Vec<String> = signals.iter().map(|s| s.id.clone()).collect();
-        for s in signals {
+        let ids: Vec<String> = c.signals.iter().map(|s| s.id.clone()).collect();
+        for s in c.signals {
             if let Ok((f, true)) = self.store.observe(s, now) {
                 self.pending_notify.push(f.id);
             }
         }
-        for kind in ["reboot-pending", "updates-security"] {
+        for kind in &c.verdicts {
             let _ = self.store.resolve_missing(kind, &ids, now);
+        }
+        let silent: Vec<&str> = CHECK_KINDS
+            .iter()
+            .filter(|(kind, _)| !c.verdicts.contains(kind))
+            .map(|(_, what)| *what)
+            .collect();
+        if !silent.is_empty() {
+            self.status.last_error = Some(format!(
+                "the 6-hourly checks couldn't ask about {}; those findings were left as they were",
+                silent.join(" or ")
+            ));
+        }
+    }
+
+    /// Start a draft of `id` beside the loop, unless one is running. The
+    /// draft stops itself after `drafter::DEADLINE`; this is the backstop
+    /// for one stuck in a call that never returns, and it writes the note
+    /// on the finding, so the next pass doesn't pick it again.
+    fn start_draft<F>(
+        &mut self,
+        tx: &mpsc::Sender<Done>,
+        id: String,
+        episode: chrono::DateTime<Utc>,
+        pass: F,
+    ) where
+        F: Future<Output = drafter::Pass> + Send + 'static,
+    {
+        if self.drafting.is_some() {
+            return;
+        }
+        self.drafting = Some(Utc::now());
+        let (tx, home) = (tx.clone(), self.home.clone());
+        tokio::spawn(async move {
+            let out = match tokio::time::timeout(DRAFT_BACKSTOP, pass).await {
+                Ok(p) => p,
+                Err(_) => {
+                    let why = format!(
+                        "the draft was cut off after {} minutes in a model call that never returned; what that call cost may be missing from the ledger",
+                        DRAFT_BACKSTOP.as_secs() / 60
+                    );
+                    // The note goes on the finding as it is now, and only
+                    // while it's still this episode and open.
+                    let store = FindingStore::new(&home);
+                    if let Some(mut f) = store.get(&id) {
+                        if f.first_seen == episode
+                            && f.status == reeve_core::findings::FindingStatus::Open
+                        {
+                            f.draft_note = Some(why.clone());
+                            let _ = store.put(&f);
+                        }
+                    }
+                    drafter::Pass::Blocked(why)
+                }
+            };
+            let _ = tx.send(Done::Draft(out)).await;
+        });
+    }
+
+    /// Take in what a draft did.
+    fn finish_draft(&mut self, cfg: &config::Config, p: drafter::Pass) {
+        self.drafting = None;
+        match p {
+            drafter::Pass::Blocked(why) => self.status.last_error = Some(why),
+            drafter::Pass::Drafted(id) => {
+                self.status.last_error = None;
+                if cfg.observer.notify {
+                    if let Some(f) = self.store.get(&id) {
+                        let first = f
+                            .proposal
+                            .as_ref()
+                            .and_then(|p| {
+                                p.text
+                                    .lines()
+                                    .find(|l| !l.trim().is_empty())
+                                    .map(str::to_string)
+                            })
+                            .unwrap_or_default();
+                        notify::plain(
+                            &format!("Reeve has a fix ready: {}", f.title),
+                            &format!("{first}\nOpen Reeve: /findings, then p to use it."),
+                            false,
+                        );
+                    }
+                }
+            }
+            drafter::Pass::Idle => {}
         }
     }
 
@@ -568,18 +675,124 @@ impl Observer {
         self.status.drafter_usd_today =
             reeve_core::ledger::role_today(&self.home, "drafter", Local::now()).usd;
         self.status.drafts_today = drafter::drafts_today(&self.store);
+        self.status.drafting_since = self.drafting;
+        self.status.checking_since = self.checking;
         let _ = self.status.save(&self.home);
     }
 }
 
-async fn run(cmd: &str) -> String {
-    tokio::process::Command::new("bash")
-        .args(["--noprofile", "--norc", "-c", cmd])
+/// The 6-hourly checks: the running kernel against the newest installed,
+/// and security updates. Each kind gets a verdict only when every probe
+/// behind it ran and succeeded; a probe that didn't (its tool missing,
+/// failing, or timing out) is no verdict, where an empty answer used to read
+/// as "no newer kernel" or "no advisories". `None` when nothing ran.
+async fn gather_checks() -> Option<Checks> {
+    let mut c = Checks {
+        signals: Vec::new(),
+        verdicts: Vec::new(),
+    };
+    let running = run("uname -r").await?;
+    let running = running.trim();
+    use reeve_core::distro::Distro;
+    let advisories = match Distro::detect() {
+        Distro::Arch { .. } => {
+            // The negative is an answer, so the probe says it and exits 0.
+            if let Some(present) =
+                run("if [ -d \"/usr/lib/modules/$(uname -r)\" ]; then echo yes; else echo no; fi")
+                    .await
+            {
+                c.signals
+                    .extend(detect::kernel_replaced(running, present.trim() == "yes"));
+                c.verdicts.push("reboot-pending");
+            }
+            // arch-audit (when installed) knows the advisories with a fix
+            // out; without it there's no verdict on security updates.
+            run("command -v arch-audit >/dev/null && timeout 120 arch-audit -u 2>/dev/null").await
+        }
+        Distro::Debian { .. } => {
+            // A newer kernel package (a new ABI is a new name; debug
+            // symbols aren't kernels, and the unsigned build is the same
+            // ABI), or the running one rebuilt under the same name (its
+            // package version no longer matches /proc/version's build),
+            // or the flag the kernel's postinst leaves. dpkg-query exits 1
+            // for "no such package", which is an answer; anything else isn't.
+            let reboot = async {
+                let newest = run(
+                    "dpkg-query -W -f='${db:Status-Status} ${Package}\\n' 'linux-image-[0-9]*' 2>/dev/null \
+                     | awk '$1==\"installed\" && $2 !~ /-dbg(sym)?$/ {sub(/-unsigned$/, \"\", $2); print substr($2, 13)}' | sort -V | tail -n 1",
+                )
+                .await?;
+                let installed = run(
+                    "dpkg-query -W -f='${Version}' \"linux-image-$(uname -r)\" 2>/dev/null || [ $? -eq 1 ]",
+                )
+                .await?;
+                let proc = run("cat /proc/version").await?;
+                let flagged = run(
+                    "if [ -f /var/run/reboot-required ]; then cat /var/run/reboot-required.pkgs 2>/dev/null; echo; fi",
+                )
+                .await?;
+                let mut s = Vec::new();
+                s.extend(detect::reboot_pending(running, newest.trim()));
+                s.extend(detect::kernel_rebuilt(running, installed.trim(), &proc));
+                s.extend(detect::reboot_required(&flagged));
+                Some(s)
+            }
+            .await;
+            if let Some(s) = reboot {
+                c.signals.extend(s);
+                c.verdicts.push("reboot-pending");
+            }
+            // Updates from a security suite, as of the last apt-get
+            // update: the archive in the parentheses says, not the name.
+            run(
+                "timeout 120 apt-get -s -q upgrade --with-new-pkgs 2>/dev/null \
+                 | awk '/^Inst / {s=$0; sub(/^[^(]*\\(/, \"\", s); if (s ~ /[Ss]ecurity/) print $2}'",
+            )
+            .await
+        }
+        Distro::Fedora { .. } | Distro::Other(_) => {
+            // awk reads all of rpm's output, so rpm is never cut off, and
+            // the pipeline's status is rpm's when rpm fails.
+            if let Some(newest) = run(
+                "rpm -q kernel-core --last 2>/dev/null | awk 'NR==1{print $1}' | sed 's/^kernel-core-//'",
+            )
+            .await
+            {
+                c.signals
+                    .extend(detect::reboot_pending(running, newest.trim()));
+                c.verdicts.push("reboot-pending");
+            }
+            run("command -v dnf5 >/dev/null && timeout 120 dnf5 -q advisory list --security --updates 2>/dev/null | tail -n +2").await
+        }
+    };
+    if let Some(adv) = advisories {
+        let lines: Vec<String> = adv
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(String::from)
+            .collect();
+        c.signals
+            .extend(detect::security_updates(lines.len(), &lines));
+        c.verdicts.push("updates-security");
+    }
+    (!c.verdicts.is_empty()).then_some(c)
+}
+
+/// Run a probe in bash with `pipefail`: its output only when it exited 0,
+/// so a tool that is missing, fails, or is killed by `timeout` is `None`,
+/// and so is a pipeline whose producer failed. The child dies with the
+/// future, so a dropped (timed out) round leaves no process behind.
+async fn run(cmd: &str) -> Option<String> {
+    let o = tokio::process::Command::new("bash")
+        .args(["--noprofile", "--norc", "-o", "pipefail", "-c", cmd])
         .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
+        .ok()?;
+    o.status
+        .success()
+        .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
 fn prune_metrics(dir: &Path, days: i64) {
@@ -602,7 +815,7 @@ pub async fn run_observer(home: PathBuf, once: bool) -> Result<(), String> {
     let _lock = lock(&home)?;
     let mut obs = Observer::new(home.clone());
     obs.status.journal = journal::system_readable().await;
-    let (jtx, mut jrx) = mpsc::channel::<journal::Entry>(1024);
+    let (jtx, jrx) = mpsc::channel::<journal::Entry>(1024);
     tokio::spawn(async move {
         // journalctl can die (journal rotation, a restart): follow it again.
         loop {
@@ -615,7 +828,7 @@ pub async fn run_observer(home: PathBuf, once: bool) -> Result<(), String> {
     });
     // With no config that loads there are no trusted limits: the observer
     // watches on defaults, and nothing starts until it loads.
-    let (mut cfg, mut cfg_error) = match config::load_at(&home) {
+    let (cfg, cfg_error) = match config::load_at(&home) {
         Ok(c) => (c, None),
         Err(e) => (config::Config::default(), Some(e.to_string())),
     };
@@ -626,22 +839,11 @@ pub async fn run_observer(home: PathBuf, once: bool) -> Result<(), String> {
             obs.sample();
         }
         obs.minute_tick(&cfg);
-        obs.slow_checks().await;
+        obs.finish_checks(gather_checks().await);
         obs.flush_notifications(&cfg, Utc::now());
         obs.beat(&cfg);
         return Ok(());
     }
-    let mut sample = tokio::time::interval(Duration::from_secs(5));
-    let mut minute = tokio::time::interval(Duration::from_secs(60));
-    let mut hour = tokio::time::interval(Duration::from_secs(3600));
-    let mut slow = tokio::time::interval(Duration::from_secs(6 * 3600));
-    let mut beat = tokio::time::interval(Duration::from_secs(10));
-    let mut draft = tokio::time::interval(Duration::from_secs(120));
-    // A minute in, so a login doesn't wait on the network, then every 12 h.
-    let mut release = tokio::time::interval_at(
-        tokio::time::Instant::now() + Duration::from_secs(60),
-        reeve_core::update::EVERY,
-    );
     // reeved runs the installed binary (an update restarts it), so this is
     // what's on disk.
     if reeve_core::update::UpdateState::load(&home)
@@ -653,72 +855,148 @@ pub async fn run_observer(home: PathBuf, once: bool) -> Result<(), String> {
             s.installed = Some(reeve_core::update::CURRENT.into());
         });
     }
-    minute.tick().await;
-    hour.tick().await;
     let profile = obs.host.profile();
+    let mut lp = Loop::new(obs, home, cfg, cfg_error, profile, jrx);
     loop {
+        lp.step().await;
+    }
+}
+
+/// What a draft runs. A test puts a stand-in here.
+type DraftFn = fn(PathBuf, config::Config, String, Finding) -> Task<drafter::Pass>;
+
+fn draft_task(
+    home: PathBuf,
+    cfg: config::Config,
+    profile: String,
+    f: Finding,
+) -> Task<drafter::Pass> {
+    Box::pin(async move {
+        let store = FindingStore::new(&home);
+        drafter::draft(&home, &cfg, &store, &profile, f).await
+    })
+}
+
+/// The loop: the observer, its clocks, and the channels work comes back
+/// on. One `step` handles one event, whichever is first.
+struct Loop {
+    obs: Observer,
+    home: PathBuf,
+    cfg: config::Config,
+    cfg_error: Option<String>,
+    profile: String,
+    journal: mpsc::Receiver<journal::Entry>,
+    done_tx: mpsc::Sender<Done>,
+    done_rx: mpsc::Receiver<Done>,
+    sample: Interval,
+    minute: Interval,
+    hour: Interval,
+    slow: Interval,
+    beat: Interval,
+    draft: Interval,
+    release: Interval,
+    draft_with: DraftFn,
+}
+
+impl Loop {
+    fn new(
+        obs: Observer,
+        home: PathBuf,
+        cfg: config::Config,
+        cfg_error: Option<String>,
+        profile: String,
+        journal: mpsc::Receiver<journal::Entry>,
+    ) -> Self {
+        let now = tokio::time::Instant::now();
+        let every = |secs: u64| tokio::time::interval(Duration::from_secs(secs));
+        // The first minute and hour close a minute and an hour from now,
+        // not at once; the rest start right away.
+        let after = |secs: u64| {
+            tokio::time::interval_at(now + Duration::from_secs(secs), Duration::from_secs(secs))
+        };
+        let (done_tx, done_rx) = mpsc::channel(8);
+        Self {
+            obs,
+            home,
+            cfg,
+            cfg_error,
+            profile,
+            journal,
+            done_tx,
+            done_rx,
+            sample: every(5),
+            minute: after(60),
+            hour: after(3600),
+            slow: every(6 * 3600),
+            beat: every(10),
+            draft: every(120),
+            // A minute in, so a login doesn't wait on the network, then
+            // every 12 h.
+            release: tokio::time::interval_at(
+                now + Duration::from_secs(60),
+                reeve_core::update::EVERY,
+            ),
+            draft_with: draft_task,
+        }
+    }
+
+    async fn step(&mut self) {
         tokio::select! {
-            _ = sample.tick() => obs.sample(),
-            _ = minute.tick() => {
+            _ = self.sample.tick() => self.obs.sample(),
+            _ = self.minute.tick() => {
                 // Settings change while it runs (the drafter toggle, thresholds).
-                match config::load_at(&home) {
+                match config::load_at(&self.home) {
                     Ok(c) => {
-                        cfg = c;
-                        cfg_error = None;
+                        self.cfg = c;
+                        self.cfg_error = None;
                     }
-                    Err(e) => cfg_error = Some(e.to_string()),
+                    Err(e) => self.cfg_error = Some(e.to_string()),
                 }
-                obs.minute_tick(&cfg);
+                self.obs.minute_tick(&self.cfg);
             }
-            _ = hour.tick() => obs.hour_tick(),
-            _ = slow.tick() => obs.slow_checks().await,
-            _ = release.tick() => {
-                if cfg.updates.check {
-                    let h = home.clone();
+            _ = self.hour.tick() => self.obs.hour_tick(),
+            _ = self.slow.tick() => self.obs.start_checks(&self.done_tx, gather_checks()),
+            _ = self.release.tick() => {
+                if self.cfg.updates.check {
+                    let h = self.home.clone();
                     tokio::spawn(async move {
                         reeve_core::update::check(&h).await;
                     });
                 }
             }
-            _ = beat.tick() => {
-                obs.beat(&cfg);
+            _ = self.beat.tick() => {
+                self.obs.beat(&self.cfg);
                 // Every 10 s, so "run now" in /orders doesn't wait a minute.
-                match &cfg_error {
+                match &self.cfg_error {
                     Some(e) => {
-                        obs.status.last_error = Some(format!(
+                        self.obs.status.last_error = Some(format!(
                             "config.toml: {e}. Standing orders and the drafter are paused until it loads."
                         ));
                     }
-                    None => obs.orders_tick(&cfg, &profile),
+                    None => self.obs.orders_tick(&self.cfg, &self.profile),
                 }
             }
-            _ = draft.tick() => {
-                if cfg.observer.drafter.enabled && cfg_error.is_none() {
-                    match drafter::pass(&home, &cfg, &obs.store, &profile).await {
-                        drafter::Pass::Blocked(why) => obs.status.last_error = Some(why),
-                        drafter::Pass::Drafted(id) => {
-                            obs.status.last_error = None;
-                            if cfg.observer.notify {
-                                if let Some(f) = obs.store.get(&id) {
-                                    let first = f
-                                        .proposal
-                                        .as_ref()
-                                        .and_then(|p| p.text.lines().find(|l| !l.trim().is_empty()).map(str::to_string))
-                                        .unwrap_or_default();
-                                    notify::plain(
-                                        &format!("Reeve has a fix ready: {}", f.title),
-                                        &format!("{first}\nOpen Reeve: /findings, then p to use it."),
-                                        false,
-                                    );
-                                }
-                            }
-                        }
-                        drafter::Pass::Idle => {}
-                    }
-                }
-            }
-            Some(e) = jrx.recv() => obs.journal.add(&e),
+            _ = self.draft.tick() => self.draft_tick(),
+            Some(d) = self.done_rx.recv() => match d {
+                Done::Checks(c) => self.obs.finish_checks(c),
+                Done::Draft(p) => self.obs.finish_draft(&self.cfg, p),
+            },
+            Some(e) = self.journal.recv() => self.obs.journal.add(&e),
         }
+    }
+
+    /// Start a draft if the drafter is on, the config loads, none is
+    /// running, and a finding has settled.
+    fn draft_tick(&mut self) {
+        if self.cfg_error.is_some() || self.obs.drafting.is_some() {
+            return;
+        }
+        let Some(f) = drafter::next(&self.obs.store, &self.cfg) else {
+            return;
+        };
+        let (id, episode) = (f.id.clone(), f.first_seen);
+        let pass = (self.draft_with)(self.home.clone(), self.cfg.clone(), self.profile.clone(), f);
+        self.obs.start_draft(&self.done_tx, id, episode, pass);
     }
 }
 
@@ -751,5 +1029,204 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let _held = lock(home.path()).unwrap();
         assert!(lock(home.path()).unwrap_err().contains("already running"));
+    }
+
+    fn sig(id: &str) -> Signal {
+        Signal {
+            id: id.into(),
+            severity: reeve_core::findings::Severity::Warning,
+            title: id.into(),
+            detail: "d".into(),
+            evidence: vec![],
+            count: 1,
+        }
+    }
+
+    static STARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A draft whose model never answers.
+    fn stalled(_: PathBuf, _: config::Config, _: String, _: Finding) -> Task<drafter::Pass> {
+        STARTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(std::future::pending())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_draft_does_not_hold_the_loop() {
+        use reeve_core::findings::FindingStatus;
+        let home = tempfile::tempdir().unwrap();
+        let (_jtx, jrx) = mpsc::channel(1);
+        let mut cfg = config::Config::default();
+        cfg.observer.drafter.enabled = true;
+        cfg.observer.notify = false;
+        let mut lp = Loop::new(
+            Observer::new(home.path().to_path_buf()),
+            home.path().to_path_buf(),
+            cfg,
+            None,
+            String::new(),
+            jrx,
+        );
+        lp.draft_with = stalled;
+        // Only samples and heartbeats tick here: the rest would run the
+        // detectors and the probes on the test machine.
+        let far = Duration::from_secs(24 * 3600);
+        for i in [
+            &mut lp.minute,
+            &mut lp.hour,
+            &mut lp.slow,
+            &mut lp.release,
+            &mut lp.draft,
+        ] {
+            i.reset_after(far);
+        }
+        // A finding that has settled, so the drafter wants it.
+        lp.obs
+            .store
+            .observe(sig("swap-full"), Utc::now() - chrono::Duration::minutes(10))
+            .unwrap();
+        lp.draft_tick();
+        assert!(lp.obs.drafting.is_some(), "a draft started");
+        lp.draft_tick();
+        assert_eq!(
+            STARTS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one at a time"
+        );
+
+        // A minute of the loop with the draft stuck: sampling kept its
+        // 5-second cadence, and the heartbeat says what's running.
+        let before = lp.obs.minute.len();
+        let _ = tokio::time::timeout(Duration::from_secs(61), async {
+            loop {
+                lp.step().await;
+            }
+        })
+        .await;
+        let sampled = lp.obs.minute.len() - before;
+        assert!(sampled >= 12, "sampled {sampled} times in a minute");
+        assert!(lp.obs.drafting.is_some());
+        let status = ObserverStatus::load(home.path()).unwrap();
+        assert!(status.drafting_since.is_some());
+        assert!(status.beat.is_some());
+
+        // The backstop: the loop hears of it, the finding keeps the note so
+        // the next pass doesn't pick it again, and a new draft may start.
+        let _ = tokio::time::timeout(DRAFT_BACKSTOP + Duration::from_secs(5), async {
+            while lp.obs.drafting.is_some() {
+                lp.step().await;
+            }
+        })
+        .await;
+        assert!(lp.obs.drafting.is_none(), "the draft was cut off");
+        let note = lp.obs.status.last_error.clone().unwrap_or_default();
+        assert!(note.contains("cut off"), "{note}");
+        let f = lp.obs.store.get("swap-full").unwrap();
+        assert_eq!(f.status, FindingStatus::Open);
+        assert_eq!(f.draft_note.as_deref(), Some(note.as_str()));
+        assert!(
+            drafter::next(&lp.obs.store, &lp.cfg).is_none(),
+            "not picked again"
+        );
+        assert_eq!(STARTS.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checks_that_do_not_finish_resolve_nothing() {
+        use reeve_core::findings::FindingStatus;
+        let home = tempfile::tempdir().unwrap();
+        let mut obs = Observer::new(home.path().to_path_buf());
+        // Found by the last round of checks.
+        obs.store
+            .observe(sig("reboot-pending"), Utc::now())
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        obs.start_checks(&tx, std::future::pending());
+        assert!(obs.checking.is_some());
+        // Ignored while one runs.
+        obs.start_checks(&tx, async {
+            Some(Checks {
+                signals: vec![],
+                verdicts: vec![],
+            })
+        });
+        let Some(Done::Checks(out)) = rx.recv().await else {
+            panic!("the checks report back")
+        };
+        assert!(out.is_none(), "a stuck probe is no verdict");
+        obs.finish_checks(out);
+        assert!(obs.checking.is_none());
+        assert!(
+            obs.status
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("didn't finish")),
+            "{:?}",
+            obs.status.last_error
+        );
+        assert_eq!(
+            obs.store.get("reboot-pending").unwrap().status,
+            FindingStatus::Open,
+            "a finding the checks didn't see isn't gone"
+        );
+        // Checks that finish and don't see it resolve it.
+        obs.start_checks(&tx, async {
+            Some(Checks {
+                signals: vec![],
+                verdicts: vec!["reboot-pending", "updates-security"],
+            })
+        });
+        let Some(Done::Checks(out)) = rx.recv().await else {
+            panic!("the checks report back")
+        };
+        obs.finish_checks(out);
+        assert_eq!(
+            obs.store.get("reboot-pending").unwrap().status,
+            FindingStatus::Resolved
+        );
+    }
+
+    #[test]
+    fn a_probe_that_did_not_run_leaves_its_findings_alone() {
+        use reeve_core::findings::FindingStatus;
+        let home = tempfile::tempdir().unwrap();
+        let mut obs = Observer::new(home.path().to_path_buf());
+        obs.store
+            .observe(sig("reboot-pending"), Utc::now())
+            .unwrap();
+        obs.store
+            .observe(sig("updates-security"), Utc::now())
+            .unwrap();
+        // Only the advisory probe ran this round.
+        obs.finish_checks(Some(Checks {
+            signals: vec![],
+            verdicts: vec!["updates-security"],
+        }));
+        assert_eq!(
+            obs.store.get("updates-security").unwrap().status,
+            FindingStatus::Resolved
+        );
+        assert_eq!(
+            obs.store.get("reboot-pending").unwrap().status,
+            FindingStatus::Open,
+            "no probe spoke for it"
+        );
+        let note = obs.status.last_error.clone().unwrap_or_default();
+        assert!(note.contains("a pending reboot"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn a_probe_is_an_answer_only_when_it_succeeds() {
+        assert_eq!(run("printf hi").await.as_deref(), Some("hi"));
+        // The negative of a test is said, not exited.
+        assert_eq!(
+            run("if [ -f /nonexistent/flag ]; then echo yes; else echo no; fi")
+                .await
+                .as_deref(),
+            Some("no\n")
+        );
+        assert_eq!(run("exit 42").await, None);
+        // A producer that failed into a consumer that didn't.
+        assert_eq!(run("false | cat").await, None);
+        assert_eq!(run("nonexistent-tool-xyz 2>/dev/null | cat").await, None);
     }
 }

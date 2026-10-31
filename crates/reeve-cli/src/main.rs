@@ -378,19 +378,30 @@ fn daemon(home: &std::path::Path, cmd: DaemonCmd) -> Result<(), String> {
         }
         DaemonCmd::Status => {
             println!("service: {}", service::state());
+            let now = chrono::Utc::now();
             match ObserverStatus::load(home) {
-                Some(s) if s.alive(chrono::Utc::now()) => println!(
-                    "reeved: running (pid {}), system journal {}, drafter {} (${:.2} today, {} drafts)",
-                    s.pid,
-                    if s.journal {
-                        "readable"
-                    } else {
-                        "NOT readable (add yourself to the systemd-journal group)"
-                    },
-                    if s.drafter { "on" } else { "off" },
-                    s.drafter_usd_today,
-                    s.drafts_today
-                ),
+                Some(s) if s.alive(now) => {
+                    println!(
+                        "reeved: running (pid {}), system journal {}, drafter {} (${:.2} today, {} drafts)",
+                        s.pid,
+                        if s.journal {
+                            "readable"
+                        } else {
+                            "NOT readable (add yourself to the systemd-journal group)"
+                        },
+                        if s.drafter { "on" } else { "off" },
+                        s.drafter_usd_today,
+                        s.drafts_today
+                    );
+                    for (since, what) in [
+                        (s.drafting_since, "drafting a proposal"),
+                        (s.checking_since, "running the 6-hourly checks"),
+                    ] {
+                        if let Some(t) = since {
+                            println!("reeved: {what} for {} min", (now - t).num_minutes());
+                        }
+                    }
+                }
                 Some(_) => println!("reeved: not running (last heartbeat is old)"),
                 None => println!("reeved: has never run"),
             }
@@ -531,8 +542,8 @@ fn orders_cmd(cfg: &Config, home: &std::path::Path, cmd: OrdersCmd) -> Result<()
             // A start like any other, so the daily limit sees it. A state
             // file that can't be read means forgotten limits: nothing runs,
             // and the file isn't replaced.
-            let mut states = orders
-                .states_checked()
+            orders
+                .modify_states(|s| s.entry(id.clone()).or_default().claim(chrono::Utc::now()))
                 .map_err(|e| format!("{e}; nothing runs until it's fixed"))?;
             println!(
                 "running \"{}\" as reeved would: unattended, inside its scope…",
@@ -544,11 +555,6 @@ fn orders_cmd(cfg: &Config, home: &std::path::Path, cmd: OrdersCmd) -> Result<()
                 .build()
                 .map_err(|e| e.to_string())?;
             let profile = reeve_observer::HostInfo::read().profile();
-            states
-                .entry(id.clone())
-                .or_default()
-                .claim(chrono::Utc::now());
-            orders.save_states(&states).map_err(|e| e.to_string())?;
             let run = rt.block_on(reeve_observer::orders::run(
                 home,
                 cfg,
@@ -565,11 +571,9 @@ fn orders_cmd(cfg: &Config, home: &std::path::Path, cmd: OrdersCmd) -> Result<()
             // The run happened, and its receipts stand. A state that stopped
             // parsing meanwhile isn't replaced with one that remembers only
             // this run.
-            let mut states = orders
-                .states_checked()
-                .map_err(|e| format!("{e}; the run isn't in the order's history"))?;
-            states.entry(id).or_default().push(run);
-            orders.save_states(&states).map_err(|e| e.to_string())
+            orders
+                .modify_states(|s| s.entry(id).or_default().push(run))
+                .map_err(|e| format!("{e}; the run isn't in the order's history"))
         }
         OrdersCmd::Sudoers { id } => {
             let o = orders.get(&id).map_err(|e| e.to_string())?;

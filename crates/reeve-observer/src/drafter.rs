@@ -7,8 +7,12 @@
 //! - Read-only: its approver says no to everything past T0, so it can
 //!   investigate but never change anything. The proposal waits for the owner.
 //! - A model with no known price can't be used while a cap is set.
+//! - Bounded: a draft stops between model calls once it has run for
+//!   `DEADLINE`, and the finding keeps the note. reeved runs each draft
+//!   beside its loop and cuts off one stuck in a call that never returns.
 
 use std::path::Path;
+use std::time::Duration;
 
 use chrono::{Local, Utc};
 use reeve_core::agent::{Agent, AgentEvent};
@@ -16,6 +20,10 @@ use reeve_core::config::{self, Config};
 use reeve_core::findings::{Finding, FindingStatus, FindingStore, Proposal, Severity};
 use reeve_core::ledger;
 use reeve_core::llm::{HttpProvider, Provider};
+
+/// How long a draft may run. Past it, the agent stops between model
+/// calls, so the calls made are all recorded.
+pub const DEADLINE: Duration = Duration::from_secs(15 * 60);
 
 /// What one pass did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,18 +90,46 @@ fn prompt(f: &Finding) -> String {
     )
 }
 
-/// One pass: draft at most one finding.
-pub async fn pass(home: &Path, cfg: &Config, store: &FindingStore, profile: &str) -> Pass {
+/// The finding the next pass would draft: the drafter is on and one has
+/// settled. The caller starts the draft, so it knows which finding to
+/// write the note on if the draft never comes back.
+pub fn next(store: &FindingStore, cfg: &Config) -> Option<Finding> {
     let d = &cfg.observer.drafter;
     if !d.enabled {
-        return Pass::Idle;
+        return None;
     }
-    let Some(mut f) = candidate(store, Severity::parse(&d.min_severity)) else {
-        return Pass::Idle;
-    };
-    let block = |f: &mut Finding, why: String| {
-        f.draft_note = Some(why.clone());
-        let _ = store.put(f);
+    candidate(store, Severity::parse(&d.min_severity))
+}
+
+/// One pass: draft at most one finding.
+pub async fn pass(home: &Path, cfg: &Config, store: &FindingStore, profile: &str) -> Pass {
+    match next(store, cfg) {
+        Some(f) => draft(home, cfg, store, profile, f).await,
+        None => Pass::Idle,
+    }
+}
+
+/// Draft a proposal for `f`, within the drafter's budgets and `DEADLINE`.
+pub async fn draft(
+    home: &Path,
+    cfg: &Config,
+    store: &FindingStore,
+    profile: &str,
+    f: Finding,
+) -> Pass {
+    let started = std::time::Instant::now();
+    let d = &cfg.observer.drafter;
+    // The draft runs beside the observer, which may resolve or refresh the
+    // finding meanwhile. So nothing here writes `f` back: a note goes on the
+    // record as it is now, and only while it's still this episode and open.
+    let episode = f.first_seen;
+    let block = |why: String| {
+        if let Some(mut fresh) = store.get(&f.id) {
+            if fresh.first_seen == episode && fresh.status == FindingStatus::Open {
+                fresh.draft_note = Some(why.clone());
+                let _ = store.put(&fresh);
+            }
+        }
         Pass::Blocked(why)
     };
     let spent = ledger::role_today(home, "drafter", Local::now());
@@ -121,10 +157,9 @@ pub async fn pass(home: &Path, cfg: &Config, store: &FindingStore, profile: &str
         .clone()
         .unwrap_or_else(|| cfg.default_connection.clone());
     let Some(conn) = cfg.connections.get(&conn_name).cloned() else {
-        return block(
-            &mut f,
-            format!("the drafter's connection {conn_name:?} doesn't exist"),
-        );
+        return block(format!(
+            "the drafter's connection {conn_name:?} doesn't exist"
+        ));
     };
     let model = match d
         .model
@@ -132,11 +167,11 @@ pub async fn pass(home: &Path, cfg: &Config, store: &FindingStore, profile: &str
         .or_else(|| cfg.route().ok().map(|(_, _, m)| m))
     {
         Some(m) => m,
-        None => return block(&mut f, "no model chosen for the drafter".into()),
+        None => return block("no model chosen for the drafter".into()),
     };
     let key = match config::resolve_secret(cfg, home, &conn_name) {
         Ok(k) => k,
-        Err(e) => return block(&mut f, format!("drafter: {e}")),
+        Err(e) => return block(format!("drafter: {e}")),
     };
     // Its own per-draft cap is the session cap of its agent.
     let mut agent_cfg = cfg.clone();
@@ -151,21 +186,19 @@ pub async fn pass(home: &Path, cfg: &Config, store: &FindingStore, profile: &str
         profile,
     ) {
         Ok(a) => a,
-        Err(e) => return block(&mut f, format!("drafter: {e}")),
+        Err(e) => return block(format!("drafter: {e}")),
     };
     agent.set_role("drafter");
+    agent.set_deadline(started + DEADLINE);
     let _ = agent.refresh_models().await;
     let any_cap = d.daily_usd > 0.0
         || d.per_draft_usd > 0.0
         || cfg.spend.daily_usd > 0.0
         || cfg.spend.monthly_usd > 0.0;
     if any_cap && !conn.is_local() && agent.book().rates(&model).is_none() {
-        return block(
-            &mut f,
-            format!(
-                "no known price for {model}, so the drafter won't run it while budgets are set"
-            ),
-        );
+        return block(format!(
+            "no known price for {model}, so the drafter won't run it while budgets are set"
+        ));
     }
     let failed = std::sync::Mutex::new(None);
     agent
@@ -180,13 +213,19 @@ pub async fn pass(home: &Path, cfg: &Config, store: &FindingStore, profile: &str
     let _ = agent.write_report();
     // A reply from before the error isn't a proposal.
     if let Some(msg) = failed.into_inner().ok().flatten() {
-        return block(&mut f, format!("draft failed: {msg}"));
+        return block(format!("draft failed: {msg}"));
     }
     let Some(text) = reply else {
-        return block(&mut f, "the drafter produced no proposal".into());
+        return block("the drafter produced no proposal".into());
     };
-    // Re-read: the owner may have acted on it while the draft ran.
-    let mut fresh = store.get(&f.id).unwrap_or(f);
+    // Re-read: the owner or a detector may have acted on it while the
+    // draft ran. A new episode is another finding: this proposal isn't its.
+    let Some(mut fresh) = store.get(&f.id).filter(|n| n.first_seen == episode) else {
+        return Pass::Blocked(format!(
+            "{} changed while the draft ran; the proposal wasn't kept",
+            f.id
+        ));
+    };
     fresh.proposal = Some(Proposal {
         text,
         drafted_at: Utc::now(),
@@ -237,6 +276,48 @@ mod tests {
         let p = pass(home.path(), &cfg, &store, "").await;
         assert!(
             matches!(&p, Pass::Blocked(m) if m.contains("no key")),
+            "{p:?}"
+        );
+        assert!(store.get("swap-full").unwrap().draft_note.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_draft_that_fails_leaves_a_changed_finding_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let store = FindingStore::new(home.path());
+        let mut cfg = Config::default();
+        cfg.observer.drafter.enabled = true;
+        cfg.observer.drafter.connection = Some("nowhere".into());
+        let old = Utc::now() - chrono::Duration::minutes(10);
+        let sig = || Signal {
+            id: "swap-full".into(),
+            severity: Severity::Warning,
+            title: "Swap".into(),
+            detail: "d".into(),
+            evidence: vec![],
+            count: 1,
+        };
+        store.observe(sig(), old).unwrap();
+        let captured = store.get("swap-full").unwrap();
+        // Resolved while the draft ran: the failure writes nothing back.
+        store.resolve_missing("swap-full", &[], Utc::now()).unwrap();
+        let p = draft(home.path(), &cfg, &store, "", captured.clone()).await;
+        assert!(matches!(p, Pass::Blocked(_)), "{p:?}");
+        let now = store.get("swap-full").unwrap();
+        assert_eq!(now.status, FindingStatus::Resolved, "not reopened");
+        assert_eq!(now.draft_note, None);
+        // Back as a new episode: the old draft's note isn't its.
+        store.observe(sig(), Utc::now()).unwrap();
+        let fresh = store.get("swap-full").unwrap();
+        assert_ne!(fresh.first_seen, captured.first_seen);
+        let p = draft(home.path(), &cfg, &store, "", captured).await;
+        assert!(matches!(p, Pass::Blocked(_)));
+        assert_eq!(store.get("swap-full").unwrap().draft_note, None);
+        assert_eq!(store.get("swap-full").unwrap().status, FindingStatus::Open);
+        // The same episode, still open, gets the note.
+        let p = draft(home.path(), &cfg, &store, "", fresh).await;
+        assert!(
+            matches!(&p, Pass::Blocked(m) if m.contains("doesn't exist")),
             "{p:?}"
         );
         assert!(store.get("swap-full").unwrap().draft_note.is_some());

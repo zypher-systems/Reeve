@@ -4,7 +4,7 @@ An **operator harness**: an agent that runs on your computer and manages it for 
 coding agent. It keeps the machine healthy, tidy, and configured. It gives receipts for everything
 it does, and it learns how your system behaves.
 
-> **Status: 0.7 (Fedora, Arch, and Debian; standing orders; skills).** Reeve manages this machine with you:
+> **Status: 0.8 (Fedora, Arch, and Debian; standing orders; skills; signed releases).** Reeve manages this machine with you:
 > - files anywhere, including root-owned ones
 > - packages, services, logs, and processes
 > - shell, with `sudo` through its own password prompt
@@ -21,24 +21,31 @@ curl -fsSL https://raw.githubusercontent.com/zypher-systems/reeve/main/install.s
 ```
 
 This installs `/usr/local/bin/reeve` (using sudo for the copy) and the `reeved` user service, starts the
-observer, and checks every download against the release's `SHA256SUMS`. Options: `--user` (everything under
-`~/.local`, no sudo), `--no-start`, `--version v0.1.0`, `--uninstall`. Your data in `~/.reeve` is never touched.
+observer, and checks the release's `SHA256SUMS` against Reeve's release key (`release/reeve-release.pub.pem`,
+with OpenSSL) and every download against those sums. Options: `--user` (everything under `~/.local`, no sudo),
+`--no-start`, `--version v0.1.0`, `--uninstall`. Your data in `~/.reeve` is never touched.
 
 Packages:
 
 - **Fedora:** `sudo dnf install ./reeve-<version>-1.x86_64.rpm` from the release, or build from source with
-  `packaging/fedora/reeve.spec` (offline, with the vendored crates each release ships).
+  the release's `reeve.spec` (offline, from the release's source and vendored-crates tarballs, their
+  checksums filled in): `spectool -g -R reeve.spec && rpmbuild -ba reeve.spec`.
+- **Debian / Ubuntu:** `sudo apt install ./reeve_<version>-1_amd64.deb` (or `_arm64.deb`) from the release.
 - **Arch / Omarchy:** the release's `PKGBUILD` (`reeve-bin`), or `packaging/arch/reeve` to build from source.
-- **Debian / Ubuntu:** the installer above (the binaries are static, so they run on any release). There's no
-  `.deb` yet.
+- **Anything else:** the installer above; the binaries are static, so they run on any Linux.
+
+Every archive and package carries `third-party/`: the licenses of the crates built into Reeve.
 
 With a package, start the observer yourself: `systemctl --user enable --now reeved` (or `reeve daemon install`).
 
 Then run `reeve`, type `/providers`, and paste your API key. `reeve doctor` checks the whole install.
 
 Updating: when a newer release is out, the header shows `↑ <version>`. `reeve update` installs it the same way
-Reeve was installed (the release's installer, dnf, or your AUR helper), checked against the release's
-`SHA256SUMS` and with a receipt. `reeve update --rollback` goes back.
+Reeve was installed (the release's installer, dnf, apt-get, or your AUR helper), checked against the release's
+signed `SHA256SUMS` and with a receipt. A package that came from a distribution's repository is updated through
+that repository instead, so its signed build stays the one installed; if the repository doesn't have the new
+version yet, nothing changes. `reeve update --rollback` goes back. Releases before 0.8.0 aren't
+signed, so neither the installer nor `reeve update` will install one; that release's own `install.sh` still does.
 
 From source:
 

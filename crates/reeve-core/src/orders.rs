@@ -841,8 +841,23 @@ impl Orders {
         }
     }
 
-    /// Save every order's state.
-    pub fn save_states(&self, s: &BTreeMap<String, OrderState>) -> Result<()> {
+    /// Read, change and save every order's state under a lock, so reeved's
+    /// tick, a run finishing and `reeve orders run` never drop each other's
+    /// claims. A state file that doesn't parse is an error, and `f` doesn't
+    /// run: nothing replaces it.
+    pub fn modify_states<R>(
+        &self,
+        f: impl FnOnce(&mut BTreeMap<String, OrderState>) -> R,
+    ) -> Result<R> {
+        let _lock = crate::lockfile::hold(&self.dir.join(".state.lock"))?;
+        let mut s = self.states_checked()?;
+        let out = f(&mut s);
+        self.save_states(&s)?;
+        Ok(out)
+    }
+
+    /// Save every order's state. Only under [`Orders::modify_states`].
+    fn save_states(&self, s: &BTreeMap<String, OrderState>) -> Result<()> {
         fs::create_dir_all(&self.dir)?;
         let json = serde_json::to_string_pretty(s).map_err(|e| Error::Io(e.to_string()))?;
         crate::undo::write_atomic(&self.state_path(), json.as_bytes(), Some(0o600))
@@ -1581,6 +1596,41 @@ cooldown_hours = 24
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_edits_are_serialized_and_a_broken_state_is_left_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let orders = Orders::new(home.path());
+        let now = Utc::now();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let p = home.path().to_path_buf();
+        let first = std::thread::spawn(move || {
+            Orders::new(&p)
+                .modify_states(|s| {
+                    s.entry("a".into()).or_default().claim(now);
+                    entered_tx.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                })
+                .unwrap();
+        });
+        entered_rx.recv().unwrap();
+        // Begins while the first edit is open: a claim made meanwhile is
+        // kept, where a read-modify-write would drop one of the two.
+        orders
+            .modify_states(|s| {
+                s.entry("b".into()).or_default().claim(now);
+            })
+            .unwrap();
+        first.join().unwrap();
+        let s = orders.states_checked().unwrap();
+        assert!(s.contains_key("a") && s.contains_key("b"), "{s:?}");
+
+        fs::write(orders.state_path(), "not json").unwrap();
+        let mut ran = false;
+        assert!(orders.modify_states(|_| ran = true).is_err());
+        assert!(!ran, "nothing changes on a state that can't be read");
+        assert_eq!(fs::read_to_string(orders.state_path()).unwrap(), "not json");
+    }
 
     #[test]
     fn a_rendered_order_reads_back_the_same() {

@@ -2,8 +2,10 @@
 # Package a built release binary: packaging/dist.sh <target> [out-dir]
 #
 # Expects target/<target>/release/reeve. Writes <out>/reeve-<target>.tar.gz
-# (binary, user unit, installer, docs) and its .sha256. CI and local
-# builds use the same script, so what's tested is what ships.
+# (binary, user unit, installer, docs, third-party notices) and its .sha256,
+# and leaves the notices in <out>/third-party for the RPM and .deb built
+# next (their asset lists name dist/third-party). CI and local builds use
+# the same script, so what's tested is what ships.
 set -eu
 
 target="${1:?usage: packaging/dist.sh <target> [out-dir]}"
@@ -20,6 +22,8 @@ cp "$bin" "$stage/reeve"
 cp "$root/packaging/systemd/reeved.service" "$stage/reeved.service"
 cp "$root/install.sh" "$root/LICENSE" "$root/README.md" "$root/config.example.toml" "$stage/"
 chmod 755 "$stage/reeve" "$stage/install.sh"
+(cd "$root" && python3 packaging/third_party.py "$out/third-party")
+cp -R "$out/third-party" "$stage/third-party"
 tar -C "$out" -czf "$out/$name.tar.gz" "$name"
 rm -rf "$stage"
 cd "$out"

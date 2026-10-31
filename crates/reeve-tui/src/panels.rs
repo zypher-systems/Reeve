@@ -859,6 +859,17 @@ fn observer(f: &mut Frame, r: Rect, p: &crate::overlay::ObserverPanel, t: &Theme
                 Style::default().fg(t.warn),
             )));
         }
+        for (since, what) in [
+            (s.drafting_since, "drafting a proposal"),
+            (s.checking_since, "running the 6-hourly checks"),
+        ] {
+            if let Some(since) = since {
+                lines.push(Line::from(Span::styled(
+                    format!("  now: {what} (for {})", ago(since)),
+                    t.muted(),
+                )));
+            }
+        }
     }
     lines.push(Line::from(Span::styled(
         "  Watches with rules only: no model, no cost. It never changes the machine.",

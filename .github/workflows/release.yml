@@ -1,12 +1,15 @@
 name: release
 
-# Pushing a tag like v0.1.0 builds the Linux binaries, RPMs, and the source
-# vendor tarball, and opens a *draft* release with them, the installer, the
-# checksums, and a ready AUR PKGBUILD. A person reviews and publishes it.
+# Pushing a tag like v0.1.0 builds the Linux binaries, the RPMs and .debs,
+# and the source and vendor tarballs, and opens a *draft* release with them,
+# the installer, the checksums signed with the release key, a ready AUR
+# PKGBUILD, and the Fedora spec with its sources' checksums filled in. A
+# person reviews and publishes it.
 #
 # Running it by hand (Actions → release → Run workflow), or a pull request
-# that changes packaging, builds everything as artifacts without a release:
-# a dry run, installer included.
+# that changes packaging, builds everything the release would carry as the
+# `release-files` artifact, without a release: a dry run, installer and
+# package installs included.
 on:
   push:
     tags: ["v*"]
@@ -16,6 +19,7 @@ on:
       - .github/workflows/release.yml
       - install.sh
       - packaging/**
+      - release/**
       - Cargo.toml
       - Cargo.lock
       - crates/reeve-cli/Cargo.toml
@@ -53,6 +57,7 @@ jobs:
           target/${{ matrix.target }}/release/reeve --version
           target/${{ matrix.target }}/release/reeve doctor || true
       - name: archive
+        # Also writes dist/third-party, which the RPM and .deb below pick up.
         run: packaging/dist.sh ${{ matrix.target }} dist
       - name: installer, end to end
         # Install from the archive just built, into a scratch home, exactly
@@ -64,6 +69,7 @@ jobs:
           ./install.sh --from dist/reeve-${{ matrix.target }}.tar.gz --user --no-start
           "$HOME/.local/bin/reeve" --version
           grep -q "ExecStart=$HOME/.local/bin/reeve daemon run" "$HOME/.local/share/systemd/user/reeved.service"
+          test -f "$HOME/.local/bin/reeve" && test -d dist/third-party
           ./install.sh --user --uninstall
           test ! -e "$HOME/.local/bin/reeve"
       - name: rpm
@@ -71,7 +77,25 @@ jobs:
           set -eu
           cargo install cargo-generate-rpm --locked --version 0.16.1
           cargo generate-rpm -p crates/reeve-cli --target ${{ matrix.target }} -o dist/
-          ls -l dist/
+          rpm -qlp dist/reeve-*.rpm | grep -q /usr/share/doc/reeve/third-party/README.md
+      - name: deb
+        run: |
+          set -eu
+          cargo install cargo-deb --locked --version 3.8.0
+          cargo deb -p reeve-cli --no-build --no-strip --target ${{ matrix.target }} -o dist/
+          dpkg-deb --info dist/reeve_*.deb
+          dpkg-deb --contents dist/reeve_*.deb | grep -q usr/share/doc/reeve/third-party/README.md
+      - name: deb, installed and removed
+        # The runner is Debian-based: install the package as a user would,
+        # check what it put in place, then remove it.
+        run: |
+          set -eu
+          sudo apt-get install -y ./dist/reeve_*.deb
+          /usr/bin/reeve --version
+          test -f /usr/lib/systemd/user/reeved.service
+          test -f /usr/share/doc/reeve/third-party/README.md
+          sudo apt-get remove -y reeve
+          test ! -e /usr/bin/reeve
       - uses: actions/upload-artifact@v4
         with:
           name: reeve-${{ matrix.target }}
@@ -79,29 +103,127 @@ jobs:
             dist/*.tar.gz
             dist/*.sha256
             dist/*.rpm
+            dist/*.deb
 
   source:
-    # Crates vendored for offline builds (the Fedora spec, COPR).
+    # The source tarball (reeve-<version>/ inside, with a checksum that stays
+    # what the release says, where GitHub's archive/ URL guarantees neither)
+    # and the crates vendored for offline builds (the Fedora spec, COPR).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88.0"
-      - name: vendor
+      - name: source and vendor tarballs
         run: |
           set -eu
           version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="reeve-cli"))')
-          cargo vendor --locked vendor >/dev/null
           mkdir -p dist
+          git archive --format=tar.gz --prefix="reeve-$version/" -o "dist/reeve-$version.tar.gz" HEAD
+          cargo vendor --locked vendor >/dev/null
           tar -cJf "dist/reeve-$version-vendor.tar.xz" vendor
+          ls -l dist/
       - uses: actions/upload-artifact@v4
         with:
           name: reeve-source
-          path: dist/*.tar.xz
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.xz
+
+  assemble:
+    # Everything the release carries, in one place: checksums over all of
+    # it, signed with the release key, the AUR PKGBUILD and the Fedora spec
+    # filled in, and the installer run against the lot. Runs on dry runs
+    # too, so a broken fill or signature shows up before release day.
+    needs: [build, source]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums, PKGBUILD and spec
+        run: |
+          set -eu
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="reeve-cli"))')
+          case "${GITHUB_REF}" in
+            refs/tags/v*) test "${GITHUB_REF_NAME#v}" = "$version" || { echo "::error::tag ${GITHUB_REF_NAME} but Cargo.toml says $version"; exit 1; } ;;
+          esac
+          cp install.sh dist/
+          (cd dist && sha256sum *.tar.gz *.rpm *.deb *.tar.xz install.sh > SHA256SUMS)
+          sum() { grep " $1\$" dist/SHA256SUMS | awk '{print $1}'; }
+          sed -e "s/@VERSION@/$version/" \
+              -e "s/@SHA256_X86_64@/$(sum reeve-x86_64-unknown-linux-musl.tar.gz)/" \
+              -e "s/@SHA256_AARCH64@/$(sum reeve-aarch64-unknown-linux-musl.tar.gz)/" \
+              packaging/arch/reeve-bin/PKGBUILD > dist/PKGBUILD
+          sed -e "s/^%global source0_sha256 .*/%global source0_sha256 $(sum reeve-$version.tar.gz)/" \
+              -e "s/^%global source1_sha256 .*/%global source1_sha256 $(sum reeve-$version-vendor.tar.xz)/" \
+              packaging/fedora/reeve.spec > dist/reeve.spec
+          grep -q "^Version: *$version\$" dist/reeve.spec || { echo "::error::packaging/fedora/reeve.spec isn't at $version"; exit 1; }
+          grep -q "^pkgver=$version\$" dist/PKGBUILD
+          grep -Eq "^%global source[01]_sha256 [0-9a-f]{64}\$" dist/reeve.spec
+          rm -rf dist/third-party
+          cat dist/SHA256SUMS
+      - name: sign the checksums
+        # Reeve installs a release only when this signature matches the key
+        # built into it (release/reeve-release.pub.pem). No key, no release.
+        env:
+          REEVE_SIGNING_KEY: ${{ secrets.REEVE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REEVE_SIGNING_KEY:-}" ]; then
+            echo "::error::the REEVE_SIGNING_KEY secret is not set; releases must be signed"
+            exit 1
+          fi
+          umask 077
+          key="$RUNNER_TEMP/release.pem"
+          printf '%s\n' "$REEVE_SIGNING_KEY" > "$key"
+          openssl pkeyutl -sign -inkey "$key" -rawin -in dist/SHA256SUMS -out "$RUNNER_TEMP/sums.sig"
+          rm -f "$key"
+          # The signature must match the public key every Reeve is built with.
+          openssl pkeyutl -verify -pubin -inkey release/reeve-release.pub.pem -rawin \
+            -in dist/SHA256SUMS -sigfile "$RUNNER_TEMP/sums.sig"
+          base64 -w0 "$RUNNER_TEMP/sums.sig" > dist/SHA256SUMS.sig
+      - name: installer, from the signed release files
+        # dist/ served as a release mirror: install from it as a user would,
+        # signature and checksums checked, into a scratch home. Then the same
+        # files with one checksum changed after signing must be refused.
+        run: |
+          set -eu
+          (cd dist && exec python3 -m http.server 8765 --bind 127.0.0.1) >/dev/null 2>&1 &
+          good=$!
+          cp -r dist "$RUNNER_TEMP/tampered"
+          # Change the first hex digit of the first checksum, whatever it is.
+          sums="$RUNNER_TEMP/tampered/SHA256SUMS"
+          case "$(head -c1 "$sums")" in
+            0) sed -i '1s/^./1/' "$sums" ;;
+            *) sed -i '1s/^./0/' "$sums" ;;
+          esac
+          if cmp -s dist/SHA256SUMS "$sums"; then
+            echo "::error::the tampered checksums are the signed ones"; exit 1
+          fi
+          (cd "$RUNNER_TEMP/tampered" && exec python3 -m http.server 8766 --bind 127.0.0.1) >/dev/null 2>&1 &
+          bad=$!
+          sleep 2
+          export HOME="$RUNNER_TEMP/home"
+          mkdir -p "$HOME"
+          REEVE_DOWNLOAD_URL=http://127.0.0.1:8765 ./install.sh --user --no-start
+          "$HOME/.local/bin/reeve" --version
+          ./install.sh --user --uninstall
+          if REEVE_DOWNLOAD_URL=http://127.0.0.1:8766 ./install.sh --user --no-start; then
+            echo "::error::the installer took checksums changed after signing"; exit 1
+          fi
+          test ! -e "$HOME/.local/bin/reeve"
+          kill "$good" "$bad"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-files
+          path: dist/
 
   release:
-    needs: [build, source]
+    needs: assemble
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -110,21 +232,8 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
+          name: release-files
           path: dist
-          merge-multiple: true
-      - name: checksums and PKGBUILD
-        run: |
-          set -eu
-          tag="${GITHUB_REF_NAME}"
-          version="${tag#v}"
-          cp install.sh dist/
-          (cd dist && sha256sum *.tar.gz *.rpm *.tar.xz install.sh > SHA256SUMS)
-          sum() { grep " $1\$" dist/SHA256SUMS | awk '{print $1}'; }
-          sed -e "s/@VERSION@/$version/" \
-              -e "s/@SHA256_X86_64@/$(sum reeve-x86_64-unknown-linux-musl.tar.gz)/" \
-              -e "s/@SHA256_AARCH64@/$(sum reeve-aarch64-unknown-linux-musl.tar.gz)/" \
-              packaging/arch/reeve-bin/PKGBUILD > dist/PKGBUILD
-          cat dist/SHA256SUMS
       - name: draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -134,4 +243,5 @@ jobs:
           notes="docs/releases/${tag}.md"
           if [ -f "$notes" ]; then flag=(--notes-file "$notes"); else flag=(--generate-notes); fi
           gh release create "$tag" --draft --title "Reeve ${tag}" "${flag[@]}" \
-            dist/*.tar.gz dist/*.rpm dist/*.tar.xz dist/SHA256SUMS dist/install.sh dist/PKGBUILD
+            dist/*.tar.gz dist/*.rpm dist/*.deb dist/*.tar.xz dist/SHA256SUMS dist/SHA256SUMS.sig \
+            dist/install.sh dist/PKGBUILD dist/reeve.spec
