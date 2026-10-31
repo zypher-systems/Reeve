@@ -27,17 +27,20 @@ observer, and checks every download against the release's `SHA256SUMS`. Options:
 Packages:
 
 - **Fedora:** `sudo dnf install ./reeve-<version>-1.x86_64.rpm` from the release, or build from source with
-  `packaging/fedora/reeve.spec` (offline, with the vendored crates each release ships).
+  the release's `reeve.spec` (offline, from the release's source and vendored-crates tarballs, their
+  checksums filled in): `spectool -g -R reeve.spec && rpmbuild -ba reeve.spec`.
+- **Debian / Ubuntu:** `sudo apt install ./reeve_<version>-1_amd64.deb` (or `_arm64.deb`) from the release.
 - **Arch / Omarchy:** the release's `PKGBUILD` (`reeve-bin`), or `packaging/arch/reeve` to build from source.
-- **Debian / Ubuntu:** the installer above (the binaries are static, so they run on any release). There's no
-  `.deb` yet.
+- **Anything else:** the installer above; the binaries are static, so they run on any Linux.
+
+Every archive and package carries `third-party/`: the licenses of the crates built into Reeve.
 
 With a package, start the observer yourself: `systemctl --user enable --now reeved` (or `reeve daemon install`).
 
 Then run `reeve`, type `/providers`, and paste your API key. `reeve doctor` checks the whole install.
 
 Updating: when a newer release is out, the header shows `↑ <version>`. `reeve update` installs it the same way
-Reeve was installed (the release's installer, dnf, or your AUR helper), checked against the release's
+Reeve was installed (the release's installer, dnf, apt-get, or your AUR helper), checked against the release's
 `SHA256SUMS` and with a receipt. `reeve update --rollback` goes back.
 
 From source:

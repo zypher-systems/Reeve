@@ -432,6 +432,8 @@ Everything shown is escaped. Log lines and finding text are data.
     release's own `install.sh --from` with flags matching this install. The installer never starts
     reeved; `reeve update` restarts it only when it runs the binary just replaced.
   - **An RPM:** the release RPM, checked the same way, through `sudo dnf upgrade` (or `downgrade`).
+  - **A .deb:** the release .deb, checked the same way, through `sudo apt-get install` (with
+    `--allow-downgrades` for a rollback).
   - **A pacman package:** the AUR helper.
   - **A cargo build, or a binary somewhere no installer puts it:** refused, with what to do instead.
 - **Receipts and rollback:** every attempt leaves a `reeve_update` receipt (T1 under your home, T2
@@ -777,7 +779,8 @@ pacman and apt pass, and the dev → main PR has its two external reviews.
 3. **Long sessions** (G18). When the transcript nears the model's context length, older rounds are
    compacted; the owner's constraints, pending approvals and the open change are kept. M.
 4. **A .deb** in the release workflow, since the servers it's wanted on are Debian; install.sh stays.
-   M.
+   M. *In dev as of 2026-10-30, with the source tarball, the filled spec and the third-party
+   notices (DECISIONS 2026-10-30, "The release carries every package").*
 5. **A runbook "worked" only with evidence** (G19): reflection counts a success only when the
    session has a verified change or no failed receipt. S. *In dev as of 2026-10-30 (§7, step 4).*
 6. **Locked updates for shared files** (G17): settings and order state use the lock the receipts

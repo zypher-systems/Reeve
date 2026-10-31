@@ -318,6 +318,11 @@ pub enum Install {
         /// Its name.
         package: String,
     },
+    /// Owned by a Debian package.
+    Deb {
+        /// Its name.
+        package: String,
+    },
     /// Owned by a pacman package.
     Pacman {
         /// Its name.
@@ -346,10 +351,10 @@ pub fn classify(bin: &Path, home: &Path, owner: impl Fn(&Path) -> Owner) -> Inst
         return Install::Source(bin.into());
     }
     if let Some((pm, package)) = owner(bin) {
-        return if pm == "rpm" {
-            Install::Rpm { package }
-        } else {
-            Install::Pacman { package }
+        return match pm {
+            "rpm" => Install::Rpm { package },
+            "dpkg" => Install::Deb { package },
+            _ => Install::Pacman { package },
         };
     }
     let Some(dir) = bin.parent() else {
@@ -365,7 +370,7 @@ pub fn classify(bin: &Path, home: &Path, owner: impl Fn(&Path) -> Owner) -> Inst
     }
 }
 
-/// Ask rpm, then pacman, who owns `path`.
+/// Ask rpm, then dpkg, then pacman, who owns `path`.
 pub fn package_owner(path: &Path) -> Owner {
     let ask = |prog: &str, args: &[&str]| -> Option<String> {
         let o = std::process::Command::new(prog)
@@ -381,6 +386,12 @@ pub fn package_owner(path: &Path) -> Owner {
     };
     if let Some(p) = ask("rpm", &["-qf", "--qf", "%{NAME}\\n"]) {
         return Some(("rpm", p));
+    }
+    // `reeve: /usr/bin/reeve`
+    if let Some(p) = ask("dpkg", &["-S"]) {
+        if let Some((package, _)) = p.split_once(':') {
+            return Some(("dpkg", package.trim().to_string()));
+        }
     }
     ask("pacman", &["-Qoq"]).map(|p| ("pacman", p))
 }
@@ -433,6 +444,17 @@ pub fn tarball_name(target: &str) -> String {
 /// The release RPM for this machine.
 pub fn rpm_name(v: Version) -> String {
     format!("reeve-{v}-1.{}.rpm", std::env::consts::ARCH)
+}
+
+/// The release .deb for this machine (Debian names the architectures its
+/// own way).
+pub fn deb_name(v: Version) -> String {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    format!("reeve_{v}-1_{arch}.deb")
 }
 
 #[cfg(test)]
@@ -583,6 +605,13 @@ mod tests {
             classify(Path::new("/usr/bin/reeve"), home, pac),
             Install::Pacman {
                 package: "reeve-bin".into()
+            }
+        );
+        let deb = |_: &Path| Some(("dpkg", "reeve".to_string()));
+        assert_eq!(
+            classify(Path::new("/usr/bin/reeve"), home, deb),
+            Install::Deb {
+                package: "reeve".into()
             }
         );
         // Source builds win even if something claims to own them.

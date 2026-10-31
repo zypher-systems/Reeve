@@ -42,12 +42,14 @@ enum Kind {
     },
     /// The release RPM, through dnf.
     Rpm { dnf: String, downgrade: bool },
+    /// The release .deb, through apt-get.
+    Deb { downgrade: bool },
     /// The AUR helper.
     Aur { helper: String, package: String },
 }
 
 struct Plan {
-    /// For the receipt: `install.sh (/usr/local)`, `rpm`, `aur`.
+    /// For the receipt: `install.sh (/usr/local)`, `rpm`, `deb`, `aur`.
     method: String,
     tier: Tier,
     /// What will happen, in plain words, before asking.
@@ -260,6 +262,20 @@ fn plan(
                 kind: Kind::Rpm { dnf, downgrade },
             })
         }
+        Install::Deb { package } => {
+            let downgrade = to < running;
+            let allow = if downgrade { " --allow-downgrades" } else { "" };
+            Ok(Plan {
+                method: "deb".into(),
+                tier: Tier::T2,
+                describe: format!(
+                    "{head} ({package} is a Debian package)\nDownload {} from {}, check it against SHA256SUMS, then run: sudo apt-get install -y{allow} <that file>",
+                    update::deb_name(to),
+                    update::download_base(to)
+                ),
+                kind: Kind::Deb { downgrade },
+            })
+        }
         Install::Pacman { package } => {
             if !latest {
                 return Err(format!(
@@ -335,6 +351,16 @@ async fn execute(plan: &Plan, to: Version, dir: &Path) -> Result<String, String>
                 dnf,
             )?;
             Ok(format!("Reeve {to} installed with {dnf}"))
+        }
+        Kind::Deb { downgrade } => {
+            let deb = fetch_checked(dir, to, &update::deb_name(to)).await?;
+            let mut cmd = Command::new("sudo");
+            cmd.args(["apt-get", "install", "-y"]);
+            if *downgrade {
+                cmd.arg("--allow-downgrades");
+            }
+            status(cmd.arg(&deb), "apt-get")?;
+            Ok(format!("Reeve {to} installed with apt-get"))
         }
         Kind::Aur { helper, package } => {
             status(Command::new(helper).args(["-S", package.as_str()]), helper)?;

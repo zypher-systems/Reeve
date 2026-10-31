@@ -1,9 +1,17 @@
-# Build from source, offline, with the vendored crates each release ships
-# (reeve-<version>-vendor.tar.xz). Works with rpmbuild, mock, and COPR.
+# Build from source, offline, from the two tarballs each release ships: the
+# source (reeve-<version>.tar.gz, which unpacks as reeve-<version>/) and the
+# vendored crates (reeve-<version>-vendor.tar.xz). Works with rpmbuild, mock,
+# and COPR.
 #
-#   spectool -g -R packaging/fedora/reeve.spec && rpmbuild -ba packaging/fedora/reeve.spec
+#   spectool -g -R reeve.spec && rpmbuild -ba reeve.spec
 #
-# The release also ships a prebuilt RPM (static binary) for quick installs.
+# The copy attached to each release has the two sources' checksums filled in
+# below, so a downstream build pins them; in the repository they're empty and
+# the check is skipped. The release also ships a prebuilt RPM (static
+# binary) for quick installs.
+
+%global source0_sha256 %{nil}
+%global source1_sha256 %{nil}
 
 # Rust attributes (`#![deny(...)]`) in vendored sources look like shebangs
 # to the checker that scans the debug sources.
@@ -16,7 +24,7 @@ Summary:        An operator agent that manages this computer, with receipts
 
 License:        Apache-2.0
 URL:            https://github.com/zypher-systems/reeve
-Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
+Source0:        %{url}/releases/download/v%{version}/%{name}-%{version}.tar.gz
 Source1:        %{url}/releases/download/v%{version}/%{name}-%{version}-vendor.tar.xz
 
 BuildRequires:  cargo >= 1.88
@@ -41,6 +49,8 @@ can be undone. The reeved user service watches the machine, learns what
 normal looks like, and tells you when something needs a look.
 
 %prep
+if [ -n "%{source0_sha256}" ]; then echo "%{source0_sha256}  %{SOURCE0}" | sha256sum --check --quiet; fi
+if [ -n "%{source1_sha256}" ]; then echo "%{source1_sha256}  %{SOURCE1}" | sha256sum --check --quiet; fi
 %autosetup -n %{name}-%{version}
 tar -xJf %{SOURCE1}
 mkdir -p .cargo
