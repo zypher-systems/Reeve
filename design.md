@@ -302,7 +302,9 @@ confidence, tags, OS version).
 3. **Verify.** Reeve checks that the symptom is gone: the unit is active, the error rate is back
    to baseline, or the disk is below its threshold.
 4. **Reflect.** At session end, a cheap model reads the session and proposes new facts, a
-   new or updated runbook with its outcome, and preference candidates.
+   new or updated runbook with its outcome, and preference candidates. A runbook's "worked"
+   counts only when the receipts bear it out: a verified change passed its checks, or something
+   ran and nothing failed. Otherwise the runbook is left out, and the summary says so.
 5. **Review.** Facts and runbooks are written with provenance and show as "new" in the Memory
    panel. Preferences wait for your yes.
 
@@ -776,7 +778,7 @@ pacman and apt pass, and the dev → main PR has its two external reviews.
 4. **A .deb** in the release workflow, since the servers it's wanted on are Debian; install.sh stays.
    M.
 5. **A runbook "worked" only with evidence** (G19): reflection counts a success only when the
-   session has a verified change or no failed receipt. S.
+   session has a verified change or no failed receipt. S. *In dev as of 2026-10-30 (§7, step 4).*
 6. **Locked updates for shared files** (G17): settings and order state use the lock the receipts
    already use. S.
 
