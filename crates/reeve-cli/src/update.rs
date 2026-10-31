@@ -23,7 +23,7 @@ use std::process::{Command, Stdio};
 use reeve_core::distro::Distro;
 use reeve_core::policy::Tier;
 use reeve_core::receipts::{Receipt, ReceiptBook, Status};
-use reeve_core::update::{self, Install, UpdateState, Version};
+use reeve_core::update::{self, Install, Source, UpdateState, Version};
 
 /// What `reeve update` was asked to do.
 pub struct Opts {
@@ -251,7 +251,7 @@ fn plan(
                 },
             })
         }
-        Install::Rpm { package, repo } => {
+        Install::Rpm { package, source } => {
             // Image-based Fedora layers packages with rpm-ostree; the package
             // tools refuse there, and so does this.
             if let Some(why) = distro.package_block() {
@@ -263,83 +263,101 @@ fn plan(
             };
             let downgrade = to < running;
             let verb = if downgrade { "downgrade" } else { "upgrade" };
-            if let Some(repo) = repo {
+            match source {
                 // A repository's build stays the one installed: the version
-                // comes from the repository, signed its way, or nothing changes.
-                let spec = format!("{package}-{to}");
-                return Ok(Plan {
-                    method: format!("rpm ({repo})"),
+                // comes from that repository and no other, signed its way,
+                // or nothing changes.
+                Source::Repo(repo) => {
+                    let spec = format!("{package}-{to}");
+                    // dnf5 takes the named items from the repository and
+                    // dependencies from anywhere; dnf 4 can only narrow to it.
+                    let only = if dnf == "dnf5" {
+                        format!("--from-repo={repo}")
+                    } else {
+                        format!("--repo={repo}")
+                    };
+                    Ok(Plan {
+                        method: format!("rpm ({repo})"),
+                        tier: Tier::T2,
+                        describe: format!(
+                            "{head} ({package} comes from the {repo} repository)\nRun: sudo {dnf} {verb} -y {only} {spec}. If {repo} doesn't have {to} yet, nothing changes."
+                        ),
+                        kind: Kind::Repo {
+                            command: vec![dnf, verb.into(), "-y".into(), only, spec],
+                            repo: repo.clone(),
+                        },
+                    })
+                }
+                Source::Unknown(why) => Err(format!(
+                    "{package} is an RPM, but where it came from couldn't be told ({why}), so `reeve update` won't replace it. Update it with {dnf}, or reinstall the release's RPM yourself."
+                )),
+                Source::ByHand => Ok(Plan {
+                    method: "rpm".into(),
                     tier: Tier::T2,
                     describe: format!(
-                        "{head} ({package} comes from the {repo} repository)\nRun: sudo {dnf} {verb} -y {spec}. If {repo} doesn't have {to} yet, nothing changes."
+                        "{head} ({package} is an RPM)\nDownload {} from {}, check it against SHA256SUMS, then run: sudo {dnf} {verb} -y <that file>",
+                        update::rpm_name(to),
+                        update::download_base(to)
                     ),
-                    kind: Kind::Repo {
-                        command: vec![dnf, verb.into(), "-y".into(), spec],
-                        repo: repo.clone(),
-                    },
-                });
+                    kind: Kind::Rpm { dnf, downgrade },
+                }),
             }
-            Ok(Plan {
-                method: "rpm".into(),
-                tier: Tier::T2,
-                describe: format!(
-                    "{head} ({package} is an RPM)\nDownload {} from {}, check it against SHA256SUMS, then run: sudo {dnf} {verb} -y <that file>",
-                    update::rpm_name(to),
-                    update::download_base(to)
-                ),
-                kind: Kind::Rpm { dnf, downgrade },
-            })
         }
-        Install::Deb { package, repo } => {
+        Install::Deb { package, source } => {
             let downgrade = to < running;
             let allow = if downgrade { " --allow-downgrades" } else { "" };
-            if let Some(repo) = repo {
+            match source {
                 // apt installs an exact version: the repository's build of
                 // `to`, whatever revision it gave it.
-                let Some(version) = repo
-                    .versions
-                    .iter()
-                    .find(|v| **v == to.to_string() || v.starts_with(&format!("{to}-")))
-                else {
-                    let has = if repo.versions.is_empty() {
-                        "nothing listed".to_string()
-                    } else {
-                        repo.versions.join(", ")
+                Source::Repo(repo) => {
+                    let Some(version) = repo
+                        .versions
+                        .iter()
+                        .find(|v| **v == to.to_string() || v.starts_with(&format!("{to}-")))
+                    else {
+                        let has = if repo.versions.is_empty() {
+                            "nothing listed".to_string()
+                        } else {
+                            repo.versions.join(", ")
+                        };
+                        return Err(format!(
+                            "{package} comes from the {} repository, which doesn't have {to} in what apt last fetched ({has}); run `sudo apt-get update` and try again, or wait for the repository",
+                            repo.name
+                        ));
                     };
-                    return Err(format!(
-                        "{package} comes from the {} repository, which doesn't have {to} in what apt last fetched ({has}); run `sudo apt-get update` and try again, or wait for the repository",
-                        repo.name
-                    ));
-                };
-                let spec = format!("{package}={version}");
-                let mut command = vec!["apt-get".to_string(), "install".into(), "-y".into()];
-                if downgrade {
-                    command.push("--allow-downgrades".into());
+                    let spec = format!("{package}={version}");
+                    let mut command = vec!["apt-get".to_string(), "install".into(), "-y".into()];
+                    if downgrade {
+                        command.push("--allow-downgrades".into());
+                    }
+                    command.push(spec.clone());
+                    Ok(Plan {
+                        method: format!("deb ({})", repo.name),
+                        tier: Tier::T2,
+                        describe: format!(
+                            "{head} ({package} comes from the {} repository)\nRun: sudo apt-get install -y{allow} {spec}",
+                            repo.name
+                        ),
+                        kind: Kind::Repo {
+                            command,
+                            repo: repo.name.clone(),
+                        },
+                    })
                 }
-                command.push(spec.clone());
-                return Ok(Plan {
-                    method: format!("deb ({})", repo.name),
+                Source::Unknown(why) => Err(format!(
+                    "{package} is a Debian package, but where it came from couldn't be told ({why}), so `reeve update` won't replace it. Update it with apt, or reinstall the release's .deb yourself."
+                )),
+                Source::ByHand => Ok(Plan {
+                    method: "deb".into(),
                     tier: Tier::T2,
                     describe: format!(
-                        "{head} ({package} comes from the {} repository)\nRun: sudo apt-get install -y{allow} {spec}",
-                        repo.name
+                        "{head} ({package} is a Debian package)\nDownload {} from {}, check it against SHA256SUMS, then run: sudo apt-get install -y{allow} <that file>",
+                        update::deb_name(to),
+                        update::download_base(to)
                     ),
-                    kind: Kind::Repo {
-                        command,
-                        repo: repo.name.clone(),
-                    },
-                });
+                    kind: Kind::Deb { downgrade },
+                }),
             }
-            Ok(Plan {
-                method: "deb".into(),
-                tier: Tier::T2,
-                describe: format!(
-                    "{head} ({package} is a Debian package)\nDownload {} from {}, check it against SHA256SUMS, then run: sudo apt-get install -y{allow} <that file>",
-                    update::deb_name(to),
-                    update::download_base(to)
-                ),
-                kind: Kind::Deb { downgrade },
-            })
         }
         Install::Pacman { package } => {
             if !latest {
@@ -564,32 +582,66 @@ mod tests {
         let (running, to) = (v("0.8.0"), v("0.8.1"));
         let from_repo = Install::Rpm {
             package: "reeve".into(),
-            repo: Some("kinetic".into()),
+            source: Source::Repo("kinetic".into()),
         };
         let p = plan(&from_repo, me, running, to, true, &fedora()).unwrap();
         assert_eq!(p.method, "rpm (kinetic)");
         assert!(p.describe.contains("kinetic repository"), "{}", p.describe);
         match &p.kind {
             Kind::Repo { command, repo } => {
-                assert_eq!(command, &["dnf5", "upgrade", "-y", "reeve-0.8.1"]);
+                // From that repository and no other.
+                assert_eq!(
+                    command,
+                    &[
+                        "dnf5",
+                        "upgrade",
+                        "-y",
+                        "--from-repo=kinetic",
+                        "reeve-0.8.1"
+                    ]
+                );
                 assert_eq!(repo, "kinetic");
             }
             _ => panic!("not through the repository"),
         }
+        let dnf4 = Distro::Fedora {
+            dnf: "dnf".into(),
+            atomic: false,
+        };
+        let p = plan(&from_repo, me, running, to, true, &dnf4).unwrap();
+        assert!(matches!(
+            &p.kind,
+            Kind::Repo { command, .. }
+                if command == &["dnf", "upgrade", "-y", "--repo=kinetic", "reeve-0.8.1"]
+        ));
         // Going back goes back through the repository too.
         let back = plan(&from_repo, me, to, running, false, &fedora()).unwrap();
-        assert!(
-            matches!(&back.kind, Kind::Repo { command, .. } if command[1] == "downgrade" && command[3] == "reeve-0.8.0")
-        );
+        assert!(matches!(
+            &back.kind,
+            Kind::Repo { command, .. }
+                if command[1] == "downgrade" && command[4] == "reeve-0.8.0"
+        ));
         // A file installed by hand gets the release's own RPM, as before.
         let by_hand = Install::Rpm {
             package: "reeve".into(),
-            repo: None,
+            source: Source::ByHand,
         };
         let p = plan(&by_hand, me, running, to, true, &fedora()).unwrap();
         assert_eq!(p.method, "rpm");
         assert!(p.describe.contains(&update::rpm_name(to)), "{}", p.describe);
         assert!(matches!(p.kind, Kind::Rpm { .. }));
+        // An origin that couldn't be told is refused, not taken for a hand install.
+        let unknown = Install::Rpm {
+            package: "reeve".into(),
+            source: Source::Unknown("dnf didn't answer".into()),
+        };
+        let e = plan(&unknown, me, running, to, true, &fedora())
+            .err()
+            .expect("refused");
+        assert!(
+            e.contains("couldn't be told") && e.contains("dnf didn't answer"),
+            "{e}"
+        );
 
         let debian = Distro::Debian {
             id: "debian".into(),
@@ -600,19 +652,23 @@ mod tests {
         };
         let from_repo = Install::Deb {
             package: "reeve".into(),
-            repo: Some(repo.clone()),
+            source: Source::Repo(repo.clone()),
         };
         let p = plan(&from_repo, me, running, to, true, &debian).unwrap();
         assert_eq!(p.method, "deb (repo.example.org)");
-        assert!(
-            matches!(&p.kind, Kind::Repo { command, .. } if command == &["apt-get", "install", "-y", "reeve=0.8.1-1"])
-        );
+        assert!(matches!(
+            &p.kind,
+            Kind::Repo { command, .. }
+                if command == &["apt-get", "install", "-y", "reeve=0.8.1-1"]
+        ));
         // The repository's revision, whatever it is, and a downgrade allowed
         // only when going back.
         let back = plan(&from_repo, me, to, v("0.7.2"), false, &debian).unwrap();
-        assert!(
-            matches!(&back.kind, Kind::Repo { command, .. } if command == &["apt-get", "install", "-y", "--allow-downgrades", "reeve=0.7.2-1"])
-        );
+        assert!(matches!(
+            &back.kind,
+            Kind::Repo { command, .. }
+                if command == &["apt-get", "install", "-y", "--allow-downgrades", "reeve=0.7.2-1"]
+        ));
         // Not in the repository yet: nothing runs, and the reason says what is.
         let e = plan(&from_repo, me, running, v("0.9.0"), true, &debian)
             .err()
@@ -623,10 +679,15 @@ mod tests {
         );
         let by_hand = Install::Deb {
             package: "reeve".into(),
-            repo: None,
+            source: Source::ByHand,
         };
         let p = plan(&by_hand, me, running, to, true, &debian).unwrap();
         assert_eq!(p.method, "deb");
         assert!(p.describe.contains(&update::deb_name(to)), "{}", p.describe);
+        let unknown = Install::Deb {
+            package: "reeve".into(),
+            source: Source::Unknown("apt-cache didn't answer".into()),
+        };
+        assert!(plan(&unknown, me, running, to, true, &debian).is_err());
     }
 }

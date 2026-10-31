@@ -84,7 +84,8 @@ pub struct Evidence {
     pub verified: bool,
     /// An action failed.
     pub failed: bool,
-    /// Anything ran at all.
+    /// Anything ran at all: an action that finished or failed, not one the
+    /// owner or the policy said no to.
     pub acted: bool,
 }
 
@@ -96,7 +97,9 @@ impl Evidence {
                 .iter()
                 .any(|r| r.tool == "change_commit" && r.outcome.status == Status::Ok),
             failed: receipts.iter().any(|r| r.outcome.status == Status::Error),
-            acted: !receipts.is_empty(),
+            acted: receipts
+                .iter()
+                .any(|r| matches!(r.outcome.status, Status::Ok | Status::Error)),
         }
     }
 
@@ -528,6 +531,11 @@ mod tests {
         // Everything ran and nothing failed.
         let clean = Evidence::of(&[receipt("svc_restart", Status::Ok)]);
         assert_eq!(count(clean, "d"), (1, 0));
+        // An action the owner declined, or the policy refused, never ran.
+        for never_ran in [Status::Denied, Status::Refused] {
+            let ev = Evidence::of(&[receipt("svc_restart", never_ran)]);
+            assert!(!ev.acted && !ev.supports_success(), "{never_ran:?}");
+        }
         // "failed" needs no evidence: it only lowers confidence.
         let mut out = Reflected::default();
         apply(

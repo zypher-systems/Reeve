@@ -44,10 +44,19 @@ const DRAFT_BACKSTOP: Duration = Duration::from_secs(35 * 60);
 /// A piece of work run beside the loop.
 type Task<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-/// What the 6-hourly checks found.
+/// What the 6-hourly checks found, and which kinds of finding they can
+/// speak for: a kind whose probe didn't run gets no verdict, so its
+/// findings are left as they were.
 struct Checks {
     signals: Vec<Signal>,
+    verdicts: Vec<&'static str>,
 }
+
+/// The kinds the checks maintain, and how to name each.
+const CHECK_KINDS: [(&str, &str); 2] = [
+    ("reboot-pending", "a pending reboot"),
+    ("updates-security", "security updates"),
+];
 
 /// Work that ran beside the loop, reporting back.
 enum Done {
@@ -550,14 +559,15 @@ impl Observer {
         });
     }
 
-    /// Record what the checks found. Checks that didn't finish say so and
-    /// resolve nothing: a finding they didn't see isn't gone.
+    /// Record what the checks found. A kind whose probe didn't run, or a
+    /// round that didn't finish, resolves nothing of its own: a finding the
+    /// checks didn't see isn't gone.
     fn finish_checks(&mut self, out: Option<Checks>) {
         self.checking = None;
         let now = Utc::now();
         let Some(c) = out else {
             self.status.last_error = Some(format!(
-                "the 6-hourly checks didn't finish in {} minutes; nothing was resolved",
+                "the 6-hourly checks didn't finish in {} minutes, or no probe ran; nothing was resolved",
                 CHECKS_DEADLINE.as_secs() / 60
             ));
             return;
@@ -568,8 +578,19 @@ impl Observer {
                 self.pending_notify.push(f.id);
             }
         }
-        for kind in ["reboot-pending", "updates-security"] {
+        for kind in &c.verdicts {
             let _ = self.store.resolve_missing(kind, &ids, now);
+        }
+        let silent: Vec<&str> = CHECK_KINDS
+            .iter()
+            .filter(|(kind, _)| !c.verdicts.contains(kind))
+            .map(|(_, what)| *what)
+            .collect();
+        if !silent.is_empty() {
+            self.status.last_error = Some(format!(
+                "the 6-hourly checks couldn't ask about {}; those findings were left as they were",
+                silent.join(" or ")
+            ));
         }
     }
 
@@ -577,8 +598,13 @@ impl Observer {
     /// draft stops itself after `drafter::DEADLINE`; this is the backstop
     /// for one stuck in a call that never returns, and it writes the note
     /// on the finding, so the next pass doesn't pick it again.
-    fn start_draft<F>(&mut self, tx: &mpsc::Sender<Done>, id: String, pass: F)
-    where
+    fn start_draft<F>(
+        &mut self,
+        tx: &mpsc::Sender<Done>,
+        id: String,
+        episode: chrono::DateTime<Utc>,
+        pass: F,
+    ) where
         F: Future<Output = drafter::Pass> + Send + 'static,
     {
         if self.drafting.is_some() {
@@ -594,10 +620,16 @@ impl Observer {
                         "the draft was cut off after {} minutes in a model call that never returned; what that call cost may be missing from the ledger",
                         DRAFT_BACKSTOP.as_secs() / 60
                     );
+                    // The note goes on the finding as it is now, and only
+                    // while it's still this episode and open.
                     let store = FindingStore::new(&home);
                     if let Some(mut f) = store.get(&id) {
-                        f.draft_note = Some(why.clone());
-                        let _ = store.put(&f);
+                        if f.first_seen == episode
+                            && f.status == reeve_core::findings::FindingStatus::Open
+                        {
+                            f.draft_note = Some(why.clone());
+                            let _ = store.put(&f);
+                        }
                     }
                     drafter::Pass::Blocked(why)
                 }
@@ -650,82 +682,117 @@ impl Observer {
 }
 
 /// The 6-hourly checks: the running kernel against the newest installed,
-/// and security updates. `None` when a probe couldn't run: no verdict.
+/// and security updates. Each kind gets a verdict only when every probe
+/// behind it ran and succeeded; a probe that didn't (its tool missing,
+/// failing, or timing out) is no verdict, where an empty answer used to read
+/// as "no newer kernel" or "no advisories". `None` when nothing ran.
 async fn gather_checks() -> Option<Checks> {
-    let mut signals = Vec::new();
+    let mut c = Checks {
+        signals: Vec::new(),
+        verdicts: Vec::new(),
+    };
     let running = run("uname -r").await?;
+    let running = running.trim();
     use reeve_core::distro::Distro;
-    let adv = match Distro::detect() {
+    let advisories = match Distro::detect() {
         Distro::Arch { .. } => {
-            let present = run("test -d \"/usr/lib/modules/$(uname -r)\" && echo yes").await?;
-            signals.extend(detect::kernel_replaced(
-                running.trim(),
-                present.trim() == "yes",
-            ));
-            // arch-audit (when installed) knows the advisories with a fix out.
-            run("command -v arch-audit >/dev/null && timeout 120 arch-audit -u 2>/dev/null").await?
+            // The negative is an answer, so the probe says it and exits 0.
+            if let Some(present) =
+                run("if [ -d \"/usr/lib/modules/$(uname -r)\" ]; then echo yes; else echo no; fi")
+                    .await
+            {
+                c.signals
+                    .extend(detect::kernel_replaced(running, present.trim() == "yes"));
+                c.verdicts.push("reboot-pending");
+            }
+            // arch-audit (when installed) knows the advisories with a fix
+            // out; without it there's no verdict on security updates.
+            run("command -v arch-audit >/dev/null && timeout 120 arch-audit -u 2>/dev/null").await
         }
         Distro::Debian { .. } => {
             // A newer kernel package (a new ABI is a new name; debug
             // symbols aren't kernels, and the unsigned build is the same
             // ABI), or the running one rebuilt under the same name (its
             // package version no longer matches /proc/version's build),
-            // or the flag the kernel's postinst leaves.
-            let newest = run(
-                "dpkg-query -W -f='${db:Status-Status} ${Package}\\n' 'linux-image-[0-9]*' 2>/dev/null \
-                 | awk '$1==\"installed\" && $2 !~ /-dbg(sym)?$/ {sub(/-unsigned$/, \"\", $2); print substr($2, 13)}' | sort -V | tail -n 1",
-            )
-            .await?;
-            signals.extend(detect::reboot_pending(running.trim(), newest.trim()));
-            let installed =
-                run("dpkg-query -W -f='${Version}' \"linux-image-$(uname -r)\" 2>/dev/null")
-                    .await?;
-            let proc = run("cat /proc/version").await?;
-            signals.extend(detect::kernel_rebuilt(
-                running.trim(),
-                installed.trim(),
-                &proc,
-            ));
-            let flagged = run(
-                "test -f /var/run/reboot-required && cat /var/run/reboot-required.pkgs 2>/dev/null; \
-                 test -f /var/run/reboot-required && echo",
-            )
-            .await?;
-            signals.extend(detect::reboot_required(&flagged));
+            // or the flag the kernel's postinst leaves. dpkg-query exits 1
+            // for "no such package", which is an answer; anything else isn't.
+            let reboot = async {
+                let newest = run(
+                    "dpkg-query -W -f='${db:Status-Status} ${Package}\\n' 'linux-image-[0-9]*' 2>/dev/null \
+                     | awk '$1==\"installed\" && $2 !~ /-dbg(sym)?$/ {sub(/-unsigned$/, \"\", $2); print substr($2, 13)}' | sort -V | tail -n 1",
+                )
+                .await?;
+                let installed = run(
+                    "dpkg-query -W -f='${Version}' \"linux-image-$(uname -r)\" 2>/dev/null || [ $? -eq 1 ]",
+                )
+                .await?;
+                let proc = run("cat /proc/version").await?;
+                let flagged = run(
+                    "if [ -f /var/run/reboot-required ]; then cat /var/run/reboot-required.pkgs 2>/dev/null; echo; fi",
+                )
+                .await?;
+                let mut s = Vec::new();
+                s.extend(detect::reboot_pending(running, newest.trim()));
+                s.extend(detect::kernel_rebuilt(running, installed.trim(), &proc));
+                s.extend(detect::reboot_required(&flagged));
+                Some(s)
+            }
+            .await;
+            if let Some(s) = reboot {
+                c.signals.extend(s);
+                c.verdicts.push("reboot-pending");
+            }
             // Updates from a security suite, as of the last apt-get
             // update: the archive in the parentheses says, not the name.
             run(
                 "timeout 120 apt-get -s -q upgrade --with-new-pkgs 2>/dev/null \
                  | awk '/^Inst / {s=$0; sub(/^[^(]*\\(/, \"\", s); if (s ~ /[Ss]ecurity/) print $2}'",
             )
-            .await?
+            .await
         }
         Distro::Fedora { .. } | Distro::Other(_) => {
-            let newest = run("rpm -q kernel-core --last 2>/dev/null | head -n 1 | awk '{print $1}' | sed 's/^kernel-core-//'").await?;
-            signals.extend(detect::reboot_pending(running.trim(), newest.trim()));
-            run("command -v dnf5 >/dev/null && timeout 120 dnf5 -q advisory list --security --updates 2>/dev/null | tail -n +2").await?
+            // awk reads all of rpm's output, so rpm is never cut off, and
+            // the pipeline's status is rpm's when rpm fails.
+            if let Some(newest) = run(
+                "rpm -q kernel-core --last 2>/dev/null | awk 'NR==1{print $1}' | sed 's/^kernel-core-//'",
+            )
+            .await
+            {
+                c.signals
+                    .extend(detect::reboot_pending(running, newest.trim()));
+                c.verdicts.push("reboot-pending");
+            }
+            run("command -v dnf5 >/dev/null && timeout 120 dnf5 -q advisory list --security --updates 2>/dev/null | tail -n +2").await
         }
     };
-    let lines: Vec<String> = adv
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(String::from)
-        .collect();
-    signals.extend(detect::security_updates(lines.len(), &lines));
-    Some(Checks { signals })
+    if let Some(adv) = advisories {
+        let lines: Vec<String> = adv
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(String::from)
+            .collect();
+        c.signals
+            .extend(detect::security_updates(lines.len(), &lines));
+        c.verdicts.push("updates-security");
+    }
+    (!c.verdicts.is_empty()).then_some(c)
 }
 
-/// Run a probe; `None` when it couldn't be started. The child dies with the
-/// future, so a dropped (timed out) check leaves no process behind.
+/// Run a probe in bash with `pipefail`: its output only when it exited 0,
+/// so a tool that is missing, fails, or is killed by `timeout` is `None`,
+/// and so is a pipeline whose producer failed. The child dies with the
+/// future, so a dropped (timed out) round leaves no process behind.
 async fn run(cmd: &str) -> Option<String> {
-    tokio::process::Command::new("bash")
-        .args(["--noprofile", "--norc", "-c", cmd])
+    let o = tokio::process::Command::new("bash")
+        .args(["--noprofile", "--norc", "-o", "pipefail", "-c", cmd])
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true)
         .output()
         .await
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .ok()
+        .ok()?;
+    o.status
+        .success()
+        .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
 fn prune_metrics(dir: &Path, days: i64) {
@@ -927,9 +994,9 @@ impl Loop {
         let Some(f) = drafter::next(&self.obs.store, &self.cfg) else {
             return;
         };
-        let id = f.id.clone();
+        let (id, episode) = (f.id.clone(), f.first_seen);
         let pass = (self.draft_with)(self.home.clone(), self.cfg.clone(), self.profile.clone(), f);
-        self.obs.start_draft(&self.done_tx, id, pass);
+        self.obs.start_draft(&self.done_tx, id, episode, pass);
     }
 }
 
@@ -1076,7 +1143,12 @@ mod tests {
         obs.start_checks(&tx, std::future::pending());
         assert!(obs.checking.is_some());
         // Ignored while one runs.
-        obs.start_checks(&tx, async { Some(Checks { signals: vec![] }) });
+        obs.start_checks(&tx, async {
+            Some(Checks {
+                signals: vec![],
+                verdicts: vec![],
+            })
+        });
         let Some(Done::Checks(out)) = rx.recv().await else {
             panic!("the checks report back")
         };
@@ -1097,7 +1169,12 @@ mod tests {
             "a finding the checks didn't see isn't gone"
         );
         // Checks that finish and don't see it resolve it.
-        obs.start_checks(&tx, async { Some(Checks { signals: vec![] }) });
+        obs.start_checks(&tx, async {
+            Some(Checks {
+                signals: vec![],
+                verdicts: vec!["reboot-pending", "updates-security"],
+            })
+        });
         let Some(Done::Checks(out)) = rx.recv().await else {
             panic!("the checks report back")
         };
@@ -1106,5 +1183,50 @@ mod tests {
             obs.store.get("reboot-pending").unwrap().status,
             FindingStatus::Resolved
         );
+    }
+
+    #[test]
+    fn a_probe_that_did_not_run_leaves_its_findings_alone() {
+        use reeve_core::findings::FindingStatus;
+        let home = tempfile::tempdir().unwrap();
+        let mut obs = Observer::new(home.path().to_path_buf());
+        obs.store
+            .observe(sig("reboot-pending"), Utc::now())
+            .unwrap();
+        obs.store
+            .observe(sig("updates-security"), Utc::now())
+            .unwrap();
+        // Only the advisory probe ran this round.
+        obs.finish_checks(Some(Checks {
+            signals: vec![],
+            verdicts: vec!["updates-security"],
+        }));
+        assert_eq!(
+            obs.store.get("updates-security").unwrap().status,
+            FindingStatus::Resolved
+        );
+        assert_eq!(
+            obs.store.get("reboot-pending").unwrap().status,
+            FindingStatus::Open,
+            "no probe spoke for it"
+        );
+        let note = obs.status.last_error.clone().unwrap_or_default();
+        assert!(note.contains("a pending reboot"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn a_probe_is_an_answer_only_when_it_succeeds() {
+        assert_eq!(run("printf hi").await.as_deref(), Some("hi"));
+        // The negative of a test is said, not exited.
+        assert_eq!(
+            run("if [ -f /nonexistent/flag ]; then echo yes; else echo no; fi")
+                .await
+                .as_deref(),
+            Some("no\n")
+        );
+        assert_eq!(run("exit 42").await, None);
+        // A producer that failed into a consumer that didn't.
+        assert_eq!(run("false | cat").await, None);
+        assert_eq!(run("nonexistent-tool-xyz 2>/dev/null | cat").await, None);
     }
 }
