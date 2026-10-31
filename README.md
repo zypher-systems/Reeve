@@ -4,7 +4,7 @@ An **operator harness**: an agent that runs on your computer and manages it for 
 coding agent. It keeps the machine healthy, tidy, and configured. It gives receipts for everything
 it does, and it learns how your system behaves.
 
-> **Status: 0.7 (Fedora, Arch, and Debian; standing orders; skills).** Reeve manages this machine with you:
+> **Status: 0.8 (Fedora, Arch, and Debian; standing orders; skills; signed releases).** Reeve manages this machine with you:
 > - files anywhere, including root-owned ones
 > - packages, services, logs, and processes
 > - shell, with `sudo` through its own password prompt

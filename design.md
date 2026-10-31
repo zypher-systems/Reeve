@@ -761,7 +761,7 @@ what stops daily use first, what makes unattended work trustworthy second, and t
 last. Sizes: S is under half a day, M one or two days, L a week or more. Every fix lands with a
 regression test that fails on 0.7.1.
 
-**Release A, fixes only (a PATCH): in dev as of 2026-10-29, ships when the owner cuts it**
+**Release A, fixes only (a PATCH): shipped as 0.7.2 on 2026-10-30**
 
 - The sudo password is asked once per `password_minutes`, not every other root step (the remembered
   password is keyed on the sudo asking; DECISIONS 2026-10-29).
@@ -782,7 +782,8 @@ regression test that fails on 0.7.1.
 Done when: `cargo test --workspace`, clippy and fmt pass (they do), the live container tests for
 pacman and apt pass, and the dev → main PR has its two external reviews.
 
-**Release B, features (a MINOR)**
+**Release B, features (a MINOR): items 1, 4, 5 and 6 ship as 0.8.0 (2026-10-31), with signed releases
+and repository-aware updates besides; 2 and 3 remain**
 
 1. **The observer loop never blocks** (G10). Slow checks and the drafter run as supervised tasks
    with deadlines, like orders already do; sampling, the heartbeat and the scheduler keep their

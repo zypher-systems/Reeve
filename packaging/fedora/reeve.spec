@@ -18,7 +18,7 @@
 %global __brp_mangle_shebangs_exclude_from ^/usr/src/debug/.*$
 
 Name:           reeve
-Version:        0.7.2
+Version:        0.8.0
 Release:        1%{?dist}
 Summary:        An operator agent that manages this computer, with receipts
 
@@ -87,6 +87,13 @@ install -Dpm 0644 packaging/systemd/reeved.service %{buildroot}%{_userunitdir}/r
 %{_userunitdir}/reeved.service
 
 %changelog
+* Sat Oct 31 2026 Zypher Systems <zypher@zyphersystems.com> - 0.8.0-1
+- reeved never waits on a model call or a package query: checks and drafts run beside the loop, with deadlines.
+- Releases are signed (SHA256SUMS.sig); the installer and reeve update install only a signed release.
+- A .deb next to the RPM; the release ships its source tarball and this spec with checksums filled in.
+- reeve update updates a package from a repository through that repository, by version.
+- A runbook counts a success only when the receipts show it; settings and order state change under a lock.
+
 * Thu Oct 29 2026 Zypher Systems <zypher@zyphersystems.com> - 0.7.2-1
 - The sudo password is asked once per five minutes, not once per root step; [approvals] password_minutes sets it.
 - Standing orders count every start against runs_per_day, and "run now" requests all run, one a tick.
