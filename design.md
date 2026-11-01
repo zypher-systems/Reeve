@@ -797,6 +797,9 @@ pacman and apt pass, and the dev → main PR has its two external reviews.
 **Release B, features (a MINOR): items 1, 4, 5 and 6 ship as 0.8.0 (2026-10-31), with signed releases
 and repository-aware updates besides; 2 and 3 remain**
 
+*0.9.0 (2026-11-01) adds Anthropic's own API as a connection kind (DECISIONS 2026-11-01); 2 and 3
+still remain.*
+
 1. **The observer loop never blocks** (G10). Slow checks and the drafter run as supervised tasks
    with deadlines, like orders already do; sampling, the heartbeat and the scheduler keep their
    cadence while a model call takes minutes. M. *In dev as of 2026-10-30 (§8, "Nothing waits on
