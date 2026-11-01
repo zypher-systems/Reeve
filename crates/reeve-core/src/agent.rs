@@ -447,6 +447,13 @@ impl Agent {
         &mut self,
         dir: &std::path::Path,
     ) -> Result<crate::memory::reflect::Reflected> {
+        // The same gate as a turn: reflection is a model call like any other.
+        let totals = ledger::totals(&self.home, Local::now());
+        if let Some(why) = ledger::over_cap(&self.cfg.spend, &self.tally, &totals) {
+            return Err(Error::Budget(format!(
+                "{why}. Raise it in [spend] to continue."
+            )));
+        }
         let mut meta =
             crate::session::load_meta(dir).ok_or_else(|| Error::Io("no such session".into()))?;
         let transcript = if dir == self.session.dir {
@@ -470,14 +477,7 @@ impl Agent {
             &self.tools.os,
         )
         .await?;
-        let (usd, priced_by) = match out.reported_usd {
-            Some(c) => (Some(c), Some("provider")),
-            None if self.local => (Some(0.0), Some("local")),
-            None => {
-                let c = self.book.cost(&self.model, out.usage);
-                (c, c.map(|_| "book"))
-            }
-        };
+        let (usd, priced_by) = self.price(out.usage, out.reported_usd);
         ledger::record(
             &self.home,
             &SpendRecord {
@@ -1076,7 +1076,10 @@ impl Agent {
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<String> {
         self.change_allowed = false;
-        let Some(t) = self.txn.take() else {
+        // The change stays open through the wait, the checks and the
+        // rollback: a turn stopped here (the TUI drops its future) leaves
+        // it for the next change_commit, or the end of a turn, to finish.
+        let Some(t) = self.txn.as_ref() else {
             emit(AgentEvent::ToolStarted {
                 id: id.into(),
                 tool: "change_commit".into(),
@@ -1109,7 +1112,6 @@ impl Agent {
                 "Reeve can't write its receipts ({e}), so it can't record a verdict on change {} or roll it back; nothing was touched, and the change stays open until that's fixed",
                 t.id
             );
-            self.txn = Some(t);
             emit(AgentEvent::ToolFinished {
                 id: id.into(),
                 status: Status::Error,
@@ -1120,7 +1122,14 @@ impl Agent {
             return Err(Error::Io(msg));
         }
         let passed = results.iter().all(|r| r.ok);
-        let mut rolled = Vec::new();
+        // Changes undone before this verdict (a rollback that was stopped
+        // partway, or the owner's own undo) stay undone, and count as such.
+        let mut rolled: Vec<(u64, u64)> = t
+            .changes
+            .iter()
+            .filter_map(|s| self.receipts.undone_by(*s).map(|u| (*s, u)))
+            .collect();
+        let already = rolled.len();
         let mut stuck: Vec<(u64, String)> = t
             .unrevertable
             .iter()
@@ -1129,6 +1138,9 @@ impl Agent {
         if !passed {
             let by = format!("txn:{}", t.id);
             for seq in t.changes.iter().rev() {
+                if rolled.iter().any(|(s, _)| s == seq) {
+                    continue;
+                }
                 match tools::undo_receipt_by(
                     &self.tools,
                     &self.receipts,
@@ -1147,6 +1159,7 @@ impl Agent {
             }
             stuck.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
         }
+        rolled.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
         let failed: Vec<&str> = results
             .iter()
             .filter(|r| !r.ok)
@@ -1155,6 +1168,13 @@ impl Agent {
         let summary = if passed {
             if t.changes.is_empty() && t.unrevertable.is_empty() {
                 format!("verified, no changes made: {}", t.goal)
+            } else if already > 0 {
+                format!(
+                    "verified: {} ({} checks passed; {} undone earlier)",
+                    t.goal,
+                    results.len(),
+                    changes(already)
+                )
             } else {
                 format!("verified: {} ({} checks passed)", t.goal, results.len())
             }
@@ -1199,6 +1219,9 @@ impl Agent {
         }
         if passed {
             text.push_str("Verified: the change is kept.");
+            for (s, u) in &rolled {
+                text.push_str(&format!("\n↶ #{s} was undone earlier (receipt #{u})"));
+            }
         } else {
             text.push_str("A check failed, so Reeve rolled the change back.");
             for (s, u) in &rolled {
@@ -1212,6 +1235,8 @@ impl Agent {
             }
         }
         text.push_str(&format!("\n(receipt #{})", sealed.seq));
+        // Closed: the verdict is on record.
+        self.txn = None;
         emit(AgentEvent::ToolFinished {
             id: id.into(),
             status: sealed.outcome.status,
@@ -1238,23 +1263,28 @@ impl Agent {
             .undo(&self.tools.undo, seq, &self.session.meta.id)
     }
 
+    /// What a call cost and who says so: the provider's figure, nothing
+    /// for a local model, the price book, or unknown when neither usage nor
+    /// a price came back (recorded as unknown, not as nothing).
+    fn price(&self, usage: Usage, reported: Option<f64>) -> (Option<f64>, Option<&'static str>) {
+        match reported {
+            Some(c) => (Some(c), Some("provider")),
+            None if self.local => (Some(0.0), Some("local")),
+            None if usage == Usage::default() => (None, None),
+            None => {
+                let c = self.book.cost(&self.model, usage);
+                (c, c.map(|_| "book"))
+            }
+        }
+    }
+
     fn charge(
         &mut self,
         usage: Usage,
         reported: Option<f64>,
         emit: &(dyn Fn(AgentEvent) + Send + Sync),
     ) -> Result<()> {
-        let (usd, priced_by) = match reported {
-            Some(c) => (Some(c), Some("provider")),
-            None if self.local => (Some(0.0), Some("local")),
-            // Neither usage nor a price came back: the call cost something
-            // unknown, which is recorded as unknown, not as nothing.
-            None if usage == Usage::default() => (None, None),
-            None => {
-                let c = self.book.cost(&self.model, usage);
-                (c, c.map(|_| "book"))
-            }
-        };
+        let (usd, priced_by) = self.price(usage, reported);
         let rec = SpendRecord {
             ts: Utc::now(),
             session: self.session.meta.id.clone(),
@@ -2433,6 +2463,190 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AgentEvent::ToolStarted { .. })),
             "nothing was called past the deadline: {events:?}"
+        );
+    }
+
+    fn tc(n: u32, (name, args): (&str, serde_json::Value)) -> AssistantToolCall {
+        AssistantToolCall {
+            id: format!("c{n}"),
+            name: name.into(),
+            arguments: args.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stopped_check_leaves_the_change_open_for_the_retry() {
+        let home = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in(home.path()).unwrap();
+        let other = tmp.path().canonicalize().unwrap().join("other.txt");
+        std::fs::write(&other, "old\n").unwrap();
+        let (_home, mut a) = agent_at(home, vec![], fixed(Decision::Approve, false));
+        let noop = |_: AgentEvent| {};
+        a.run_call(
+            &tc(
+                1,
+                (
+                    "change_begin",
+                    serde_json::json!({"goal": "say bye", "checks": [{"kind": "command", "command": "false"}], "wait_secs": 30}),
+                ),
+            ),
+            &noop,
+        )
+        .await
+        .unwrap();
+        a.run_call(
+            &tc(
+                2,
+                (
+                    "fs_edit",
+                    serde_json::json!({"path": other, "old": "old", "new": "new"}),
+                ),
+            ),
+            &noop,
+        )
+        .await
+        .unwrap();
+        // The TUI stops a turn by dropping its future: here in the settle wait.
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            a.run_call(&tc(3, ("change_commit", serde_json::json!({}))), &noop),
+        )
+        .await;
+        assert!(stopped.is_err(), "still waiting when stopped");
+        assert!(a.txn.is_some(), "the change is still open");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "new\n");
+        a.txn.as_mut().unwrap().wait_secs = 0;
+        let out = a
+            .run_call(&tc(4, ("change_commit", serde_json::json!({}))), &noop)
+            .await
+            .unwrap();
+        assert!(out.contains("rolled the change back"), "{out}");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "old\n");
+        assert!(a.txn.is_none(), "closed by the verdict");
+        let rs = ReceiptBook::new(&a.home).all();
+        let tools: Vec<&str> = rs.iter().map(|r| r.tool.as_str()).collect();
+        assert_eq!(tools, ["change_begin", "fs_edit", "undo", "change_commit"]);
+    }
+
+    #[tokio::test]
+    async fn a_change_undone_by_hand_counts_as_rolled_back() {
+        let home = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in(home.path()).unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let (note, other) = (dir.join("note.txt"), dir.join("other.txt"));
+        std::fs::write(&other, "old\n").unwrap();
+        let (_home, mut a) = agent_at(home, vec![], fixed(Decision::Approve, false));
+        let noop = |_: AgentEvent| {};
+        a.run_call(&tc(1, begin("false")), &noop).await.unwrap();
+        a.run_call(
+            &tc(
+                2,
+                (
+                    "fs_write",
+                    serde_json::json!({"path": note, "content": "hi\n"}),
+                ),
+            ),
+            &noop,
+        )
+        .await
+        .unwrap();
+        a.run_call(
+            &tc(
+                3,
+                (
+                    "fs_edit",
+                    serde_json::json!({"path": other, "old": "old", "new": "new"}),
+                ),
+            ),
+            &noop,
+        )
+        .await
+        .unwrap();
+        // The owner undid the first change themselves (a rollback stopped
+        // partway leaves the same trace).
+        let by_hand = a.undo(2).unwrap();
+        assert!(!note.exists());
+        let out = a
+            .run_call(&tc(4, ("change_commit", serde_json::json!({}))), &noop)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "old\n");
+        let rs = ReceiptBook::new(&a.home).all();
+        let commit = rs.iter().find(|r| r.tool == "change_commit").unwrap();
+        assert_eq!(
+            commit.outcome.summary,
+            "failed (`false` succeeds), so rolled back 2 changes"
+        );
+        let rolled = commit.args["rolled_back"].as_array().unwrap();
+        assert_eq!(rolled.len(), 2);
+        assert!(
+            rolled
+                .iter()
+                .any(|r| r["seq"] == 2 && r["by"] == by_hand.seq),
+            "{rolled:?}"
+        );
+        assert!(
+            commit.args["not_rolled_back"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            out.contains(&format!("#2 undone (receipt #{})", by_hand.seq)),
+            "{out}"
+        );
+        // Only the other change was Reeve's own undo.
+        let own = rs
+            .iter()
+            .filter(|r| r.tool == "undo" && r.approved_by.starts_with("txn:"))
+            .count();
+        assert_eq!(own, 1);
+    }
+
+    #[tokio::test]
+    async fn reflection_waits_at_the_cap_like_a_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.spend.daily_usd = 0.01;
+        let p = ReplayProvider::scripted(vec![done("{\"facts\":[]}")]);
+        let seen = p.requests();
+        let mut a = Agent::new(
+            Box::new(p),
+            cfg,
+            home.path().join(".reeve"),
+            "openrouter".into(),
+            "m".into(),
+            "",
+        )
+        .unwrap();
+        ledger::record(
+            &a.home,
+            &SpendRecord {
+                ts: Utc::now(),
+                session: "earlier".into(),
+                connection: "openrouter".into(),
+                model: "m".into(),
+                usage: Usage::default(),
+                usd: Some(1.0),
+                priced_by: Some("provider".into()),
+                role: None,
+            },
+        )
+        .unwrap();
+        let err = match a.reflect().await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("reflection ran past the cap"),
+        };
+        assert!(err.contains("daily cap reached"), "{err}");
+        assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
+        assert!(
+            a.session.meta.reflected.is_none(),
+            "still to be reflected on"
+        );
+        assert_eq!(
+            ledger::totals(&a.home, Local::now()).today.calls,
+            1,
+            "nothing was charged"
         );
     }
 }

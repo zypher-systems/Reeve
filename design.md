@@ -241,7 +241,10 @@ Each receipt has four parts:
    root files never land in your home. Structured undo covers packages (`dnf history undo`) and
    units (restore previous enable/mask state). In the TUI, `u` on a receipt undoes it. The undo
    is itself an action with its own receipt, and it checks that the file still matches the
-   post-image before reverting (no clobbering later edits).
+   post-image before reverting: the same content, mode and kind (file or link), so a later edit
+   or chmod is never clobbered. An undo's receipt carries its inverse, so it can be undone in
+   turn; for a move that overwrote a file, the inverse knows what the undo put back and moves
+   over it only while it is still that file.
 3. **Session reports.** At session end, `sessions/<id>/report.md` records what was asked, what changed
    (with receipt seqs), what failed, what it cost, and what Reeve learned.
 4. **Snapshots.** On btrfs with snapper, a T2 action is wrapped in a `snapper create --type pre/post`
@@ -269,7 +272,10 @@ A fix is a transaction that has to prove it worked.
 3. **`change_commit`** waits `wait_secs` (default 3), then runs the checks. If they all pass, the
    receipt says `verified`. If any fails, every tagged change that has an undo record is undone,
    newest first. Each undo gets its own receipt, approved by `txn:<id>`. A change without an
-   undo record (most shell commands) is listed as still in place.
+   undo record (most shell commands) is listed as still in place. A turn stopped during the
+   wait, the checks or the rollback leaves the change open: the next `change_commit`, or the end
+   of a turn, finishes it, and a change already undone (by the stopped rollback, or by the owner)
+   counts as rolled back.
 4. **A transaction left open** when the model ends its turn is committed then, and the model is
    told the result so it can report it.
 
@@ -716,7 +722,8 @@ today; an open one is not, or not yet proven.
   has expected tiers, and no mode (YOLO, a session or change "yes", a standing order) gets past
   the floor without the typed confirmation.
 - [ ] **Undo covers what it claims.** Files, dnf and pacman transactions, and unit state each undo
-  cleanly, and an undo refuses when the target changed since.
+  cleanly, and an undo refuses when the target changed since. *Files compare content, mode and
+  kind as of 2026-11-01; moves and units are still to record a post-state.*
 - [ ] **No key leaks.** Tests push known token formats through prompts, tool output, receipts,
   logs, and session reports, and none comes out unmasked.
 - [x] A standing order that needs root runs only with the drop-in `reeve orders sudoers <order>`
@@ -730,8 +737,8 @@ today; an open one is not, or not yet proven.
 - [ ] **It keeps itself current.** reeved notices a new release and the app shows it, without a
   popup. `reeve update` installs it the way Reeve was installed, checks it against the release's
   `SHA256SUMS`, leaves a receipt, and can roll back.
-- [x] Budgets hold across the TUI, the drafter, and standing orders, and a model with no known
-  price fails closed while any cap is set.
+- [x] Budgets hold across the TUI, the drafter, standing orders and reflection, and a model with
+  no known price fails closed while any cap is set.
 
 **Nothing you keep is lost**
 
@@ -808,9 +815,12 @@ and repository-aware updates besides; 2 and 3 remain**
   Reeve's state; or, if neither is available, an honest statement of the trust model) and tests
   that execute, not only classify (G01, G23). L.
 - Receipts cover every change: an intent record before the action and a completion after, with
-  reconciliation at startup; an open verified change survives a crash or cancel (G03, G04). L.
+  reconciliation at startup; an open verified change survives a crash or cancel (G03, G04). L. *A
+  stopped check or rollback leaves the change open for the retry as of 2026-11-01; the intent
+  record and the crash case stay open.*
 - Undo covers what it claims: moves and units record a post-state and refuse when it changed;
-  partial multi-file restores leave their inverse (G13). M.
+  partial multi-file restores leave their inverse (G13). M. *A file's mode and kind are compared,
+  and an undone overwriting move can be redone, as of 2026-11-01; the rest stays open.*
 - reeved stays small: retention for sessions, undo objects and findings; a 90-day soak with
   measured disk, memory and query time (G15). M.
 - Upgrades never lose data: a version in every file format, fixtures from each shipped release,
