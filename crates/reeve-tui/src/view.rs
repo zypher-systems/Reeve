@@ -397,23 +397,46 @@ impl View {
     /// Remember a receipt for the rail (and mark an undone one: only an
     /// undo that worked undid anything).
     pub fn add_receipt(&mut self, r: Receipt) {
-        if let Some(seq) = r.undoes.filter(|_| r.outcome.status == Status::Ok) {
+        let undid = r.undoes.filter(|_| r.outcome.status == Status::Ok);
+        self.receipts.insert(0, r);
+        self.receipts.truncate(RAIL_RECEIPTS);
+        // An undo marks the action at the root of its chain, and an undo
+        // of an undo puts that action back.
+        if let Some(seq) = undid {
+            let mut root = seq;
+            while let Some(p) = self
+                .receipts
+                .iter()
+                .find(|x| x.seq == root)
+                .and_then(|x| x.undoes)
+                .filter(|p| *p < root)
+            {
+                root = p;
+            }
+            let (undoable, note) = match reeve_core::receipts::standing(&self.receipts, root) {
+                reeve_core::receipts::Standing::Reversed(by) => {
+                    (false, format!("  · undone by #{by}"))
+                }
+                reeve_core::receipts::Standing::InEffect(by) => {
+                    (true, format!("  · put back by #{by}"))
+                }
+            };
             for e in &mut self.entries {
-                if let Some(t) = e.tool.as_mut().filter(|t| t.seq == Some(seq)) {
-                    t.undoable = false;
-                    t.result.push_str(&format!("  · undone by #{}", r.seq));
+                if let Some(t) = e.tool.as_mut().filter(|t| t.seq == Some(root)) {
+                    t.undoable = undoable;
+                    t.result.push_str(&note);
                 }
             }
         }
-        self.receipts.insert(0, r);
-        self.receipts.truncate(RAIL_RECEIPTS);
     }
 
-    /// Whether receipt `seq` has been undone (as far as the rail knows).
+    /// Whether receipt `seq` stands undone (as far as the rail knows): an
+    /// undo of its undo puts it back.
     pub fn is_undone(&self, seq: u64) -> bool {
-        self.receipts
-            .iter()
-            .any(|r| r.undoes == Some(seq) && r.outcome.status == Status::Ok)
+        matches!(
+            reeve_core::receipts::standing(&self.receipts, seq),
+            reeve_core::receipts::Standing::Reversed(_)
+        )
     }
 
     /// Add a chat entry.

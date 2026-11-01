@@ -893,6 +893,7 @@ pub(super) fn mv(ctx: &ToolCtx, a: &MoveArgs) -> Executed {
         from: from.to_string_lossy().into_owned(),
         to: to.to_string_lossy().into_owned(),
         replaced,
+        restored: None,
     });
     e
 }

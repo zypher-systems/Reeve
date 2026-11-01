@@ -90,9 +90,10 @@ pub fn render(meta: &Meta, transcript: &[Message], receipts: &[Receipt], tally: 
         .iter()
         .filter(|r| r.undo.is_some() && r.outcome.status == Status::Ok && r.undoes.is_none())
         .filter(|r| {
-            !receipts
-                .iter()
-                .any(|u| u.undoes == Some(r.seq) && u.outcome.status == Status::Ok)
+            matches!(
+                crate::receipts::standing(receipts, r.seq),
+                crate::receipts::Standing::InEffect(_)
+            )
         })
         .collect();
     if !undoable.is_empty() {

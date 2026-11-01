@@ -95,6 +95,12 @@ pub enum Undo {
         /// What was at `to` before.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replaced: Option<Blob>,
+        /// What an undo put back at `from` after moving the file away (the
+        /// `replaced` of the move it reversed). Reverting this record redoes
+        /// the move: it checks that file is still there unchanged and moves
+        /// over it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restored: Option<Blob>,
     },
 }
 
@@ -237,18 +243,70 @@ impl UndoStore {
         }
     }
 
+    /// How `path` differs from `left`, what Reeve left there (`None`:
+    /// nothing), in words; `None` when it still holds exactly that: the
+    /// same content, mode, and kind (file or link).
+    fn changed_since(path: &Path, left: Option<&Blob>) -> Result<Option<String>> {
+        let meta = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(left.map(|_| "it is gone".to_string()));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let Some(b) = left else {
+            return Ok(Some("something is there now".into()));
+        };
+        let kind = meta.file_type();
+        if kind.is_dir() {
+            return Ok(Some("it is a directory now".into()));
+        }
+        if !kind.is_file() && !kind.is_symlink() {
+            return Ok(Some("it is not a regular file now".into()));
+        }
+        if kind.is_symlink() != b.link.is_some() {
+            return Ok(Some(
+                if kind.is_symlink() {
+                    "it is a link now"
+                } else {
+                    "it is a file now, not a link"
+                }
+                .into(),
+            ));
+        }
+        // The mode before the content: a file made unreadable is refused
+        // for its mode, not for the read it stops.
+        let (now, was) = (mode_of(&meta), b.mode & 0o7777);
+        if now != was {
+            return Ok(Some(format!("its mode is {now:04o}, was {was:04o}")));
+        }
+        let (content, differs) = if kind.is_symlink() {
+            (
+                fs::read_link(path)?
+                    .to_string_lossy()
+                    .into_owned()
+                    .into_bytes(),
+                "it points elsewhere",
+            )
+        } else {
+            (fs::read(path)?, "its content changed")
+        };
+        if sha256_hex(&content) != b.sha256 {
+            return Ok(Some(differs.into()));
+        }
+        Ok(None)
+    }
+
     /// Put things back. Refuses (changing nothing) if any path no longer
-    /// holds what Reeve left there. Returns the inverse, so an undo can
-    /// itself be undone.
+    /// holds what Reeve left there: the same content, mode, and kind.
+    /// Returns the inverse, so an undo can itself be undone.
     pub fn revert(&self, undo: &Undo) -> Result<(Undo, String)> {
         match undo {
             Undo::Files { changes } => {
                 for c in changes {
-                    let now = Self::current(Path::new(&c.path))?;
-                    let left = c.post.as_ref().map(|b| b.sha256.clone());
-                    if now != left {
+                    if let Some(how) = Self::changed_since(Path::new(&c.path), c.post.as_ref())? {
                         return Err(Error::Io(format!(
-                            "{} has changed since Reeve touched it; not undoing, to keep the newer version",
+                            "{} has changed since Reeve touched it ({how}); not undoing, to keep the newer version",
                             c.path
                         )));
                     }
@@ -274,12 +332,36 @@ impl UndoStore {
 
                 "package and service changes are undone through their own tools, not the file store".into(),
             )),
-            Undo::Move { from, to, replaced } => {
-                if Path::new(from).exists() {
-                    return Err(Error::Io(format!(
-                        "{from} exists again; not moving over it"
-                    )));
+            Undo::Move {
+                from,
+                to,
+                replaced,
+                restored,
+            } => {
+                let back = Path::new(from);
+                match restored {
+                    // Redoing a move: the file an undo put back here goes,
+                    // if it's still that file.
+                    Some(b) => {
+                        if let Some(how) = Self::changed_since(back, Some(b))? {
+                            return Err(Error::Io(format!(
+                                "{from} has changed since Reeve put it back ({how}); not moving over it"
+                            )));
+                        }
+                    }
+                    None => {
+                        if fs::symlink_metadata(back).is_ok() {
+                            return Err(Error::Io(format!(
+                                "{from} exists again; not moving over it"
+                            )));
+                        }
+                    }
                 }
+                if matches!(fs::symlink_metadata(to), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+                {
+                    return Err(Error::Io(format!("{to} is gone; nothing to move back")));
+                }
+                // rename replaces a file at `from` in one step.
                 fs::rename(to, from)?;
                 if let Some(b) = replaced {
                     self.restore(Path::new(to), Some(b))?;
@@ -288,7 +370,8 @@ impl UndoStore {
                     Undo::Move {
                         from: to.clone(),
                         to: from.clone(),
-                        replaced: None,
+                        replaced: restored.clone(),
+                        restored: replaced.clone(),
                     },
                     format!("moved {to} back to {from}"),
                 ))
@@ -513,6 +596,104 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
         store.revert(&Undo::Files { changes }).unwrap();
         assert_eq!(fs::read_to_string(dir.join("sub/b")).unwrap(), "2");
+    }
+
+    #[test]
+    fn a_later_chmod_blocks_the_undo() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let store = UndoStore::new(home.path());
+        let f = home.path().join("conf");
+        fs::write(&f, "old\n").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();
+        let pre = store.snapshot(&f).unwrap();
+        fs::write(&f, "new\n").unwrap();
+        let post = store.snapshot(&f).unwrap();
+        let undo = Undo::Files {
+            changes: vec![FileChange {
+                path: f.to_string_lossy().into(),
+                pre,
+                post,
+                root: false,
+            }],
+        };
+        // The owner locks the file down after Reeve's edit.
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
+        let e = store.revert(&undo).unwrap_err().to_string();
+        assert!(e.contains("its mode is 0600, was 0644"), "{e}");
+        assert_eq!(fs::read_to_string(&f).unwrap(), "new\n");
+        assert_eq!(
+            fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // A mode Reeve can't read through is still a mode, not a read error.
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o000)).unwrap();
+        let e = store.revert(&undo).unwrap_err().to_string();
+        assert!(e.contains("its mode is 0000, was 0644"), "{e}");
+        // Put back as it was, the undo goes through and restores the old mode too.
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();
+        store.revert(&undo).unwrap();
+        assert_eq!(fs::read_to_string(&f).unwrap(), "old\n");
+    }
+
+    #[test]
+    fn a_file_that_became_a_link_blocks_the_undo() {
+        let home = tempfile::tempdir().unwrap();
+        let store = UndoStore::new(home.path());
+        let f = home.path().join("conf");
+        let undo = Undo::Files {
+            changes: vec![FileChange {
+                path: f.to_string_lossy().into(),
+                pre: None,
+                post: {
+                    fs::write(&f, "target").unwrap();
+                    store.snapshot(&f).unwrap()
+                },
+                root: false,
+            }],
+        };
+        // A link whose target reads the same as the file's content: the
+        // same hash, a different kind of thing.
+        fs::remove_file(&f).unwrap();
+        std::os::unix::fs::symlink("target", &f).unwrap();
+        let e = store.revert(&undo).unwrap_err().to_string();
+        assert!(e.contains("it is a link now"), "{e}");
+        assert!(fs::symlink_metadata(&f).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn an_undone_overwriting_move_can_be_redone() {
+        let home = tempfile::tempdir().unwrap();
+        let store = UndoStore::new(home.path());
+        let (a, b) = (home.path().join("a"), home.path().join("b"));
+        fs::write(&a, "A\n").unwrap();
+        fs::write(&b, "B\n").unwrap();
+        let replaced = store.snapshot(&b).unwrap();
+        fs::rename(&a, &b).unwrap();
+        let undo = Undo::Move {
+            from: a.to_string_lossy().into(),
+            to: b.to_string_lossy().into(),
+            replaced,
+            restored: None,
+        };
+        let (redo, _) = store.revert(&undo).unwrap();
+        assert_eq!(fs::read_to_string(&a).unwrap(), "A\n");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "B\n");
+        // The replaced file was edited since the undo put it back: no redo over it.
+        fs::write(&b, "B2\n").unwrap();
+        let e = store.revert(&redo).unwrap_err().to_string();
+        assert!(
+            e.contains("since Reeve put it back (its content changed)"),
+            "{e}"
+        );
+        fs::write(&b, "B\n").unwrap();
+        let (undo_again, _) = store.revert(&redo).unwrap();
+        assert!(!a.exists(), "moved away again");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "A\n");
+        assert_eq!(undo_again, undo, "the redo's inverse is the original undo");
+        store.revert(&undo_again).unwrap();
+        assert_eq!(fs::read_to_string(&a).unwrap(), "A\n");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "B\n");
     }
 
     #[cfg(unix)]

@@ -18,7 +18,7 @@
 %global __brp_mangle_shebangs_exclude_from ^/usr/src/debug/.*$
 
 Name:           reeve
-Version:        0.8.0
+Version:        0.8.1
 Release:        1%{?dist}
 Summary:        An operator agent that manages this computer, with receipts
 
@@ -87,6 +87,11 @@ install -Dpm 0644 packaging/systemd/reeved.service %{buildroot}%{_userunitdir}/r
 %{_userunitdir}/reeved.service
 
 %changelog
+* Sun Nov 01 2026 Zypher Systems <zypher@zyphersystems.com> - 0.8.1-1
+- A change_commit stopped mid-check leaves the change open for the retry instead of losing it.
+- Reflection waits at the spend cap like a turn.
+- Undo refuses when a file's mode or kind changed since; an undone overwriting move can be redone.
+
 * Sat Oct 31 2026 Zypher Systems <zypher@zyphersystems.com> - 0.8.0-1
 - reeved never waits on a model call or a package query: checks and drafts run beside the loop, with deadlines.
 - Releases are signed (SHA256SUMS.sig); the installer and reeve update install only a signed release.
