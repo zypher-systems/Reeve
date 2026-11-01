@@ -66,14 +66,31 @@ impl From<&str> for UndoFailed {
     }
 }
 
-/// Which of `receipts` have been undone, by seq. Only an undo that worked
-/// counts: after a failed attempt (which may have a partial inverse of its
-/// own) the target can be tried again.
+/// Which of `receipts` stand undone, by seq. Only an undo that worked
+/// counts, and an undo of an undo puts its action back: a seq is in the
+/// set while its chain of successful undos leaves it reversed (as
+/// [`standing`] reads it), so after a redo the undo receipt is in it and
+/// the action is not. After a failed attempt (which may have a partial
+/// inverse of its own) the target can be tried again.
 pub fn undone(receipts: &[Receipt]) -> std::collections::HashSet<u64> {
+    // Each successful undo, by what it undoes.
+    let mut next = std::collections::HashMap::new();
+    for r in receipts.iter().filter(|r| r.outcome.status == Status::Ok) {
+        if let Some(u) = r.undoes.filter(|u| *u < r.seq) {
+            next.entry(u).or_insert(r.seq);
+        }
+    }
     receipts
         .iter()
-        .filter(|r| r.outcome.status == Status::Ok)
-        .filter_map(|r| r.undoes)
+        .map(|r| r.seq)
+        .filter(|seq| {
+            let (mut cur, mut reversed) = (*seq, false);
+            while let Some(n) = next.get(&cur) {
+                cur = *n;
+                reversed = !reversed;
+            }
+            reversed
+        })
         .collect()
 }
 
@@ -770,17 +787,26 @@ mod tests {
         );
         let first = undo(did, Status::Ok);
         assert_eq!(b.standing(did), Standing::Reversed(first));
+        assert!(undone(&b.all()).contains(&did));
         assert_eq!(b.undone_by(did), Some(first));
         let e = b.undo_target(did).unwrap_err().to_string();
         assert!(e.contains(&format!("already undone by #{first}")), "{e}");
         let redo = undo(first, Status::Ok);
         assert_eq!(b.standing(did), Standing::InEffect(redo));
         assert_eq!(b.undone_by(did), None);
+        let set = undone(&b.all());
+        assert!(!set.contains(&did), "put back, so not undone: {set:?}");
+        assert!(set.contains(&first), "the undo itself was undone: {set:?}");
         // Undoing the action again goes through the redo's record.
         let (target, _) = b.undo_target(did).unwrap();
         assert_eq!(target.seq, redo);
         let again = undo(redo, Status::Ok);
         assert_eq!(b.standing(did), Standing::Reversed(again));
         assert_eq!(b.undone_by(did), Some(again));
+        let set = undone(&b.all());
+        assert!(
+            set.contains(&did) && set.contains(&redo) && !set.contains(&first),
+            "{set:?}"
+        );
     }
 }
