@@ -1258,6 +1258,7 @@ impl ModelPicker {
 pub const KINDS: &[(&str, &str)] = &[
     ("openai", "OpenAI-compatible"),
     ("openrouter", "OpenRouter"),
+    ("anthropic", "Anthropic"),
     ("local", "local server (no key, $0)"),
 ];
 
@@ -1332,8 +1333,9 @@ impl AddForm {
         conn.base_url = url;
         let model = self.model.trim();
         conn.default_model = (!model.is_empty()).then(|| model.to_string());
-        if self.kind != 1 {
-            // Only OpenRouter's variable name is a safe guess.
+        if !matches!(KINDS[self.kind].0, "openrouter" | "anthropic") {
+            // An "OpenAI-compatible" endpoint could be anyone's; only
+            // OpenRouter's and Anthropic's variable names are safe guesses.
             conn.env_key = None;
         }
         Action::AddConnection { name, conn }
@@ -1660,6 +1662,10 @@ mod tests {
         f.name = "box".into();
         f.focus = 1;
         o.on_key(key(KeyCode::Right));
+        o.on_key(key(KeyCode::Right));
+        let Overlay::Add(f) = &o else { unreachable!() };
+        assert_eq!(KINDS[f.kind].0, "anthropic");
+        assert!(f.base_url.starts_with("https://api.anthropic.com"));
         o.on_key(key(KeyCode::Right));
         let Overlay::Add(f) = &o else { unreachable!() };
         assert_eq!(KINDS[f.kind].0, "local");

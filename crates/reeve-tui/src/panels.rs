@@ -414,7 +414,7 @@ fn providers(f: &mut Frame, r: Rect, p: &Providers, t: &Theme) {
             lines.push(Line::from(vec![Span::raw("   "), status]));
         }
         None => lines.push(Line::from(Span::styled(
-            "   An OpenAI-compatible API, OpenRouter, or a model server on this machine.",
+            "   Anthropic, OpenRouter, an OpenAI-compatible API, or a model server on this machine.",
             t.ghost(),
         ))),
     }
@@ -595,6 +595,20 @@ fn models(f: &mut Frame, r: Rect, m: &ModelPicker, t: &Theme) {
     ));
 }
 
+/// A line about the kind under the add form.
+fn kind_note(kind: &str) -> &'static str {
+    match kind {
+        "openrouter" => {
+            "One key, many models, live prices; /privacy routes around providers that train."
+        }
+        "anthropic" => {
+            "Anthropic's own API: Claude at list prices. Key: ANTHROPIC_API_KEY or keys/<name>."
+        }
+        "local" => "Ollama, llama.cpp, LM Studio… on this machine: no key, nothing leaves, $0.",
+        _ => "Groq, Together, vLLM, LM Studio… anything that speaks /v1/chat/completions.",
+    }
+}
+
 fn add_form(f: &mut Frame, r: Rect, a: &AddForm, t: &Theme) {
     let w = r.width as usize;
     let mut lines = Vec::new();
@@ -646,7 +660,7 @@ fn add_form(f: &mut Frame, r: Rect, a: &AddForm, t: &Theme) {
             Style::default().fg(t.bad),
         ))),
         None => lines.push(Line::from(Span::styled(
-            "   Groq, Together, vLLM, LM Studio… anything that speaks /v1/chat/completions.",
+            format!("   {}", kind_note(KINDS[a.kind].0)),
             t.ghost(),
         ))),
     }

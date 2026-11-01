@@ -17,6 +17,12 @@ base_url = "https://api.openai.com/v1"
 env_key = "OPENAI_API_KEY"
 default_model = "gpt-5-mini"
 
+[connections.anthropic]
+kind = "anthropic"                      # Anthropic's own API
+base_url = "https://api.anthropic.com/v1"
+env_key = "ANTHROPIC_API_KEY"
+default_model = "claude-opus-5-5"
+
 # A model server on this machine: no key, priced at $0.
 # [connections.ollama]
 # kind = "local"
@@ -24,7 +30,8 @@ default_model = "gpt-5-mini"
 # default_model = "qwen3:32b"
 
 # Prices come live from each connection's /models list (OpenRouter includes
-# cache read/write prices). A cost the provider reports always wins.
+# cache read/write prices; Anthropic's list has none, so Reeve carries its
+# published list prices). A cost the provider reports always wins.
 # Override a model here, USD per million tokens:
 # [pricing."my/model"]
 # input_per_million = 1.0

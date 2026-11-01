@@ -1,8 +1,11 @@
-//! Inference providers: OpenRouter and any OpenAI-compatible endpoint.
+//! Inference providers: OpenRouter, any OpenAI-compatible endpoint, and
+//! Anthropic's own API.
 //!
-//! Copied from Ryter's `llm/` and trimmed to Chat Completions, which every
-//! connection Reeve supports speaks.
+//! Copied from Ryter's `llm/` and trimmed to Chat Completions, which
+//! OpenRouter and every OpenAI-compatible server speak. The Messages API
+//! (`kind = "anthropic"`) is a second wire behind the same `Provider`.
 
+mod anthropic;
 mod http;
 mod parse;
 
@@ -111,8 +114,9 @@ pub struct CompletionRequest {
     pub tools: Vec<ToolSpec>,
     /// Max output tokens.
     pub max_tokens: Option<u32>,
-    /// Reasoning effort (`low`, `medium`, `high`), sent to OpenRouter only.
-    /// `None` sends nothing, and then some models reason without limit.
+    /// Reasoning effort (`low`, `medium`, `high`), sent to OpenRouter and to
+    /// Anthropic. `None` sends nothing, and then some models reason without
+    /// limit.
     pub reasoning: Option<String>,
     /// Where OpenRouter may send it. Other providers ignore it.
     pub route: Option<Route>,

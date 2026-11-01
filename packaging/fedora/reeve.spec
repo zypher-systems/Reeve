@@ -18,7 +18,7 @@
 %global __brp_mangle_shebangs_exclude_from ^/usr/src/debug/.*$
 
 Name:           reeve
-Version:        0.8.1
+Version:        0.9.0
 Release:        1%{?dist}
 Summary:        An operator agent that manages this computer, with receipts
 
@@ -87,6 +87,10 @@ install -Dpm 0644 packaging/systemd/reeved.service %{buildroot}%{_userunitdir}/r
 %{_userunitdir}/reeved.service
 
 %changelog
+* Sun Nov 01 2026 Zypher Systems <zypher@zyphersystems.com> - 0.9.0-1
+- Anthropic's own API is a connection kind (kind = "anthropic"), for the chat, the drafter and standing orders.
+- Claude models are priced from Anthropic's list prices; the catalog's output ceilings and capabilities shape each request.
+
 * Sun Nov 01 2026 Zypher Systems <zypher@zyphersystems.com> - 0.8.1-1
 - A change_commit stopped mid-check leaves the change open for the retry instead of losing it.
 - Reflection waits at the spend cap like a turn.
