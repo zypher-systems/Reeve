@@ -852,6 +852,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_messages_reply_that_filled_the_context_window_is_truncated() {
+        let body: &[u8] = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"half\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"model_context_window_exceeded\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":3}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let open = stream::iter(chunks(&[body])).chain(stream::pending());
+        let got = collect(
+            sse_delta_stream(
+                Box::pin(open),
+                Duration::from_secs(60),
+                Wire::Anthropic(anthropic::EventState::default()),
+            ),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let kinds: Vec<&str> = got
+            .iter()
+            .map(|d| match d {
+                Ok(StreamDelta::Text(_)) => "text",
+                Ok(StreamDelta::Usage(_)) => "usage",
+                Ok(StreamDelta::Truncated) => "truncated",
+                Ok(StreamDelta::Done) => "done",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["usage", "text", "usage", "truncated", "done"],
+            "{got:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_messages_error_event_ends_the_stream_as_an_error() {
         let body: &[u8] = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
         let open = stream::iter(chunks(&[body])).chain(stream::pending());

@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
 use crate::llm::{CompletionRequest, ModelInfo, StreamDelta, ToolSpec};
-use crate::spend::Usage;
+use crate::spend::{Usage, undated};
 
 /// The API version every request names.
 pub const API_VERSION: &str = "2026-10-21";
@@ -310,7 +310,11 @@ pub fn parse_event(st: &mut EventState, data: &str) -> (Vec<StreamDelta>, End) {
                 out.push(StreamDelta::Usage(u));
             }
             match v["delta"]["stop_reason"].as_str() {
-                Some("max_tokens") => out.push(StreamDelta::Truncated),
+                // The output limit, or the context window filling up mid-reply:
+                // either way the answer is cut short.
+                Some("max_tokens" | "model_context_window_exceeded") => {
+                    out.push(StreamDelta::Truncated);
+                }
                 Some("refusal") => {
                     let details = if v["delta"]["stop_details"].is_object() {
                         &v["delta"]["stop_details"]
@@ -506,12 +510,6 @@ pub fn rates(id: &str) -> Option<ListPrice> {
             cache_read,
             output,
         })
-}
-
-/// `claude-haiku-4-5-20251001` → `claude-haiku-4-5`; `None` without a date.
-pub fn undated(id: &str) -> Option<&str> {
-    let (head, tail) = id.rsplit_once('-')?;
-    (tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit())).then_some(head)
 }
 
 #[cfg(test)]
@@ -736,6 +734,14 @@ mod tests {
         let cut = "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":5}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
         let (d, errors, done) = run(cut);
         assert!(done && errors.is_empty() && d.contains(&StreamDelta::Truncated));
+        let full = "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"model_context_window_exceeded\"},\"usage\":{\"output_tokens\":5}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+        let (d, errors, done) = run(full);
+        assert!(
+            done && errors.is_empty() && d.contains(&StreamDelta::Truncated),
+            "a reply that filled the context window is cut short too"
+        );
+        let whole = "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n";
+        assert!(!run(whole).0.contains(&StreamDelta::Truncated));
         let refused = "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\"}},\"usage\":{\"output_tokens\":5}}\n\n";
         let (d, errors, _) = run(refused);
         assert!(

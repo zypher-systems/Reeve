@@ -2679,7 +2679,12 @@ async fn connect(
     match a.refresh_models().await {
         Ok(models) => {
             let mut label = format_rates(a.book().rates(&model));
-            if !models.is_empty() && !models.iter().any(|m| m.id == model) {
+            // A dated catalog id (`claude-haiku-4-5-20251001`) answers to its
+            // alias too.
+            let listed = models.iter().any(|m| {
+                m.id == model || reeve_core::spend::undated(&m.id) == Some(model.as_str())
+            });
+            if !models.is_empty() && !listed {
                 label = format!("{label} · not in {name}'s catalog");
             }
             let _ = tx.send(UiMsg::Rates(label));

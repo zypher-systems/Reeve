@@ -115,6 +115,19 @@ impl Rates {
     }
 }
 
+/// `claude-haiku-4-5-20251001` → `claude-haiku-4-5`; `None` without a
+/// trailing `yyyymmdd`.
+pub fn undated(id: &str) -> Option<&str> {
+    let (head, tail) = id.rsplit_once('-')?;
+    if tail.len() != 8 || !tail.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n = |s: &str| s.parse::<u32>().unwrap_or(0);
+    let (year, month, day) = (n(&tail[..4]), n(&tail[4..6]), n(&tail[6..]));
+    ((2000..2100).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day))
+        .then_some(head)
+}
+
 /// Looks up rates: TOML override → live catalog (`GET /models`).
 #[derive(Debug, Clone, Default)]
 pub struct PriceBook {
@@ -141,20 +154,28 @@ impl PriceBook {
     /// older ones: prices change.
     pub fn ingest(&mut self, models: &[ModelInfo]) -> usize {
         let mut n = 0;
+        let mut dated = Vec::new();
         for m in models {
             let (Some(input), Some(output)) = (m.input_per_million, m.output_per_million) else {
                 continue;
             };
-            self.catalog.insert(
-                m.id.clone(),
-                Rates {
-                    input_per_million: input,
-                    output_per_million: output,
-                    cache_read_per_million: m.cache_read_per_million,
-                    cache_write_per_million: m.cache_write_per_million,
-                },
-            );
+            let rates = Rates {
+                input_per_million: input,
+                output_per_million: output,
+                cache_read_per_million: m.cache_read_per_million,
+                cache_write_per_million: m.cache_write_per_million,
+            };
+            self.catalog.insert(m.id.clone(), rates);
+            if let Some(alias) = undated(&m.id) {
+                dated.push((alias.to_string(), rates));
+            }
             n += 1;
+        }
+        // A dated id (`claude-haiku-4-5-20251001`) is also called by its
+        // alias (`claude-haiku-4-5`), which the catalog may not list. The
+        // alias gets the dated row's rates unless the catalog named it.
+        for (alias, rates) in dated {
+            self.catalog.entry(alias).or_insert(rates);
         }
         n
     }
@@ -292,6 +313,67 @@ mod tests {
             cached_tokens: cached,
             cache_write_tokens: written,
         }
+    }
+
+    #[test]
+    fn a_dated_catalog_id_prices_its_alias() {
+        let row = |id: &str, input: f64| ModelInfo {
+            id: id.into(),
+            input_per_million: Some(input),
+            output_per_million: Some(input * 5.0),
+            ..ModelInfo::default()
+        };
+        let mut book = PriceBook::new();
+        book.ingest(&[row("claude-haiku-4-5-20251001", 1.0)]);
+        assert_eq!(
+            book.rates("claude-haiku-4-5").map(|r| r.input_per_million),
+            Some(1.0)
+        );
+        assert_eq!(
+            book.rates("claude-haiku-4-5-20251001")
+                .map(|r| r.input_per_million),
+            Some(1.0)
+        );
+        // A row the catalog names wins over the alias, whichever came first.
+        book.ingest(&[row("claude-haiku-4-5", 2.0)]);
+        assert_eq!(
+            book.rates("claude-haiku-4-5").map(|r| r.input_per_million),
+            Some(2.0)
+        );
+        let mut book = PriceBook::new();
+        book.ingest(&[
+            row("claude-sonnet-4-5", 3.0),
+            row("claude-sonnet-4-5-20250929", 9.0),
+        ]);
+        assert_eq!(
+            book.rates("claude-sonnet-4-5").map(|r| r.input_per_million),
+            Some(3.0)
+        );
+        // A `[pricing]` override still beats both.
+        let mut cfg = Config::default();
+        cfg.pricing.insert(
+            "claude-haiku-4-5".into(),
+            PriceOverride {
+                input_per_million: Some(0.5),
+                output_per_million: Some(2.5),
+                ..PriceOverride::default()
+            },
+        );
+        let mut book = PriceBook::from_config(&cfg);
+        book.ingest(&[row("claude-haiku-4-5-20251001", 1.0)]);
+        assert_eq!(
+            book.rates("claude-haiku-4-5").map(|r| r.input_per_million),
+            Some(0.5)
+        );
+        // Not a date: nothing is invented.
+        let mut book = PriceBook::new();
+        book.ingest(&[row("qwen3-32b-12345678", 1.0), row("gpt-5-mini", 1.0)]);
+        assert_eq!(book.rates("qwen3-32b"), None);
+        assert_eq!(undated("claude-opus-5-5"), None);
+        assert_eq!(
+            undated("claude-haiku-4-5-20251001"),
+            Some("claude-haiku-4-5")
+        );
     }
 
     #[test]
