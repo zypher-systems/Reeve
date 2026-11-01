@@ -128,11 +128,16 @@ pub fn undated(id: &str) -> Option<&str> {
         .then_some(head)
 }
 
-/// Looks up rates: TOML override → live catalog (`GET /models`).
+/// Looks up rates: TOML override → live catalog (`GET /models`) → an
+/// alias of a dated catalog id.
 #[derive(Debug, Clone, Default)]
 pub struct PriceBook {
     overrides: HashMap<String, Rates>,
     catalog: HashMap<String, Rates>,
+    /// Rows made up from dated ids (`claude-haiku-4-5` from
+    /// `claude-haiku-4-5-20251001`), kept apart from the catalog's own so
+    /// the next ingest replaces them.
+    aliases: HashMap<String, Rates>,
 }
 
 impl PriceBook {
@@ -167,16 +172,26 @@ impl PriceBook {
             };
             self.catalog.insert(m.id.clone(), rates);
             if let Some(alias) = undated(&m.id) {
-                dated.push((alias.to_string(), rates));
+                dated.push((alias.to_string(), &m.id[alias.len() + 1..], rates));
             }
             n += 1;
         }
         // A dated id (`claude-haiku-4-5-20251001`) is also called by its
         // alias (`claude-haiku-4-5`), which the catalog may not list. The
-        // alias gets the dated row's rates unless the catalog named it.
-        for (alias, rates) in dated {
-            self.catalog.entry(alias).or_insert(rates);
+        // alias gets the newest dated row's rates, replaced on every ingest
+        // so a changed catalog row carries through; a row the catalog names
+        // for the alias itself wins over it (see `rates`).
+        let mut newest: HashMap<String, (&str, Rates)> = HashMap::new();
+        for (alias, date, rates) in dated {
+            match newest.get(&alias) {
+                Some((seen, _)) if *seen >= date => {}
+                _ => {
+                    newest.insert(alias, (date, rates));
+                }
+            }
         }
+        self.aliases
+            .extend(newest.into_iter().map(|(alias, (_, rates))| (alias, rates)));
         n
     }
 
@@ -186,6 +201,9 @@ impl PriceBook {
         for (k, v) in &other.catalog {
             self.catalog.entry(k.clone()).or_insert(*v);
         }
+        for (k, v) in &other.aliases {
+            self.aliases.entry(k.clone()).or_insert(*v);
+        }
     }
 
     /// Rates for `model`, if known.
@@ -193,6 +211,7 @@ impl PriceBook {
         self.overrides
             .get(model)
             .or_else(|| self.catalog.get(model))
+            .or_else(|| self.aliases.get(model))
             .copied()
     }
 
@@ -334,11 +353,41 @@ mod tests {
                 .map(|r| r.input_per_million),
             Some(1.0)
         );
+        // A later catalog carries through to the alias.
+        book.ingest(&[row("claude-haiku-4-5-20251001", 1.5)]);
+        assert_eq!(
+            book.rates("claude-haiku-4-5").map(|r| r.input_per_million),
+            Some(1.5),
+            "the alias follows its dated row on every ingest"
+        );
         // A row the catalog names wins over the alias, whichever came first.
         book.ingest(&[row("claude-haiku-4-5", 2.0)]);
         assert_eq!(
             book.rates("claude-haiku-4-5").map(|r| r.input_per_million),
             Some(2.0)
+        );
+        book.ingest(&[row("claude-haiku-4-5-20251001", 1.7)]);
+        assert_eq!(
+            book.rates("claude-haiku-4-5").map(|r| r.input_per_million),
+            Some(2.0),
+            "a named row isn't displaced by a refreshed alias"
+        );
+        // Two snapshots of one alias: the newest prices it.
+        let mut book = PriceBook::new();
+        book.ingest(&[
+            row("claude-3-5-sonnet-20241022", 4.0),
+            row("claude-3-5-sonnet-20240620", 3.0),
+        ]);
+        assert_eq!(
+            book.rates("claude-3-5-sonnet").map(|r| r.input_per_million),
+            Some(4.0)
+        );
+        // `switch` keeps learned rows, aliases included, until the next ingest.
+        let mut kept = PriceBook::new();
+        kept.absorb(&book);
+        assert_eq!(
+            kept.rates("claude-3-5-sonnet").map(|r| r.input_per_million),
+            Some(4.0)
         );
         let mut book = PriceBook::new();
         book.ingest(&[
