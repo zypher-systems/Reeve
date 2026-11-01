@@ -258,29 +258,41 @@ impl UndoStore {
             return Ok(Some("something is there now".into()));
         };
         let kind = meta.file_type();
-        if kind.is_symlink() {
-            if b.link.is_none() {
-                return Ok(Some("it is a link now".into()));
-            }
-            let target = fs::read_link(path)?.to_string_lossy().into_owned();
-            if sha256_hex(target.as_bytes()) != b.sha256 {
-                return Ok(Some("it points elsewhere".into()));
-            }
-        } else if kind.is_file() {
-            if b.link.is_some() {
-                return Ok(Some("it is a file now, not a link".into()));
-            }
-            if sha256_hex(&fs::read(path)?) != b.sha256 {
-                return Ok(Some("its content changed".into()));
-            }
-        } else if kind.is_dir() {
+        if kind.is_dir() {
             return Ok(Some("it is a directory now".into()));
-        } else {
+        }
+        if !kind.is_file() && !kind.is_symlink() {
             return Ok(Some("it is not a regular file now".into()));
         }
+        if kind.is_symlink() != b.link.is_some() {
+            return Ok(Some(
+                if kind.is_symlink() {
+                    "it is a link now"
+                } else {
+                    "it is a file now, not a link"
+                }
+                .into(),
+            ));
+        }
+        // The mode before the content: a file made unreadable is refused
+        // for its mode, not for the read it stops.
         let (now, was) = (mode_of(&meta), b.mode & 0o7777);
         if now != was {
             return Ok(Some(format!("its mode is {now:04o}, was {was:04o}")));
+        }
+        let (content, differs) = if kind.is_symlink() {
+            (
+                fs::read_link(path)?
+                    .to_string_lossy()
+                    .into_owned()
+                    .into_bytes(),
+                "it points elsewhere",
+            )
+        } else {
+            (fs::read(path)?, "its content changed")
+        };
+        if sha256_hex(&content) != b.sha256 {
+            return Ok(Some(differs.into()));
         }
         Ok(None)
     }
@@ -614,6 +626,10 @@ mod tests {
             fs::metadata(&f).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        // A mode Reeve can't read through is still a mode, not a read error.
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o000)).unwrap();
+        let e = store.revert(&undo).unwrap_err().to_string();
+        assert!(e.contains("its mode is 0000, was 0644"), "{e}");
         // Put back as it was, the undo goes through and restores the old mode too.
         fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();
         store.revert(&undo).unwrap();

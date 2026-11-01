@@ -275,7 +275,7 @@ A fix is a transaction that has to prove it worked.
    undo record (most shell commands) is listed as still in place. A turn stopped during the
    wait, the checks or the rollback leaves the change open: the next `change_commit`, or the end
    of a turn, finishes it, and a change already undone (by the stopped rollback, or by the owner)
-   counts as rolled back.
+   counts as rolled back, while one put back again by an undo of that undo is rolled back again.
 4. **A transaction left open** when the model ends its turn is committed then, and the model is
    told the result so it can report it.
 

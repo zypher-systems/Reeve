@@ -197,6 +197,35 @@ pub struct Verify {
     pub problem: Option<String>,
 }
 
+/// Where an action stands after its undos and redos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// In effect, through this receipt: the action's own, or the redo (an
+    /// undo of its undo) that put it back.
+    InEffect(u64),
+    /// Reversed, by this undo receipt.
+    Reversed(u64),
+}
+
+/// Follow `seq`'s chain of successful undos: an undo of an undo puts the
+/// action back, and so on. Each undo comes after what it undoes, so the
+/// walk ends; a link that doesn't point forward is cut there.
+pub fn standing(all: &[Receipt], seq: u64) -> Standing {
+    let (mut cur, mut reversed) = (seq, false);
+    while let Some(u) = all
+        .iter()
+        .find(|r| r.undoes == Some(cur) && r.outcome.status == Status::Ok && r.seq > cur)
+    {
+        cur = u.seq;
+        reversed = !reversed;
+    }
+    if reversed {
+        Standing::Reversed(cur)
+    } else {
+        Standing::InEffect(cur)
+    }
+}
+
 impl ReceiptBook {
     /// Receipts under `reeve_home/receipts`.
     pub fn new(reeve_home: &Path) -> Self {
@@ -317,12 +346,19 @@ impl ReceiptBook {
         self.all().into_iter().find(|r| r.seq == seq)
     }
 
-    /// The receipt that undid `seq`, if any.
+    /// Where `seq` stands now, after its undos and redos: see [`standing`].
+    pub fn standing(&self, seq: u64) -> Standing {
+        standing(&self.all(), seq)
+    }
+
+    /// The undo that currently reverses `seq`: the last of its chain of
+    /// undos and redos, when that leaves it reversed. `None` while it is
+    /// in effect, never undone or undone and put back again.
     pub fn undone_by(&self, seq: u64) -> Option<u64> {
-        self.all()
-            .into_iter()
-            .find(|r| r.undoes == Some(seq) && r.outcome.status == Status::Ok)
-            .map(|r| r.seq)
+        match self.standing(seq) {
+            Standing::Reversed(by) => Some(by),
+            Standing::InEffect(_) => None,
+        }
     }
 
     /// The receipt to undo and its undo record, or why it can't be undone.
@@ -339,10 +375,23 @@ impl ReceiptBook {
         if matches!(target.outcome.status, Status::Denied | Status::Refused) {
             return Err(Error::Io(format!("#{seq} never ran")));
         }
-        if let Some(by) = self.undone_by(seq) {
-            return Err(Error::Io(format!("#{seq} was already undone by #{by}")));
+        match self.standing(seq) {
+            Standing::Reversed(by) => Err(Error::Io(format!("#{seq} was already undone by #{by}"))),
+            // Undone and put back again: the redo's record is what reverses
+            // it now, and the receipt will say it undoes the redo.
+            Standing::InEffect(cur) if cur != seq => {
+                let redo = self
+                    .find(cur)
+                    .ok_or_else(|| Error::Io(format!("there's no receipt #{cur}")))?;
+                let undo = redo.undo.clone().ok_or_else(|| {
+                    Error::Io(format!(
+                        "#{cur}, which put #{seq} back, has nothing to undo"
+                    ))
+                })?;
+                Ok((redo, undo))
+            }
+            Standing::InEffect(_) => Ok((target, undo)),
         }
-        Ok((target, undo))
     }
 
     /// Write the receipt for an undo attempt (successful or not).
@@ -695,5 +744,43 @@ mod tests {
         ));
         assert_eq!(r.unwrap().seq, seq + 1);
         assert!(b.verify().problem.is_none());
+    }
+
+    #[test]
+    fn an_undo_of_an_undo_puts_the_action_back() {
+        let d = tempfile::tempdir().unwrap();
+        let b = ReceiptBook::new(d.path());
+        let mut did = Receipt::draft("s", "fs_write", json!({}), Tier::T1);
+        did.outcome.status = Status::Ok;
+        did.undo = Some(Undo::Files { changes: vec![] });
+        let did = b.append(did).unwrap().seq;
+        let undo = |of: u64, status: Status| {
+            let mut r = Receipt::draft("s", "undo", json!({"seq": of}), Tier::T1);
+            r.undoes = Some(of);
+            r.outcome.status = status;
+            r.undo = Some(Undo::Files { changes: vec![] });
+            b.append(r).unwrap().seq
+        };
+        assert_eq!(b.standing(did), Standing::InEffect(did));
+        undo(did, Status::Error);
+        assert_eq!(
+            b.standing(did),
+            Standing::InEffect(did),
+            "a failed undo changes nothing"
+        );
+        let first = undo(did, Status::Ok);
+        assert_eq!(b.standing(did), Standing::Reversed(first));
+        assert_eq!(b.undone_by(did), Some(first));
+        let e = b.undo_target(did).unwrap_err().to_string();
+        assert!(e.contains(&format!("already undone by #{first}")), "{e}");
+        let redo = undo(first, Status::Ok);
+        assert_eq!(b.standing(did), Standing::InEffect(redo));
+        assert_eq!(b.undone_by(did), None);
+        // Undoing the action again goes through the redo's record.
+        let (target, _) = b.undo_target(did).unwrap();
+        assert_eq!(target.seq, redo);
+        let again = undo(redo, Status::Ok);
+        assert_eq!(b.standing(did), Standing::Reversed(again));
+        assert_eq!(b.undone_by(did), Some(again));
     }
 }

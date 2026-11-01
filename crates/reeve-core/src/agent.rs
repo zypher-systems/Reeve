@@ -1124,6 +1124,8 @@ impl Agent {
         let passed = results.iter().all(|r| r.ok);
         // Changes undone before this verdict (a rollback that was stopped
         // partway, or the owner's own undo) stay undone, and count as such.
+        // One undone and put back again is in effect, and is rolled back
+        // through the redo's record (`undo_target` resolves that).
         let mut rolled: Vec<(u64, u64)> = t
             .changes
             .iter()
@@ -2648,5 +2650,96 @@ mod tests {
             1,
             "nothing was charged"
         );
+    }
+
+    #[tokio::test]
+    async fn a_redone_change_is_rolled_back_again() {
+        let home = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in(home.path()).unwrap();
+        let note = tmp.path().canonicalize().unwrap().join("note.txt");
+        let (_home, mut a) = agent_at(home, vec![], fixed(Decision::Approve, false));
+        let noop = |_: AgentEvent| {};
+        a.run_call(&tc(1, begin("false")), &noop).await.unwrap();
+        a.run_call(
+            &tc(
+                2,
+                (
+                    "fs_write",
+                    serde_json::json!({"path": note, "content": "hi\n"}),
+                ),
+            ),
+            &noop,
+        )
+        .await
+        .unwrap();
+        let undone = a.undo(2).unwrap();
+        assert!(!note.exists());
+        let redone = a.undo(undone.seq).unwrap();
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "hi\n", "put back");
+        let out = a
+            .run_call(&tc(3, ("change_commit", serde_json::json!({}))), &noop)
+            .await
+            .unwrap();
+        assert!(!note.exists(), "rolled back through the redo's record");
+        assert!(a.txn.is_none());
+        let rs = ReceiptBook::new(&a.home).all();
+        let commit = rs.iter().find(|r| r.tool == "change_commit").unwrap();
+        assert_eq!(
+            commit.outcome.summary,
+            "failed (`false` succeeds), so rolled back 1 change"
+        );
+        let by = rs
+            .iter()
+            .find(|r| r.undoes == Some(redone.seq) && r.approved_by.starts_with("txn:"))
+            .expect("the rollback undid the redo")
+            .seq;
+        let rolled = commit.args["rolled_back"].as_array().unwrap();
+        assert_eq!(rolled.len(), 1);
+        assert_eq!(
+            (rolled[0]["seq"].as_u64(), rolled[0]["by"].as_u64()),
+            (Some(2), Some(by))
+        );
+        assert!(
+            commit.args["not_rolled_back"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(out.contains(&format!("#2 undone (receipt #{by})")), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_redone_change_is_not_called_undone() {
+        let home = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in(home.path()).unwrap();
+        let note = tmp.path().canonicalize().unwrap().join("note.txt");
+        let (_home, mut a) = agent_at(home, vec![], fixed(Decision::Approve, false));
+        let noop = |_: AgentEvent| {};
+        a.run_call(&tc(1, begin("true")), &noop).await.unwrap();
+        a.run_call(
+            &tc(
+                2,
+                (
+                    "fs_write",
+                    serde_json::json!({"path": note, "content": "hi\n"}),
+                ),
+            ),
+            &noop,
+        )
+        .await
+        .unwrap();
+        let undone = a.undo(2).unwrap();
+        a.undo(undone.seq).unwrap();
+        a.run_call(&tc(3, ("change_commit", serde_json::json!({}))), &noop)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "hi\n");
+        let rs = ReceiptBook::new(&a.home).all();
+        let commit = rs.iter().find(|r| r.tool == "change_commit").unwrap();
+        assert_eq!(
+            commit.outcome.summary,
+            "verified: say bye (1 checks passed)"
+        );
+        assert!(commit.args["rolled_back"].as_array().unwrap().is_empty());
     }
 }
