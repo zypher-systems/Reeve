@@ -1,13 +1,16 @@
-//! Live HTTP provider (Chat Completions over SSE).
+//! Live HTTP provider: Chat Completions over SSE, or Anthropic's Messages
+//! API for `kind = "anthropic"`.
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
 use std::time::Duration;
 
+use super::anthropic::{self, ModelFacts};
 use crate::config::ConnectionConfig;
 use crate::error::{Error, Result};
 use crate::llm::{
@@ -32,6 +35,8 @@ const MAX_RETRIES: u32 = 3;
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
 /// Ceiling on one backoff wait.
 const BACKOFF_CAP: Duration = Duration::from_secs(20);
+/// Most pages of a paged catalog to read (Anthropic's: 1000 models a page).
+const MODEL_PAGES: usize = 5;
 
 /// Statuses worth trying again: rate limits, overload, and gateway noise.
 fn is_retryable_status(code: u16) -> bool {
@@ -68,13 +73,17 @@ fn jitter_ms() -> u16 {
     (nanos % 250) as u16
 }
 
-/// reqwest-backed provider for OpenRouter and OpenAI-compatible endpoints.
+/// reqwest-backed provider for OpenRouter, OpenAI-compatible endpoints,
+/// and Anthropic.
 pub struct HttpProvider {
     client: reqwest::Client,
     base_url: String,
     api_key: String,
     kind: String,
     local: bool,
+    /// What Anthropic's catalog said about its models, from `list_models`:
+    /// output ceilings and what each takes.
+    facts: Mutex<HashMap<String, ModelFacts>>,
 }
 
 impl HttpProvider {
@@ -97,12 +106,27 @@ impl HttpProvider {
             api_key,
             kind: conn.kind.clone(),
             local,
+            facts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn anthropic(&self) -> bool {
+        self.kind == "anthropic"
+    }
+
+    /// Which stream to expect back.
+    fn wire(&self) -> Wire {
+        if self.anthropic() {
+            Wire::Anthropic(anthropic::EventState::default())
+        } else {
+            Wire::Chat
         }
     }
 
     /// Check that the key works, and say what the provider knows about it.
     /// OpenRouter has a key endpoint (usage and limit); elsewhere, an
-    /// authenticated `/models` call is the check.
+    /// authenticated `/models` call is the check (Anthropic's catalog wants
+    /// the key too).
     pub async fn verify(&self) -> Result<String> {
         if self.kind == "openrouter" {
             let resp = self
@@ -136,6 +160,20 @@ impl HttpProvider {
     fn headers(&self) -> Result<HeaderMap> {
         let mut h = HeaderMap::new();
         h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if self.anthropic() {
+            if !self.api_key.is_empty() {
+                h.insert(
+                    "x-api-key",
+                    HeaderValue::from_str(&self.api_key)
+                        .map_err(|e| Error::Provider(e.to_string()))?,
+                );
+            }
+            h.insert(
+                "anthropic-version",
+                HeaderValue::from_static(anthropic::API_VERSION),
+            );
+            return Ok(h);
+        }
         // A keyless local server gets no Authorization header rather than
         // an empty `Bearer `, which some servers reject.
         if !self.api_key.is_empty() {
@@ -156,10 +194,22 @@ impl HttpProvider {
     }
 
     fn endpoint(&self) -> String {
-        format!("{}/chat/completions", self.base_url)
+        if self.anthropic() {
+            format!("{}/messages", self.base_url)
+        } else {
+            format!("{}/chat/completions", self.base_url)
+        }
     }
 
     fn body(&self, req: &CompletionRequest) -> Value {
+        if self.anthropic() {
+            let facts = self
+                .facts
+                .lock()
+                .ok()
+                .and_then(|f| f.get(&req.model).cloned());
+            return anthropic::body(req, facts.as_ref());
+        }
         let mut body = chat_body(req);
         // OpenRouter normalizes one reasoning setting across its models, and
         // reports the call's real cost when asked. Other OpenAI-compatible
@@ -206,7 +256,57 @@ impl HttpProvider {
                 text.trim()
             );
         }
-        format!("http {status}: {text}")
+        format!("http {status}: {}", error_body(text))
+    }
+
+    /// `GET` a URL on this connection and return the body, or the status
+    /// and body as the error.
+    async fn get_text(&self, url: &str) -> Result<String> {
+        let resp = self
+            .client
+            .get(url)
+            .headers(self.headers()?)
+            .send()
+            .await
+            .map_err(|e| Error::Provider(e.to_string()))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| Error::Provider(e.to_string()))?;
+        if !status.is_success() {
+            return Err(Error::Provider(format!(
+                "http {status}: {}",
+                error_body(&text)
+            )));
+        }
+        Ok(text)
+    }
+
+    /// Anthropic's catalog comes in pages. What it says about each model
+    /// (its output ceiling, what it accepts) is kept for the requests after.
+    async fn list_anthropic_models(&self) -> Result<Vec<ModelInfo>> {
+        let mut models = Vec::new();
+        let mut facts = HashMap::new();
+        let mut after: Option<String> = None;
+        for _ in 0..MODEL_PAGES {
+            let mut url = format!("{}/models?limit=1000", self.base_url);
+            if let Some(a) = &after {
+                url.push_str("&after_id=");
+                url.push_str(a);
+            }
+            let page = anthropic::parse_models_json(&self.get_text(&url).await?)?;
+            models.extend(page.models);
+            facts.extend(page.facts);
+            match page.next {
+                Some(id) => after = Some(id),
+                None => break,
+            }
+        }
+        if let Ok(mut f) = self.facts.lock() {
+            *f = facts;
+        }
+        Ok(models)
     }
 }
 
@@ -250,7 +350,11 @@ impl Provider for HttpProvider {
                 } else {
                     STALL_TIMEOUT
                 };
-                return Ok(Box::pin(sse_delta_stream(resp.bytes_stream(), stall)));
+                return Ok(Box::pin(sse_delta_stream(
+                    resp.bytes_stream(),
+                    stall,
+                    self.wire(),
+                )));
             }
             let wait = retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
@@ -268,28 +372,25 @@ impl Provider for HttpProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>> {
-        let resp = self
-            .client
-            .get(format!("{}/models", self.base_url))
-            .headers(self.headers()?)
-            .send()
-            .await
-            .map_err(|e| Error::Provider(e.to_string()))?;
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| Error::Provider(e.to_string()))?;
-        if !status.is_success() {
-            return Err(Error::Provider(format!("http {status}: {text}")));
+        if self.anthropic() {
+            return self.list_anthropic_models().await;
         }
+        let text = self.get_text(&format!("{}/models", self.base_url)).await?;
         parse_models_json(&text)
     }
+}
+
+/// Which stream the bytes are: Chat Completions chunks, or the Messages
+/// API's events (with the state their parser keeps between them).
+enum Wire {
+    Chat,
+    Anthropic(anthropic::EventState),
 }
 
 fn sse_delta_stream<E: std::fmt::Display>(
     byte_stream: impl Stream<Item = std::result::Result<Bytes, E>> + Send + Unpin + 'static,
     stall: Duration,
+    wire: Wire,
 ) -> impl Stream<Item = Result<StreamDelta>> + Send {
     futures_util::stream::unfold(
         StreamState {
@@ -300,6 +401,7 @@ fn sse_delta_stream<E: std::fmt::Display>(
             done: false,
             stall,
             progress: tokio::time::Instant::now(),
+            wire,
         },
         |mut st| async move {
             loop {
@@ -376,6 +478,7 @@ struct StreamState<S> {
     stall: Duration,
     /// When the last real delta arrived.
     progress: tokio::time::Instant,
+    wire: Wire,
 }
 
 /// Decode the whole characters at the front of `raw`, leaving an incomplete
@@ -412,20 +515,46 @@ fn drain_sse<S>(st: &mut StreamState<S>) {
 }
 
 fn push_block<S>(st: &mut StreamState<S>, block: &str) {
-    match super::parse::parse_blocks(block) {
-        Ok((ds, terminal)) => {
-            if !ds.is_empty() {
-                st.progress = tokio::time::Instant::now();
+    let Wire::Anthropic(state) = &mut st.wire else {
+        match super::parse::parse_blocks(block) {
+            Ok((ds, terminal)) => {
+                if !ds.is_empty() {
+                    st.progress = tokio::time::Instant::now();
+                }
+                st.pending.extend(ds.into_iter().map(Ok));
+                // `[DONE]`: the answer is whole. Waiting for the socket to close
+                // spins until the idle timeout on servers that keep it open.
+                if terminal {
+                    st.pending.push_back(Ok(StreamDelta::Done));
+                    st.done = true;
+                }
             }
-            st.pending.extend(ds.into_iter().map(Ok));
-            // `[DONE]`: the answer is whole. Waiting for the socket to close
-            // spins until the idle timeout on servers that keep it open.
-            if terminal {
+            Err(e) => st.pending.push_back(Err(e)),
+        }
+        return;
+    };
+    for data in super::parse::sse_data(block) {
+        if data.is_empty() {
+            continue;
+        }
+        let (ds, end) = anthropic::parse_event(state, &data);
+        if !ds.is_empty() {
+            st.progress = tokio::time::Instant::now();
+        }
+        st.pending.extend(ds.into_iter().map(Ok));
+        match end {
+            anthropic::End::Open => {}
+            // `message_stop`: whole, as `[DONE]` above.
+            anthropic::End::Done => {
                 st.pending.push_back(Ok(StreamDelta::Done));
                 st.done = true;
+                return;
+            }
+            anthropic::End::Failed(e) => {
+                st.pending.push_back(Err(e));
+                return;
             }
         }
-        Err(e) => st.pending.push_back(Err(e)),
     }
 }
 
@@ -520,6 +649,19 @@ fn tools_openai(tools: &[ToolSpec]) -> Value {
             })
         })
         .collect()
+}
+
+/// An error body as the provider's words when it is the usual
+/// `{"error": {"type", "message"}}`, else as it came, trimmed.
+fn error_body(text: &str) -> String {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .filter(|e| e.is_object() || e.is_string())
+                .map(super::parse::error_text)
+        })
+        .unwrap_or_else(|| text.trim().to_string())
 }
 
 fn key_error(status: u16, body: &str) -> String {
@@ -639,7 +781,7 @@ mod tests {
             b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
         let open = stream::iter(chunks(&[body])).chain(stream::pending());
         let got = collect(
-            sse_delta_stream(Box::pin(open), Duration::from_secs(60)),
+            sse_delta_stream(Box::pin(open), Duration::from_secs(60), Wire::Chat),
             Duration::from_secs(2),
         )
         .await
@@ -660,7 +802,7 @@ mod tests {
             ))
         });
         let got = collect(
-            sse_delta_stream(Box::pin(pings), Duration::from_millis(300)),
+            sse_delta_stream(Box::pin(pings), Duration::from_millis(300), Wire::Chat),
             Duration::from_secs(3),
         )
         .await
@@ -678,12 +820,109 @@ mod tests {
         let cut2 = body.find('本').unwrap() + 2;
         let parts = chunks(&[&bytes[..cut], &bytes[cut..cut2], &bytes[cut2..]]);
         let got = collect(
-            sse_delta_stream(Box::pin(stream::iter(parts)), Duration::from_secs(60)),
+            sse_delta_stream(
+                Box::pin(stream::iter(parts)),
+                Duration::from_secs(60),
+                Wire::Chat,
+            ),
             Duration::from_secs(2),
         )
         .await
         .unwrap();
         assert_eq!(got[0], Ok(StreamDelta::Text("café 日本".into())));
+    }
+
+    #[tokio::test]
+    async fn a_messages_stream_ends_at_message_stop() {
+        let body = include_str!("../../fixtures/anthropic_messages.sse");
+        let open = stream::iter(chunks(&[body.as_bytes()])).chain(stream::pending());
+        let got = collect(
+            sse_delta_stream(
+                Box::pin(open),
+                Duration::from_secs(60),
+                Wire::Anthropic(anthropic::EventState::default()),
+            ),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("waited for the socket after message_stop");
+        assert_eq!(got.last(), Some(&Ok(StreamDelta::Done)));
+        assert!(got.contains(&Ok(StreamDelta::Text("Hello".into()))));
+        assert!(got.iter().all(|d| d.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn a_messages_error_event_ends_the_stream_as_an_error() {
+        let body: &[u8] = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        let open = stream::iter(chunks(&[body])).chain(stream::pending());
+        let got = collect(
+            sse_delta_stream(
+                Box::pin(open),
+                Duration::from_secs(60),
+                Wire::Anthropic(anthropic::EventState::default()),
+            ),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(got[0], Ok(StreamDelta::Usage(_))));
+        assert!(got[1].as_ref().unwrap_err().contains("Overloaded"));
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn anthropic_gets_its_own_headers_endpoint_and_body() {
+        let conn = crate::config::connection_template("anthropic").unwrap();
+        let p = HttpProvider::new(&conn, "sk-ant-test".into());
+        let h = p.headers().unwrap();
+        assert_eq!(h.get("x-api-key").unwrap(), "sk-ant-test");
+        assert_eq!(h.get("anthropic-version").unwrap(), anthropic::API_VERSION);
+        assert!(h.get(AUTHORIZATION).is_none());
+        assert_eq!(p.endpoint(), "https://api.anthropic.com/v1/messages");
+        let req = CompletionRequest {
+            model: "claude-opus-5-5".into(),
+            system: Some("sys".into()),
+            messages: vec![crate::llm::Message::new("user", "hi")],
+            tools: vec![],
+            max_tokens: None,
+            reasoning: Some("high".into()),
+            route: Some(Route {
+                no_training: true,
+                zdr: true,
+            }),
+        };
+        let body = p.body(&req);
+        assert_eq!(body["max_tokens"], anthropic::DEFAULT_MAX_TOKENS);
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert!(
+            body.get("provider").is_none(),
+            "OpenRouter routing stays home"
+        );
+        assert!(body.get("usage").is_none());
+        // The catalog's output ceiling, once read, caps the request.
+        p.facts.lock().unwrap().insert(
+            "claude-opus-5-5".into(),
+            ModelFacts {
+                max_output: Some(8_192),
+                adaptive: Some(true),
+                effort: Some(true),
+            },
+        );
+        assert_eq!(p.body(&req)["max_tokens"], 8_192);
+        let or = crate::config::connection_template("openrouter").unwrap();
+        let h = HttpProvider::new(&or, "k".into()).headers().unwrap();
+        assert!(h.get("x-api-key").is_none() && h.get(AUTHORIZATION).is_some());
+    }
+
+    #[test]
+    fn error_bodies_read_as_the_providers_words() {
+        assert_eq!(
+            error_body(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: too large"}}"#
+            ),
+            "invalid_request_error: max_tokens: too large"
+        );
+        assert_eq!(error_body(" plain text \n"), "plain text");
     }
 
     #[test]

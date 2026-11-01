@@ -2,7 +2,8 @@
 //!
 //! `~/.reeve/config.toml` is yours; Reeve never rewrites it. Keys resolve in
 //! Ryter's order: inline `api_key` (file must be 0600) → `env_key` →
-//! `~/.reeve/keys/<connection>` → the kind's default variable.
+//! `~/.reeve/keys/<connection>` → the kind's default variable
+//! (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -20,7 +21,8 @@ pub struct Config {
     pub default_connection: String,
     /// Model used when none is named. Falls back to the connection's default.
     pub model: Option<String>,
-    /// Reasoning effort sent to OpenRouter: `low`, `medium`, `high`, or `default` (send nothing).
+    /// Reasoning effort sent to OpenRouter and Anthropic: `low`, `medium`,
+    /// `high`, or `default` (send nothing).
     pub reasoning: String,
     /// Named connections.
     pub connections: BTreeMap<String, ConnectionConfig>,
@@ -67,8 +69,9 @@ impl Default for Config {
 /// One model endpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConnectionConfig {
-    /// `openrouter`, `openai` (any OpenAI-compatible endpoint), or `local`
-    /// (a model server on this machine: no key, no API cost).
+    /// `openrouter`, `openai` (any OpenAI-compatible endpoint), `anthropic`
+    /// (Anthropic's own API), or `local` (a model server on this machine:
+    /// no key, no API cost).
     pub kind: String,
     /// API base URL, up to and including `/v1`.
     pub base_url: String,
@@ -405,7 +408,7 @@ impl Config {
 
 fn builtin_connections() -> BTreeMap<String, ConnectionConfig> {
     let mut m = BTreeMap::new();
-    for kind in ["openrouter", "openai"] {
+    for kind in ["openrouter", "openai", "anthropic"] {
         if let Ok(c) = connection_template(kind) {
             m.insert(kind.to_string(), c);
         }
@@ -435,12 +438,18 @@ pub fn connection_template(kind: &str) -> Result<ConnectionConfig> {
             Some("OPENAI_API_KEY"),
             Some("gpt-5-mini"),
         ),
+        "anthropic" | "claude" => c(
+            "anthropic",
+            "https://api.anthropic.com/v1",
+            Some("ANTHROPIC_API_KEY"),
+            Some("claude-opus-5-5"),
+        ),
         "local" | "ollama" => c("local", "http://localhost:11434/v1", None, None),
         "lmstudio" => c("local", "http://localhost:1234/v1", None, None),
         "llamacpp" => c("local", "http://localhost:8080/v1", None, None),
         other => {
             return Err(Error::Config(format!(
-                "unknown kind {other:?} (openrouter, openai, local, ollama, lmstudio, llamacpp)"
+                "unknown kind {other:?} (openrouter, openai, anthropic, local, ollama, lmstudio, llamacpp)"
             )));
         }
     })
@@ -550,11 +559,7 @@ pub fn resolve_secret_with(
     if conn.is_local() {
         return Ok(String::new());
     }
-    let fallback = match conn.kind.as_str() {
-        "openrouter" => Some("OPENROUTER_API_KEY"),
-        "openai" => Some("OPENAI_API_KEY"),
-        _ => None,
-    };
+    let fallback = default_env_key(&conn.kind);
     if let Some(k) = fallback.and_then(&env).and_then(clean) {
         return Ok(k);
     }
@@ -594,12 +599,18 @@ fn secret_source_with(
     if conn.is_local() {
         return Some("none needed".into());
     }
-    let fallback = match conn.kind.as_str() {
+    let fallback = default_env_key(&conn.kind)?;
+    set(env(fallback)).then(|| format!("${fallback}"))
+}
+
+/// The variable a kind's key is usually in, when `env_key` isn't set.
+fn default_env_key(kind: &str) -> Option<&'static str> {
+    match kind {
         "openrouter" => Some("OPENROUTER_API_KEY"),
         "openai" => Some("OPENAI_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
         _ => None,
-    }?;
-    set(env(fallback)).then(|| format!("${fallback}"))
+    }
 }
 
 /// Forget a stored key. Keys from the environment or `config.toml` are
@@ -779,6 +790,7 @@ daily_usd = 2.0
         .unwrap();
         let cfg = load_at(home.path()).unwrap();
         assert!(cfg.connections.contains_key("openrouter"));
+        assert_eq!(cfg.connections["anthropic"].kind, "anthropic");
         let (name, conn, model) = cfg.route().unwrap();
         assert_eq!((name.as_str(), model.as_str()), ("box", "qwen3"));
         assert!(conn.is_local());
@@ -825,6 +837,17 @@ daily_usd = 2.0
             secret_source_with(&cfg, home.path(), "openrouter", fallback).as_deref(),
             Some("$OPENROUTER_API_KEY")
         );
+        // Anthropic's usual variable is the last resort for its kind too.
+        let anthropic_env = |k: &str| (k == "ANTHROPIC_API_KEY").then(|| "sk-ant".to_string());
+        assert_eq!(
+            resolve_secret_with(&cfg, home.path(), "anthropic", anthropic_env).unwrap(),
+            "sk-ant"
+        );
+        assert_eq!(
+            secret_source_with(&cfg, home.path(), "anthropic", anthropic_env).as_deref(),
+            Some("$ANTHROPIC_API_KEY")
+        );
+        assert!(resolve_secret_with(&cfg, home.path(), "anthropic", no_env).is_err());
     }
 
     #[cfg(unix)]

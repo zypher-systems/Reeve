@@ -32,7 +32,7 @@ pub fn parse_blocks(body: &str) -> Result<(Vec<StreamDelta>, bool)> {
 }
 
 /// The provider's own words for an error object: `type: message`.
-fn error_text(e: &Value) -> String {
+pub(crate) fn error_text(e: &Value) -> String {
     let msg = e
         .get("message")
         .and_then(Value::as_str)
@@ -70,8 +70,9 @@ fn refused(reason: &str) -> Error {
 }
 
 /// The `data:` payload of each SSE block. Comments (keep-alives) and event
-/// names are dropped: Chat Completions doesn't use them.
-fn sse_data(body: &str) -> Vec<String> {
+/// names are dropped: Chat Completions doesn't use them, and the Messages
+/// API repeats the event name inside the payload.
+pub(crate) fn sse_data(body: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut data = String::new();
     let mut open = false;

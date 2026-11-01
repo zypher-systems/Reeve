@@ -79,9 +79,14 @@ Reeve needs.
 
 - **Connections:** OpenRouter (`kind = "openrouter"`) and any OpenAI-compatible endpoint
   (`kind = "openai"`: OpenAI, Groq, Together, llama.cpp, Ollama, vLLM, LM Studio). Both use
-  Chat Completions with SSE streaming. Local endpoints are priced at $0.
+  Chat Completions with SSE streaming. Local endpoints are priced at $0. Anthropic's own API
+  (`kind = "anthropic"`) is a second wire behind the same provider: the Messages API, with tool
+  results as blocks in one user turn, a required `max_tokens` taken from the catalog, `reasoning`
+  sent as adaptive thinking plus `effort` on the models that take them, and thinking blocks shown
+  but not sent back (Reeve's system prompt changes every round, which would invalidate them).
 - **Prices:** pulled live from each connection's `GET /models`. For OpenRouter that is per-token
-  prompt, completion, and cache pricing. They are refreshed at startup and when the model picker
+  prompt, completion, and cache pricing. Anthropic's catalog has none, so a table of its published
+  list prices stands in. They are refreshed at startup and when the model picker
   opens, and TOML `[pricing]` overrides them. **A cost the provider reports (`usage.cost`) always
   beats the price book.**
 - **Tokens tracked:** input, output, cache read, **and cache write**. Ryter ignores cache writes;
@@ -95,7 +100,7 @@ Reeve needs.
   session warns and shows `≥$x`.
 - **Keys:** stored in `~/.reeve/keys/<connection>` (0600). The lookup order is Ryter's: inline
   (the config file must be 0600), then `env_key`, then the stored key, then the kind's default
-  variable (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`). The `keys/` directory is on the policy's
+  variable (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`). The `keys/` directory is on the policy's
   never-read list (§5.4).
 
 ### 3.1 Privacy

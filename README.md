@@ -40,6 +40,10 @@ With a package, start the observer yourself: `systemctl --user enable --now reev
 
 Then run `reeve`, type `/providers`, and paste your API key. `reeve doctor` checks the whole install.
 
+A model comes through a *connection*: OpenRouter, Anthropic's own API, any OpenAI-compatible endpoint
+(OpenAI, Groq, vLLM, …), or a model server on this machine (Ollama, llama.cpp, LM Studio: no key, $0).
+`/providers` adds one and picks its model; the drafter and standing orders can each use their own.
+
 Updating: when a newer release is out, the header shows `↑ <version>`. `reeve update` installs it the same way
 Reeve was installed (the release's installer, dnf, apt-get, or your AUR helper), checked against the release's
 signed `SHA256SUMS` and with a receipt. A package that came from a distribution's repository is updated through
@@ -273,6 +277,7 @@ Reeve reads your machine, so what it sends a model could include keys from dotfi
 - **Secrets go one way.** A `<secretN>` can only be written back into a file's content (an edit of a file that holds a key still works), never into a command. So an instruction hidden in a log can't have the model send your key anywhere.
 - **Levels:** `standard` in chat; `strict` for the drafter and standing orders, which also masks private IPs, MACs, and UUIDs. Add your own words (a company, a project) with `[privacy] terms`.
 - **OpenRouter routing:** by default, requests go only to providers that don't store or train on prompts (`data_collection = "deny"`). Zero data retention (`zdr`) is one key away. If no provider for your model qualifies, Reeve says so.
+- **Anthropic directly:** there is nothing to route; requests go to Anthropic under its own API terms. The `no_training` and `zdr` switches are OpenRouter's and don't apply.
 - **`/privacy`** shows all of it, and every value masked this session. Secrets are shown only by their ends.
 - Local models are never masked, since nothing leaves.
 
