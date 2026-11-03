@@ -12,6 +12,11 @@ pub enum Error {
     /// Filesystem or serialization trouble.
     #[error("io: {0}")]
     Io(String),
+    /// An undo that couldn't go through: what it would put back has
+    /// changed since, or the package manager has nothing to put back.
+    /// Nothing was changed.
+    #[error("{0}")]
+    Undo(String),
     /// A spending cap was reached. The work stopped.
     #[error("budget: {0}")]
     Budget(String),

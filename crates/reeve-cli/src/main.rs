@@ -688,7 +688,20 @@ fn doctor(cfg: &Config, home: &std::path::Path) {
         Ok((name, _, model)) => {
             ok(format!("{model} via {name}"));
             match config::secret_source(cfg, home, &name) {
-                Some(src) => ok(format!("key for {name}: {src}")),
+                Some(src) => {
+                    ok(format!("key for {name}: {src}"));
+                    // A key file anyone else can read is a key anyone else has.
+                    let file = home.join("keys").join(&name);
+                    if let Ok(m) = std::fs::metadata(&file) {
+                        if m.mode() & 0o077 != 0 {
+                            warn(format!(
+                                "{} is mode {:o}, not 600: chmod 600 it",
+                                file.display(),
+                                m.mode() & 0o777
+                            ));
+                        }
+                    }
+                }
                 None => bad(format!(
                     "no key for {name}: run `reeve`, then /providers (or `reeve key set {name}`)"
                 )),
@@ -749,10 +762,17 @@ fn doctor(cfg: &Config, home: &std::path::Path) {
     }
     match reeve_core::findings::ObserverStatus::load(home) {
         Some(s) if s.alive(chrono::Utc::now()) => ok(format!("reeved is running (pid {})", s.pid)),
-        _ if unit.is_some() => warn(format!(
-            "reeved isn't running ({}): systemctl --user start reeved",
-            reeve_observer::service::state()
-        )),
+        _ if unit.is_some() => match reeve_observer::service::state().as_str() {
+            // The unit runs, but nothing fresh is in this home: a reeved on
+            // another REEVE_HOME, or one that just started.
+            "active" => warn(format!(
+                "reeved's unit is active, but no fresh status has reached {}: is it running with another REEVE_HOME, or did it just start?",
+                home.display()
+            )),
+            state => warn(format!(
+                "reeved isn't running ({state}): systemctl --user start reeved"
+            )),
+        },
         _ => {}
     }
 

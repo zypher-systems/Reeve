@@ -67,6 +67,49 @@ impl Paths {
     }
 }
 
+/// Why an undo couldn't take old versions from apt's cache here, if it
+/// couldn't. apt-get keeps what it downloads unless apt.conf says
+/// otherwise: `APT::Keep-Downloaded-Packages "false"`, or a post-invoke
+/// hook that empties the archives after every run (container images ship
+/// one as docker-clean). apt(8)'s own `Binary::apt::` setting doesn't bind
+/// apt-get, which is what Reeve runs.
+pub fn cache_cleaned() -> Option<String> {
+    let dump = std::process::Command::new("apt-config")
+        .arg("dump")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())?;
+    cache_cleaned_in(&dump)
+}
+
+/// [`cache_cleaned`], on what `apt-config dump` printed.
+pub fn cache_cleaned_in(dump: &str) -> Option<String> {
+    for line in dump.lines().map(str::trim) {
+        let Some((key, value)) = line.split_once(' ') else {
+            continue;
+        };
+        let value = value.trim().trim_end_matches(';').trim_matches('"');
+        if key == "APT::Keep-Downloaded-Packages"
+            && crate::policy::apt_syntax::string_to_bool(value) == Some(false)
+        {
+            return Some("APT::Keep-Downloaded-Packages is off in apt.conf".into());
+        }
+        if (key.starts_with("DPkg::Post-Invoke") || key.starts_with("APT::Update::Post-Invoke"))
+            && (value.contains("/var/cache/apt/archives")
+                || value.contains("apt-get clean")
+                || value.contains("apt clean"))
+        {
+            return Some(
+                "a post-invoke hook in apt.conf empties the archives after every run".into(),
+            );
+        }
+    }
+    None
+}
+
 /// Where the log ends now; the next command's changes start here.
 pub fn mark(log: &Path) -> u64 {
     crate::pacman::mark(log)
@@ -568,6 +611,29 @@ Conf reeve-t-lib (2 local-deb [all])
         assert_eq!(p.cache, PathBuf::from("/srv/apt/archives"));
         let d = Paths::from_conf("", None);
         assert_eq!((d.log.to_str(), d.cache.to_str()), (Some(LOG), Some(CACHE)));
+    }
+
+    #[test]
+    fn a_cleaned_cache_is_named() {
+        // docker-clean, as `apt-config dump` prints it.
+        let docker = "APT::Update::Post-Invoke \"\";\n\
+            APT::Update::Post-Invoke:: \"rm -f /var/cache/apt/archives/*.deb /var/cache/apt/archives/partial/*.deb /var/cache/apt/*.bin || true\";\n\
+            DPkg::Post-Invoke \"\";\n\
+            DPkg::Post-Invoke:: \"rm -f /var/cache/apt/archives/*.deb /var/cache/apt/archives/partial/*.deb /var/cache/apt/*.bin || true\";\n\
+            Binary::apt::APT::Keep-Downloaded-Packages \"0\";\n";
+        assert!(cache_cleaned_in(docker).is_some_and(|w| w.contains("after every run")));
+        assert!(
+            cache_cleaned_in("APT::Keep-Downloaded-Packages \"false\";\n")
+                .is_some_and(|w| w.contains("Keep-Downloaded-Packages"))
+        );
+        assert!(cache_cleaned_in("APT::Keep-Downloaded-Packages \"no\";\n").is_some());
+        // apt(8)'s own default doesn't bind apt-get, which is what Reeve
+        // runs; snapper's hook isn't a clean; the default keeps everything.
+        let kept = "Binary::apt::APT::Keep-Downloaded-Packages \"0\";\n\
+            DPkg::Post-Invoke:: \"if [ -x /usr/bin/snapper ]; then snapper create -d apt; fi\";\n\
+            APT::Keep-Downloaded-Packages \"true\";\n";
+        assert_eq!(cache_cleaned_in(kept), None);
+        assert_eq!(cache_cleaned_in(""), None);
     }
 
     #[test]

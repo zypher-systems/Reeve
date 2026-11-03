@@ -305,7 +305,7 @@ impl UndoStore {
             Undo::Files { changes } => {
                 for c in changes {
                     if let Some(how) = Self::changed_since(Path::new(&c.path), c.post.as_ref())? {
-                        return Err(Error::Io(format!(
+                        return Err(Error::Undo(format!(
                             "{} has changed since Reeve touched it ({how}); not undoing, to keep the newer version",
                             c.path
                         )));
@@ -322,13 +322,19 @@ impl UndoStore {
                         root: c.root,
                     });
                 }
-                let summary = match changes.len() {
-                    1 => format!("restored {}", changes[0].path),
-                    n => format!("restored {n} files"),
+                // A file Reeve created has nothing to restore: undo removes it.
+                let (restored, removed): (Vec<_>, Vec<_>) =
+                    changes.iter().partition(|c| c.pre.is_some());
+                let summary = match (restored.len(), removed.len()) {
+                    (1, 0) => format!("restored {}", restored[0].path),
+                    (0, 1) => format!("removed {} (it didn't exist before)", removed[0].path),
+                    (r, 0) => format!("restored {r} files"),
+                    (0, d) => format!("removed {d} files that didn't exist before"),
+                    (r, d) => format!("restored {r} files, removed {d} that didn't exist before"),
                 };
                 Ok((Undo::Files { changes: inverse }, summary))
             }
-            Undo::Packages { .. } | Undo::Pacman { .. } | Undo::Apt { .. } | Undo::Unit { .. } => Err(Error::Io(
+            Undo::Packages { .. } | Undo::Pacman { .. } | Undo::Apt { .. } | Undo::Unit { .. } => Err(Error::Undo(
 
                 "package and service changes are undone through their own tools, not the file store".into(),
             )),
@@ -344,14 +350,14 @@ impl UndoStore {
                     // if it's still that file.
                     Some(b) => {
                         if let Some(how) = Self::changed_since(back, Some(b))? {
-                            return Err(Error::Io(format!(
+                            return Err(Error::Undo(format!(
                                 "{from} has changed since Reeve put it back ({how}); not moving over it"
                             )));
                         }
                     }
                     None => {
                         if fs::symlink_metadata(back).is_ok() {
-                            return Err(Error::Io(format!(
+                            return Err(Error::Undo(format!(
                                 "{from} exists again; not moving over it"
                             )));
                         }
@@ -359,7 +365,7 @@ impl UndoStore {
                 }
                 if matches!(fs::symlink_metadata(to), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
                 {
-                    return Err(Error::Io(format!("{to} is gone; nothing to move back")));
+                    return Err(Error::Undo(format!("{to} is gone; nothing to move back")));
                 }
                 // rename replaces a file at `from` in one step.
                 fs::rename(to, from)?;
