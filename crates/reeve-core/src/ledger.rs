@@ -140,6 +140,8 @@ pub struct Totals {
 /// Read this month's ledger. A torn final line (a crash mid-write, with
 /// no newline after it) is skipped quietly; any other line that doesn't
 /// parse, or a file that can't be read, marks the totals `unreadable`.
+/// Days are cut in `now`'s offset, so the caller's clock and these
+/// totals agree.
 pub fn totals(home: &Path, now: DateTime<Local>) -> Totals {
     let today = now.date_naive();
     let path = month_path(home, now.year(), now.month());
@@ -175,7 +177,7 @@ pub fn totals(home: &Path, now: DateTime<Local>) -> Totals {
         }
     });
     for rec in records.collect::<Vec<_>>() {
-        let day: NaiveDate = rec.ts.with_timezone(&Local).date_naive();
+        let day: NaiveDate = rec.ts.with_timezone(now.offset()).date_naive();
         if day.year() != today.year() || day.month() != today.month() {
             continue;
         }
@@ -284,7 +286,7 @@ pub fn role_today(home: &Path, role: &str, now: DateTime<Local>) -> Tally {
         .filter_map(|l| serde_json::from_str::<SpendRecord>(l).ok())
     {
         if rec.role.as_deref() == Some(role)
-            && rec.ts.with_timezone(&Local).date_naive() == now.date_naive()
+            && rec.ts.with_timezone(now.offset()).date_naive() == now.date_naive()
         {
             t.add(rec.usd, rec.usage);
         }

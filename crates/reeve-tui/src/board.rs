@@ -1791,7 +1791,13 @@ pub fn composer(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
                 vec![Span::raw(" ".repeat(lead_w))]
             };
             spans.push(Span::styled(row.clone(), t.text()));
-            lines.push(Line::from(spans));
+            // Enter was pressed mid-turn: the keys beside the draft say it
+            // waits (and give way when the draft fills the row).
+            lines.push(if i == 0 && v.busy && v.busy_hinted {
+                split(spans, right.clone(), w)
+            } else {
+                Line::from(spans)
+            });
         }
     }
     let visible = body.height as usize;
@@ -1891,6 +1897,53 @@ mod health_tests {
         assert!(
             !mem.contains("temp") && mem.chars().count() <= 60,
             "{mem:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod composer_tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn render(v: &View) -> String {
+        let (w, h) = (120, 8);
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let t = Theme::slate();
+        term.draw(|f| composer(f, f.area(), v, &t)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let mut s = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                s.push_str(buf[(x, y)].symbol());
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn the_mid_turn_hint_shows_beside_the_draft() {
+        let mut v = View::new(reeve_observer::HostInfo::default());
+        v.ready = true;
+        v.chat = true;
+        v.busy = true;
+        v.input = "next question".into();
+        // Typing alone says nothing; enter does, beside the draft.
+        assert!(!render(&v).contains("again when Reeve is done"));
+        v.enter_while_busy();
+        let s = render(&v);
+        assert!(
+            s.contains("› next question") && s.contains("again when Reeve is done"),
+            "{s}"
+        );
+        // The turn ends: the keys go back to normal and the draft stays.
+        v.busy = false;
+        let s = render(&v);
+        assert!(
+            s.contains("› next question") && !s.contains("again when Reeve is done"),
+            "{s}"
         );
     }
 }
