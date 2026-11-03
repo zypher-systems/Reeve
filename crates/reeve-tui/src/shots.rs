@@ -468,7 +468,7 @@ fn fill(v: &mut View, home: Option<&Path>) {
         .collect();
     v.board = crate::board::read(home, &reeve_core::memory::Memory::new(home));
     v.board.report = Some(Box::new(reeve_observer::report::gather(home, 1)));
-    v.totals = reeve_core::ledger::totals(home, chrono::Local::now());
+    v.totals = reeve_core::ledger::totals(home, crate::view::now());
     v.drafter = Some((0.13, 0.25));
     let mut r = reeve_core::receipts::ReceiptBook::new(home).recent(40);
     r.truncate(40);

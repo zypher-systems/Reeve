@@ -13,7 +13,6 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chrono::Local;
 use crossterm::ExecutableCommand;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -199,7 +198,7 @@ pub fn run(cfg: Config, home: PathBuf) -> io::Result<()> {
         daily: cfg.spend.daily_usd,
         monthly: cfg.spend.monthly_usd,
     };
-    view.totals = ledger::totals(&home, Local::now());
+    view.totals = ledger::totals(&home, crate::view::now());
 
     let (ui_tx, ui_rx) = mpsc::channel::<UiMsg>();
     let (work_tx, work_rx) = unbounded_channel::<Work>();
@@ -830,6 +829,15 @@ impl App {
             KeyCode::Enter if alt || shift => view.insert("\n"),
             KeyCode::Enter => {
                 if view.busy {
+                    // Nothing queues behind a running turn: say so once,
+                    // and keep what was typed.
+                    if !view.input.trim().is_empty() && !view.busy_hinted {
+                        view.busy_hinted = true;
+                        view.push(
+                            Speaker::System,
+                            "Reeve is still on the last request (esc stops it). Your text stays in the box; press enter again when it's done.",
+                        );
+                    }
                     return;
                 }
                 if !view.ready {
@@ -2561,7 +2569,7 @@ async fn agent_loop(
                     () = a.turn(text, &emit) => {}
                     () = cancel.notified() => emit(AgentEvent::Error("stopped".into())),
                 }
-                let _ = tx.send(UiMsg::Totals(ledger::totals(&home, Local::now())));
+                let _ = tx.send(UiMsg::Totals(ledger::totals(&home, crate::view::now())));
             }
             AgentWork::Reflect => match agent.as_mut() {
                 Some(a) => reflect_now(a, &tx).await,
@@ -2780,7 +2788,7 @@ fn export_spend(home: &std::path::Path, p: &crate::overlay::SpendPanel) -> Resul
     let path = dir.join(format!(
         "spend-{}-{}.csv",
         p.range.label(),
-        Local::now().format("%Y-%m-%d")
+        crate::view::now().format("%Y-%m-%d")
     ));
     let mut csv = String::from(
         "first_call,session,role,model,calls,input_tokens,cached_tokens,output_tokens,usd,unpriced\n",

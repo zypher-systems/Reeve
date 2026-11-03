@@ -1743,7 +1743,7 @@ impl SpendRange {
     /// The start of the range.
     pub fn since(self) -> chrono::DateTime<chrono::Utc> {
         use chrono::{Datelike, Local, TimeZone};
-        let now = Local::now();
+        let now = crate::view::now();
         let midnight = |d: chrono::NaiveDate| {
             Local
                 .from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap_or_default())

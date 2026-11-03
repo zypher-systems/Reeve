@@ -612,7 +612,7 @@ fn activity(f: &mut Frame, area: Rect, v: &View, p: &ReceiptsPanel, t: &Theme) {
             " "
         };
         let when = rc.ts.with_timezone(&Local);
-        let time = if (Local::now() - when).num_hours() < 20 {
+        let time = if (crate::view::now() - when).num_hours() < 20 {
             when.format("%H:%M").to_string()
         } else {
             when.format("%m-%d").to_string()

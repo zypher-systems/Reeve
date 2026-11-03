@@ -462,7 +462,7 @@ pub fn top_bar(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
         }
     }
     right.push(Span::styled(
-        format!("  {}", Local::now().format("%H:%M")),
+        format!("  {}", crate::view::now().format("%H:%M")),
         Style::default().fg(t.fg).add_modifier(Modifier::BOLD),
     ));
     // The facts give way first, then the pills from the left.
@@ -915,30 +915,37 @@ fn health(r: Rect, v: &View, t: &Theme) -> Vec<Line<'static>> {
     if r.height >= 9 {
         out.push(Line::raw(""));
     }
-    // Memory and swap, temperature and network: two columns.
+    // Memory and swap, temperature and network: two columns. The bars give
+    // way to their figures (" 24.2G/60.4G" is 12 wide, " 3M/8.0G" 8), so
+    // the left column ends where the gutter starts instead of running into
+    // "temp".
     let half = w.saturating_sub(3) / 2;
     let paired = w >= 70;
-    let bar_w = if paired {
-        half.saturating_sub(5 + 5 + 9)
-    } else {
-        w.saturating_sub(5 + 5 + 12)
-    }
-    .max(4);
+    let figures =
+        |used: u64, total: u64| (total > 0).then(|| format!(" {}/{}", gib(used), gib(total)));
+    let mem_figs = figures(s.mem_used, s.mem_total);
+    let swap_figs = figures(s.swap_used, s.swap_total);
+    let figs_w = [&mem_figs, &swap_figs]
+        .into_iter()
+        .flatten()
+        .map(|f| f.chars().count())
+        .max()
+        .unwrap_or(12);
+    let bar_w = if paired { half } else { w }
+        .saturating_sub(5 + 5 + figs_w)
+        .max(4);
     let mut mem = vec![Span::styled("mem  ", t.muted())];
     let mut swap = vec![Span::styled("swap ", t.muted())];
-    if s.mem_total > 0 {
+    if let Some(figs) = mem_figs {
         let rm = s.mem_used as f64 / s.mem_total as f64;
         mem.push(Span::styled(
             format!("{:>3.0}% ", rm * 100.0),
             Style::default().fg(t.fg).add_modifier(Modifier::BOLD),
         ));
         mem.extend(meter(rm, bar_w, level(rm, t), t));
-        mem.push(Span::styled(
-            format!(" {}/{}", gib(s.mem_used), gib(s.mem_total)),
-            t.muted(),
-        ));
+        mem.push(Span::styled(figs, t.muted()));
     }
-    if s.swap_total > 0 {
+    if let Some(figs) = swap_figs {
         let rs = s.swap_used as f64 / s.swap_total as f64;
         swap.push(Span::styled(
             format!("{:>3.0}% ", rs * 100.0),
@@ -947,10 +954,7 @@ fn health(r: Rect, v: &View, t: &Theme) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ));
         swap.extend(meter(rs, bar_w, level(rs, t), t));
-        swap.push(Span::styled(
-            format!(" {}/{}", gib(s.swap_used), gib(s.swap_total)),
-            t.muted(),
-        ));
+        swap.push(Span::styled(figs, t.muted()));
     } else {
         swap.push(Span::styled("none", t.ghost()));
     }
@@ -1174,7 +1178,7 @@ fn spend(r: Rect, v: &View, t: &Theme) -> Vec<Line<'static>> {
     ])];
     let hours = &v.board.hours;
     if !hours.is_empty() && r.height >= 6 {
-        let now = Local::now()
+        let now = crate::view::now()
             .format("%H")
             .to_string()
             .parse::<usize>()
@@ -1842,5 +1846,41 @@ mod tests {
         assert_eq!(m.iter().map(|s| s.content.width()).sum::<usize>(), 16);
         let m = meter(1.0, 16, t.bad, &t);
         assert_eq!(m.iter().map(|s| s.content.width()).sum::<usize>(), 16);
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    #[test]
+    fn the_memory_figures_stop_short_of_the_gutter() {
+        let mut v = View::new(reeve_observer::HostInfo::default());
+        v.snap.mem_total = 65_000_000_000; // 60.5G: a 12-wide " used/total"
+        v.snap.mem_used = 26_000_000_000;
+        v.snap.swap_total = 8 << 30;
+        v.snap.swap_used = 3 << 20;
+        v.snap.temp_c = Some(56.0);
+        let t = Theme::slate();
+        let rows = |w: u16| -> Vec<String> {
+            health(Rect::new(0, 0, w, 12), &v, &t)
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        let mem = rows(78)
+            .into_iter()
+            .find(|l| l.starts_with("mem "))
+            .unwrap();
+        assert!(mem.contains("24.2G/60.5G   temp  56°"), "{mem:?}");
+        // One column when narrow, and the figures still fit the width.
+        let mem = rows(60)
+            .into_iter()
+            .find(|l| l.starts_with("mem "))
+            .unwrap();
+        assert!(
+            !mem.contains("temp") && mem.chars().count() <= 60,
+            "{mem:?}"
+        );
     }
 }
