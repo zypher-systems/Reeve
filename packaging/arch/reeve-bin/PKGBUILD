@@ -9,6 +9,8 @@ pkgdesc="An operator agent that manages this computer, with receipts"
 arch=('x86_64' 'aarch64')
 url="https://github.com/zypher-systems/reeve"
 license=('Apache-2.0')
+# A prebuilt binary: no reeve-bin-debug split package, and nothing stripped.
+options=('!debug' '!strip')
 depends=('bash' 'sudo' 'util-linux' 'systemd')
 optdepends=('libnotify: desktop notifications for findings'
             'snapper: snapshots around root changes')

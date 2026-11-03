@@ -69,7 +69,9 @@ license-file = ["../../LICENSE", "0"]
 section = "admin"
 priority = "optional"
 depends = "bash, sudo, util-linux, systemd"
-recommends = "libnotify-bin, snapper"
+# Suggests, not Recommends: apt installs Recommends by default, and a server
+# shouldn't get snapper and its timers for having installed Reeve.
+suggests = "libnotify-bin, snapper"
 extended-description = """Reeve is an operator harness: an agent that runs on your computer and
 manages it. It installs and removes packages, fixes services, reads logs,
 tidies disks, and edits configuration across the whole filesystem. Every
