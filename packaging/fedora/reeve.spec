@@ -18,7 +18,7 @@
 %global __brp_mangle_shebangs_exclude_from ^/usr/src/debug/.*$
 
 Name:           reeve
-Version:        0.9.0
+Version:        0.9.1
 Release:        1%{?dist}
 Summary:        An operator agent that manages this computer, with receipts
 
@@ -87,6 +87,12 @@ install -Dpm 0644 packaging/systemd/reeved.service %{buildroot}%{_userunitdir}/r
 %{_userunitdir}/reeved.service
 
 %changelog
+* Mon Nov 02 2026 Zypher Systems <zypher@zyphersystems.com> - 0.9.1-1
+- The health tile's memory figures no longer run into the temperature; every TUI clock shares one offset read at start.
+- apt installs, upgrades and removals say on their card when apt.conf empties the download cache, where an undo takes what it puts back from.
+- Undoing a created file says it was removed; undo refusals lose the "io:" prefix; `command -v` is a lookup, not a run.
+- The Debian package suggests snapper and libnotify-bin instead of recommending them.
+
 * Sun Nov 01 2026 Zypher Systems <zypher@zyphersystems.com> - 0.9.0-1
 - Anthropic's own API is a connection kind (kind = "anthropic"), for the chat, the drafter and standing orders.
 - Claude models are priced from Anthropic's list prices; the catalog's output ceilings and capabilities shape each request.

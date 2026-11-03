@@ -452,7 +452,7 @@ impl ReceiptBook {
                 let partial = e.partial.is_some();
                 r.undo = e.partial;
                 let r = self.append(r)?;
-                Err(Error::Io(if partial {
+                Err(Error::Undo(if partial {
                     format!("{}. Receipt #{} undoes that part.", e.why, r.seq)
                 } else {
                     e.why

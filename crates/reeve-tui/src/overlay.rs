@@ -1742,10 +1742,11 @@ pub enum SpendRange {
 impl SpendRange {
     /// The start of the range.
     pub fn since(self) -> chrono::DateTime<chrono::Utc> {
-        use chrono::{Datelike, Local, TimeZone};
-        let now = Local::now();
+        use chrono::{Datelike, TimeZone};
+        let now = crate::view::now();
+        // Midnight in the zone the screen's clocks use: one offset per run.
         let midnight = |d: chrono::NaiveDate| {
-            Local
+            crate::view::offset()
                 .from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap_or_default())
                 .earliest()
                 .map_or_else(chrono::Utc::now, |t| t.with_timezone(&chrono::Utc))

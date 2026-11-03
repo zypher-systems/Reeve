@@ -472,6 +472,17 @@ pub(super) fn plan(ctx: &ToolCtx, c: &SysCall) -> Planned {
     if matches!(c.capture, Capture::Transaction) && asm.tier < Tier::T2 {
         asm.raise(Tier::T2, "changes installed packages");
     }
+    // An apt change is undone from apt's cache (an install can replace
+    // versions too): say now when this apt.conf empties it, not at undo
+    // time.
+    if matches!(c.capture, Capture::Transaction) && matches!(ctx.distro, Distro::Debian { .. }) {
+        if let Some(why) = crate::apt::cache_cleaned() {
+            asm.raise(
+                Tier::T2,
+                format!("undo would have to fetch what it puts back from the mirror ({why})"),
+            );
+        }
+    }
     let rule = if asm.tier == Tier::T1 {
         asm.session_keys()
             .unwrap_or_else(|| vec![format!("{}:{}", c.tool, c.command)])

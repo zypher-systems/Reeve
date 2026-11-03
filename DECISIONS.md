@@ -688,3 +688,19 @@ Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / W
 - **Why:** The user wants Reeve to get better by learning how the system runs, and the user must be able to see and correct what it learned.
 - **Where:** `reeve-core/src/memory/`, `reeve-observer` (M3, M4)
 - **Residual risk:** Findings and journal text are written by arbitrary processes, and a proposal drafted from them can carry injected instructions. Proposals are T0-only to draft and need approval to run, and standing-order scopes are hard allowlists.
+
+### 2026-11-02: What the distrobox drive changed
+- **Decision:**
+  - The Debian package *suggests* snapper and libnotify-bin instead of recommending them. The Fedora package keeps its Recommends.
+  - On Debian, a package install, upgrade or removal says on its approval card when apt is configured to delete what it downloads (docker-clean, `APT::Keep-Downloaded-Packages "false"`), because that is where an undo gets the old versions from.
+  - The TUI stamps its ledger with one offset read at startup, not chrono's per-call local time.
+- **Chosen vs rejected:**
+  - Rejected keeping Recommends on Debian: apt installs them by default, so a headless Debian 13 got snapper and three timers for installing Reeve.
+  - Rejected refusing the upgrade when the cache is cleaned: an undo can still fetch the old version from the mirror while it is there; a warning tells the truth without blocking updates.
+  - Rejected keeping `Local::now()` per entry: chrono re-reads `/etc/localtime` once a second and answers in UTC while that read fails, which stamped one entry five hours off during the drive.
+- **Why:** Four distrobox sessions (Debian 13, Ubuntu 24.04, Arch, Tumbleweed) on 2026-11-02 against the 0.9.0 packages.
+- **Where:** `reeve-cli/Cargo.toml`, `reeve-core/src/apt.rs`, `reeve-core/src/tools/sys.rs`, `reeve-tui/src/view.rs`
+- **Residual risk:** A DST change during a session leaves the ledger on the old offset until Reeve restarts. The apt warning reads `apt-config dump` at approval time; an `apt.conf` that cleans the cache in a way the two patterns don't match goes unwarned, and the undo then fails as before, with nothing changed.
+- **After review (2026-11-03):** `command`'s options are only `-p`, `-v`, `-V` and clusters of them; a bare `-`, `--` or any other word ends them and the word after is the program, as bash reads it. The mid-turn hint lives in the composer's keys, not the ledger, so a streaming reply stays one entry. Every stored UTC time on screen goes through the one offset, and the apt note covers installs too.
+- **After review, round 2 (2026-11-03):** the hint is drawn beside the draft on the typed row as well (it was built, but only drawn with an empty box). The spend ranges on screen cut their days in the same offset as the clocks.
+- **After review, round 3 (2026-11-03):** the ledger's own totals count in the local zone again, the one `record` files by: cutting them with a fixed offset read today moved a record written under EDT into October once the clocks went back, and the budget lost it. `tests/ledger_dst.rs` pins `TZ` to a DST rule and checks a record across the change.

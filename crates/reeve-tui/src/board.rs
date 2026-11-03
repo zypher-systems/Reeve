@@ -7,7 +7,6 @@
 //! Tiles are filled surfaces with half-block edges (half a row of padding,
 //! softened corners); with 16 colors or none they get a rounded border.
 
-use chrono::Local;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -55,7 +54,10 @@ pub fn read(home: &std::path::Path, memory: &reeve_core::memory::Memory) -> crat
     b.roles.sort_by(|a, b| b.1.total_cmp(&a.1));
     b.hours = vec![0.0; 24];
     for r in &today {
-        let h = r.ts.with_timezone(&Local).format("%H").to_string();
+        let h =
+            r.ts.with_timezone(&crate::view::offset())
+                .format("%H")
+                .to_string();
         if let Ok(h) = h.parse::<usize>() {
             b.hours[h.min(23)] += r.usd.unwrap_or(0.0);
         }
@@ -462,7 +464,7 @@ pub fn top_bar(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
         }
     }
     right.push(Span::styled(
-        format!("  {}", Local::now().format("%H:%M")),
+        format!("  {}", crate::view::now().format("%H:%M")),
         Style::default().fg(t.fg).add_modifier(Modifier::BOLD),
     ));
     // The facts give way first, then the pills from the left.
@@ -915,30 +917,37 @@ fn health(r: Rect, v: &View, t: &Theme) -> Vec<Line<'static>> {
     if r.height >= 9 {
         out.push(Line::raw(""));
     }
-    // Memory and swap, temperature and network: two columns.
+    // Memory and swap, temperature and network: two columns. The bars give
+    // way to their figures (" 24.2G/60.4G" is 12 wide, " 3M/8.0G" 8), so
+    // the left column ends where the gutter starts instead of running into
+    // "temp".
     let half = w.saturating_sub(3) / 2;
     let paired = w >= 70;
-    let bar_w = if paired {
-        half.saturating_sub(5 + 5 + 9)
-    } else {
-        w.saturating_sub(5 + 5 + 12)
-    }
-    .max(4);
+    let figures =
+        |used: u64, total: u64| (total > 0).then(|| format!(" {}/{}", gib(used), gib(total)));
+    let mem_figs = figures(s.mem_used, s.mem_total);
+    let swap_figs = figures(s.swap_used, s.swap_total);
+    let figs_w = [&mem_figs, &swap_figs]
+        .into_iter()
+        .flatten()
+        .map(|f| f.chars().count())
+        .max()
+        .unwrap_or(12);
+    let bar_w = if paired { half } else { w }
+        .saturating_sub(5 + 5 + figs_w)
+        .max(4);
     let mut mem = vec![Span::styled("mem  ", t.muted())];
     let mut swap = vec![Span::styled("swap ", t.muted())];
-    if s.mem_total > 0 {
+    if let Some(figs) = mem_figs {
         let rm = s.mem_used as f64 / s.mem_total as f64;
         mem.push(Span::styled(
             format!("{:>3.0}% ", rm * 100.0),
             Style::default().fg(t.fg).add_modifier(Modifier::BOLD),
         ));
         mem.extend(meter(rm, bar_w, level(rm, t), t));
-        mem.push(Span::styled(
-            format!(" {}/{}", gib(s.mem_used), gib(s.mem_total)),
-            t.muted(),
-        ));
+        mem.push(Span::styled(figs, t.muted()));
     }
-    if s.swap_total > 0 {
+    if let Some(figs) = swap_figs {
         let rs = s.swap_used as f64 / s.swap_total as f64;
         swap.push(Span::styled(
             format!("{:>3.0}% ", rs * 100.0),
@@ -947,10 +956,7 @@ fn health(r: Rect, v: &View, t: &Theme) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ));
         swap.extend(meter(rs, bar_w, level(rs, t), t));
-        swap.push(Span::styled(
-            format!(" {}/{}", gib(s.swap_used), gib(s.swap_total)),
-            t.muted(),
-        ));
+        swap.push(Span::styled(figs, t.muted()));
     } else {
         swap.push(Span::styled("none", t.ghost()));
     }
@@ -1129,7 +1135,11 @@ fn activity(r: Rect, v: &View, t: &Theme) -> Vec<Line<'static>> {
             } else {
                 Vec::new()
             };
-            let time = rc.ts.with_timezone(&Local).format("%H:%M ").to_string();
+            let time = rc
+                .ts
+                .with_timezone(&crate::view::offset())
+                .format("%H:%M ")
+                .to_string();
             let room = w.saturating_sub(6 + 2 + 2);
             split(
                 vec![
@@ -1174,7 +1184,7 @@ fn spend(r: Rect, v: &View, t: &Theme) -> Vec<Line<'static>> {
     ])];
     let hours = &v.board.hours;
     if !hours.is_empty() && r.height >= 6 {
-        let now = Local::now()
+        let now = crate::view::now()
             .format("%H")
             .to_string()
             .parse::<usize>()
@@ -1726,6 +1736,10 @@ pub fn composer(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
     let lead_w = width(&lead);
     let text_w = w.saturating_sub(lead_w).max(4);
     let right = match screen {
+        // Enter was pressed mid-turn: the text waits in the box.
+        _ if v.busy && v.busy_hinted => {
+            hints(&[("⏎", "again when Reeve is done"), ("esc", "stop")], t)
+        }
         _ if v.busy => hints(&[("esc", "stop")], t),
         Screen::Board if v.approval.is_some() => {
             hints(&[("⏎", "yes"), ("n", "no"), ("F1", "details")], t)
@@ -1777,7 +1791,13 @@ pub fn composer(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
                 vec![Span::raw(" ".repeat(lead_w))]
             };
             spans.push(Span::styled(row.clone(), t.text()));
-            lines.push(Line::from(spans));
+            // Enter was pressed mid-turn: the keys beside the draft say it
+            // waits (and give way when the draft fills the row).
+            lines.push(if i == 0 && v.busy && v.busy_hinted {
+                split(spans, right.clone(), w)
+            } else {
+                Line::from(spans)
+            });
         }
     }
     let visible = body.height as usize;
@@ -1842,5 +1862,88 @@ mod tests {
         assert_eq!(m.iter().map(|s| s.content.width()).sum::<usize>(), 16);
         let m = meter(1.0, 16, t.bad, &t);
         assert_eq!(m.iter().map(|s| s.content.width()).sum::<usize>(), 16);
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    #[test]
+    fn the_memory_figures_stop_short_of_the_gutter() {
+        let mut v = View::new(reeve_observer::HostInfo::default());
+        v.snap.mem_total = 65_000_000_000; // 60.5G: a 12-wide " used/total"
+        v.snap.mem_used = 26_000_000_000;
+        v.snap.swap_total = 8 << 30;
+        v.snap.swap_used = 3 << 20;
+        v.snap.temp_c = Some(56.0);
+        let t = Theme::slate();
+        let rows = |w: u16| -> Vec<String> {
+            health(Rect::new(0, 0, w, 12), &v, &t)
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        let mem = rows(78)
+            .into_iter()
+            .find(|l| l.starts_with("mem "))
+            .unwrap();
+        assert!(mem.contains("24.2G/60.5G   temp  56°"), "{mem:?}");
+        // One column when narrow, and the figures still fit the width.
+        let mem = rows(60)
+            .into_iter()
+            .find(|l| l.starts_with("mem "))
+            .unwrap();
+        assert!(
+            !mem.contains("temp") && mem.chars().count() <= 60,
+            "{mem:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod composer_tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn render(v: &View) -> String {
+        let (w, h) = (120, 8);
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let t = Theme::slate();
+        term.draw(|f| composer(f, f.area(), v, &t)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let mut s = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                s.push_str(buf[(x, y)].symbol());
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn the_mid_turn_hint_shows_beside_the_draft() {
+        let mut v = View::new(reeve_observer::HostInfo::default());
+        v.ready = true;
+        v.chat = true;
+        v.busy = true;
+        v.input = "next question".into();
+        // Typing alone says nothing; enter does, beside the draft.
+        assert!(!render(&v).contains("again when Reeve is done"));
+        v.enter_while_busy();
+        let s = render(&v);
+        assert!(
+            s.contains("› next question") && s.contains("again when Reeve is done"),
+            "{s}"
+        );
+        // The turn ends: the keys go back to normal and the draft stays.
+        v.busy = false;
+        let s = render(&v);
+        assert!(
+            s.contains("› next question") && !s.contains("again when Reeve is done"),
+            "{s}"
+        );
     }
 }

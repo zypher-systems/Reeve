@@ -140,6 +140,10 @@ pub struct Totals {
 /// Read this month's ledger. A torn final line (a crash mid-write, with
 /// no newline after it) is skipped quietly; any other line that doesn't
 /// parse, or a file that can't be read, marks the totals `unreadable`.
+/// Days and months are cut in the local zone, the one `record` files by,
+/// so a record stays in the day and month it was written under when the
+/// clocks change (a fixed offset read after a DST change moved a record
+/// written under the old one into the month before).
 pub fn totals(home: &Path, now: DateTime<Local>) -> Totals {
     let today = now.date_naive();
     let path = month_path(home, now.year(), now.month());

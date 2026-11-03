@@ -224,7 +224,7 @@ fn as_root(asm: &mut Assessment, p: &Path) -> bool {
     let root = asm.deny.is_none() && needs_root(p);
     if root {
         asm.sudo = true;
-        asm.raise(Tier::T2, "needs root (you'll be asked for your password)");
+        asm.raise(Tier::T2, "needs root (sudo may ask for your password)");
     }
     root
 }
