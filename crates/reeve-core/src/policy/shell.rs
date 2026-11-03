@@ -1705,11 +1705,17 @@ fn assess_words(
             }
         }
         // `command -v cowsay`, `command -V ls`: says what a name is and runs
-        // nothing, like `which` and `type`.
+        // nothing, like `which` and `type`. Only command's own options
+        // count (`-p`, `-v`, `-V`, and clusters of them): a bare `-` or
+        // `--` ends them, and bash runs the word after as the program.
         "command"
             if args
                 .iter()
-                .take_while(|w| w.starts_with('-') && *w != "--")
+                .take_while(|w| {
+                    w.len() > 1
+                        && w.starts_with('-')
+                        && w[1..].chars().all(|c| matches!(c, 'p' | 'v' | 'V'))
+                })
                 .any(|w| w.contains(['v', 'V'])) => {}
         "env" | "nohup" | "time" | "command" | "exec" | "builtin" | "chronic" | "unbuffer"
         | "stdbuf" | "setsid" => {
@@ -4210,6 +4216,16 @@ mod tests {
         assert_eq!(tier("command -pV cowsay"), Tier::T0);
         assert_eq!(tier("command -v cowsay; rpm -q cowsay"), Tier::T0);
         assert!(tier("command cowsay") >= Tier::T1);
+        // A bare `-` or `--` ends the options: bash runs the next word as
+        // the program, so `-v` after it is that program's argument.
+        for cmd in [
+            "command - -v hello",
+            "command -p - -v hello",
+            "command -- -v hello",
+            "command -x -v hello",
+        ] {
+            assert!(tier(cmd) >= Tier::T1, "{cmd}");
+        }
     }
 
     #[test]

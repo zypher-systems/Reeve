@@ -692,7 +692,7 @@ Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / W
 ### 2026-11-02: What the distrobox drive changed
 - **Decision:**
   - The Debian package *suggests* snapper and libnotify-bin instead of recommending them. The Fedora package keeps its Recommends.
-  - On Debian, an upgrade or removal says on its approval card when apt is configured to delete what it downloads (docker-clean, `APT::Keep-Downloaded-Packages "false"`), because that is where an undo gets the old versions from.
+  - On Debian, a package install, upgrade or removal says on its approval card when apt is configured to delete what it downloads (docker-clean, `APT::Keep-Downloaded-Packages "false"`), because that is where an undo gets the old versions from.
   - The TUI stamps its ledger with one offset read at startup, not chrono's per-call local time.
 - **Chosen vs rejected:**
   - Rejected keeping Recommends on Debian: apt installs them by default, so a headless Debian 13 got snapper and three timers for installing Reeve.
@@ -701,3 +701,4 @@ Why, not what. Newest first. Each entry: Decision / Chosen vs rejected / Why / W
 - **Why:** Four distrobox sessions (Debian 13, Ubuntu 24.04, Arch, Tumbleweed) on 2026-11-02 against the 0.9.0 packages.
 - **Where:** `reeve-cli/Cargo.toml`, `reeve-core/src/apt.rs`, `reeve-core/src/tools/sys.rs`, `reeve-tui/src/view.rs`
 - **Residual risk:** A DST change during a session leaves the ledger on the old offset until Reeve restarts. The apt warning reads `apt-config dump` at approval time; an `apt.conf` that cleans the cache in a way the two patterns don't match goes unwarned, and the undo then fails as before, with nothing changed.
+- **After review (2026-11-03):** `command`'s options are only `-p`, `-v`, `-V` and clusters of them; a bare `-`, `--` or any other word ends them and the word after is the program, as bash reads it. The mid-turn hint lives in the composer's keys, not the ledger, so a streaming reply stays one entry. Every stored UTC time on screen goes through the one offset, and the apt note covers installs too.

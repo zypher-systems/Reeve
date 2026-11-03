@@ -7,7 +7,6 @@
 //! Tiles are filled surfaces with half-block edges (half a row of padding,
 //! softened corners); with 16 colors or none they get a rounded border.
 
-use chrono::Local;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -55,7 +54,10 @@ pub fn read(home: &std::path::Path, memory: &reeve_core::memory::Memory) -> crat
     b.roles.sort_by(|a, b| b.1.total_cmp(&a.1));
     b.hours = vec![0.0; 24];
     for r in &today {
-        let h = r.ts.with_timezone(&Local).format("%H").to_string();
+        let h =
+            r.ts.with_timezone(&crate::view::offset())
+                .format("%H")
+                .to_string();
         if let Ok(h) = h.parse::<usize>() {
             b.hours[h.min(23)] += r.usd.unwrap_or(0.0);
         }
@@ -1133,7 +1135,11 @@ fn activity(r: Rect, v: &View, t: &Theme) -> Vec<Line<'static>> {
             } else {
                 Vec::new()
             };
-            let time = rc.ts.with_timezone(&Local).format("%H:%M ").to_string();
+            let time = rc
+                .ts
+                .with_timezone(&crate::view::offset())
+                .format("%H:%M ")
+                .to_string();
             let room = w.saturating_sub(6 + 2 + 2);
             split(
                 vec![
@@ -1730,6 +1736,10 @@ pub fn composer(f: &mut Frame, area: Rect, v: &View, t: &Theme) {
     let lead_w = width(&lead);
     let text_w = w.saturating_sub(lead_w).max(4);
     let right = match screen {
+        // Enter was pressed mid-turn: the text waits in the box.
+        _ if v.busy && v.busy_hinted => {
+            hints(&[("⏎", "again when Reeve is done"), ("esc", "stop")], t)
+        }
         _ if v.busy => hints(&[("esc", "stop")], t),
         Screen::Board if v.approval.is_some() => {
             hints(&[("⏎", "yes"), ("n", "no"), ("F1", "details")], t)

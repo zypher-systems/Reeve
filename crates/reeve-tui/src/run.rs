@@ -829,15 +829,7 @@ impl App {
             KeyCode::Enter if alt || shift => view.insert("\n"),
             KeyCode::Enter => {
                 if view.busy {
-                    // Nothing queues behind a running turn: say so once,
-                    // and keep what was typed.
-                    if !view.input.trim().is_empty() && !view.busy_hinted {
-                        view.busy_hinted = true;
-                        view.push(
-                            Speaker::System,
-                            "Reeve is still on the last request (esc stops it). Your text stays in the box; press enter again when it's done.",
-                        );
-                    }
+                    view.enter_while_busy();
                     return;
                 }
                 if !view.ready {

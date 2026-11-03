@@ -22,9 +22,14 @@ pub const HISTORY: usize = 240;
 /// neighbours. One offset per run keeps every clock on the screen in step
 /// (a DST change mid-session is the only thing it would miss).
 pub fn now() -> DateTime<Local> {
+    DateTime::from_naive_utc_and_offset(Utc::now().naive_utc(), offset())
+}
+
+/// The offset [`now`] uses: for showing a stored UTC time (a receipt, a
+/// spend record) in the same zone as everything else on the screen.
+pub fn offset() -> FixedOffset {
     static OFFSET: OnceLock<FixedOffset> = OnceLock::new();
-    let offset = *OFFSET.get_or_init(|| Local::now().offset().fix());
-    DateTime::from_naive_utc_and_offset(Utc::now().naive_utc(), offset)
+    *OFFSET.get_or_init(|| Local::now().offset().fix())
 }
 
 /// Who said a chat entry.
@@ -454,6 +459,15 @@ impl View {
         )
     }
 
+    /// Enter during a turn: nothing queues and the text stays. The
+    /// composer's keys say so (`busy_hinted`); the entries are left alone,
+    /// so a reply streaming in stays one entry.
+    pub fn enter_while_busy(&mut self) {
+        if !self.input.trim().is_empty() {
+            self.busy_hinted = true;
+        }
+    }
+
     /// Add a chat entry.
     pub fn push(&mut self, who: Speaker, text: impl Into<String>) {
         self.streaming = false;
@@ -855,5 +869,30 @@ mod clock_tests {
         let b = now();
         assert_eq!(a.offset(), b.offset());
         assert!((Utc::now().naive_utc() - a.naive_utc()).num_seconds().abs() <= 2);
+    }
+}
+
+#[cfg(test)]
+mod busy_hint_tests {
+    use super::*;
+
+    #[test]
+    fn enter_during_a_streamed_reply_leaves_the_reply_whole() {
+        let mut v = View::new(HostInfo::default());
+        v.busy = true;
+        v.apply(AgentEvent::Text("```sh\nprintf 'hel".into()));
+        v.input = "next question".into();
+        v.enter_while_busy();
+        v.apply(AgentEvent::Text("lo'\n```\n".into()));
+        let texts: Vec<&str> = v.entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, ["```sh\nprintf 'hello'\n```\n"]);
+        assert!(v.busy_hinted && v.input == "next question");
+        // The person's next message clears the hint.
+        v.push(Speaker::User, "next question");
+        assert!(!v.busy_hinted);
+        // An empty box has nothing waiting, so nothing to say.
+        v.input.clear();
+        v.enter_while_busy();
+        assert!(!v.busy_hinted);
     }
 }

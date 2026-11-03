@@ -325,12 +325,23 @@ impl UndoStore {
                 // A file Reeve created has nothing to restore: undo removes it.
                 let (restored, removed): (Vec<_>, Vec<_>) =
                     changes.iter().partition(|c| c.pre.is_some());
+                let files = |n: usize| {
+                    if n == 1 {
+                        "1 file".to_string()
+                    } else {
+                        format!("{n} files")
+                    }
+                };
                 let summary = match (restored.len(), removed.len()) {
                     (1, 0) => format!("restored {}", restored[0].path),
                     (0, 1) => format!("removed {} (it didn't exist before)", removed[0].path),
-                    (r, 0) => format!("restored {r} files"),
-                    (0, d) => format!("removed {d} files that didn't exist before"),
-                    (r, d) => format!("restored {r} files, removed {d} that didn't exist before"),
+                    (r, 0) => format!("restored {}", files(r)),
+                    (0, d) => format!("removed {} that didn't exist before", files(d)),
+                    (r, d) => format!(
+                        "restored {}, removed {} that didn't exist before",
+                        files(r),
+                        files(d)
+                    ),
                 };
                 Ok((Undo::Files { changes: inverse }, summary))
             }

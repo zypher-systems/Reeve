@@ -89,7 +89,7 @@ install -Dpm 0644 packaging/systemd/reeved.service %{buildroot}%{_userunitdir}/r
 %changelog
 * Mon Nov 02 2026 Zypher Systems <zypher@zyphersystems.com> - 0.9.1-1
 - The health tile's memory figures no longer run into the temperature; every TUI clock shares one offset read at start.
-- apt upgrades and removals say on their card when apt.conf empties the download cache, where an undo takes old versions from.
+- apt installs, upgrades and removals say on their card when apt.conf empties the download cache, where an undo takes what it puts back from.
 - Undoing a created file says it was removed; undo refusals lose the "io:" prefix; `command -v` is a lookup, not a run.
 - The Debian package suggests snapper and libnotify-bin instead of recommending them.
 

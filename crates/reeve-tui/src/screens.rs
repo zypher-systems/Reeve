@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Utc};
 use reeve_core::findings::{Finding, FindingStatus, Severity};
 use reeve_core::receipts::Status;
 use reeve_core::spend::{format_tokens, format_usd};
@@ -422,7 +422,9 @@ fn needs(f: &mut Frame, area: Rect, v: &View, p: &NeedsPanel, t: &Theme) {
             let sub = match &x.proposal {
                 Some(pr) => format!(
                     "drafted {}{}",
-                    pr.drafted_at.with_timezone(&Local).format("%a %H:%M"),
+                    pr.drafted_at
+                        .with_timezone(&crate::view::offset())
+                        .format("%a %H:%M"),
                     pr.usd
                         .map_or(String::new(), |u| format!(" · {}", format_usd(Some(u))))
                 ),
@@ -611,8 +613,8 @@ fn activity(f: &mut Frame, area: Rect, v: &View, p: &ReceiptsPanel, t: &Theme) {
         } else {
             " "
         };
-        let when = rc.ts.with_timezone(&Local);
-        let time = if (crate::view::now() - when).num_hours() < 20 {
+        let when = rc.ts.with_timezone(&crate::view::offset());
+        let time = if (Utc::now() - rc.ts).num_hours() < 20 {
             when.format("%H:%M").to_string()
         } else {
             when.format("%m-%d").to_string()
@@ -696,7 +698,9 @@ fn activity(f: &mut Frame, area: Rect, v: &View, p: &ReceiptsPanel, t: &Theme) {
             truncate(
                 &format!(
                     "{}{exit} · approved by {}",
-                    rc.ts.with_timezone(&Local).format("%a %d %b %H:%M:%S"),
+                    rc.ts
+                        .with_timezone(&crate::view::offset())
+                        .format("%a %d %b %H:%M:%S"),
                     rc.approved_by
                 ),
                 dw,
@@ -898,7 +902,9 @@ fn changed(f: &mut Frame, area: Rect, p: &SystemPanel, t: &Theme) {
                 Style::default().fg(t.brass),
             )],
             None => vec![Span::styled(
-                x.at.with_timezone(&Local).format("%a %H:%M").to_string(),
+                x.at.with_timezone(&crate::view::offset())
+                    .format("%a %H:%M")
+                    .to_string(),
                 t.ghost(),
             )],
         };
@@ -1128,7 +1134,7 @@ fn spend(f: &mut Frame, area: Rect, v: &View, p: &SpendPanel, t: &Theme) {
         let mut b = vec![0.0; 24];
         for r in &p.records {
             if let Ok(h) =
-                r.ts.with_timezone(&Local)
+                r.ts.with_timezone(&crate::view::offset())
                     .format("%H")
                     .to_string()
                     .parse::<usize>()
@@ -1140,7 +1146,10 @@ fn spend(f: &mut Frame, area: Rect, v: &View, p: &SpendPanel, t: &Theme) {
     } else {
         let mut days: Vec<(String, f64)> = Vec::new();
         for r in &p.records {
-            let d = r.ts.with_timezone(&Local).format("%m-%d").to_string();
+            let d =
+                r.ts.with_timezone(&crate::view::offset())
+                    .format("%m-%d")
+                    .to_string();
             match days.iter_mut().find(|x| x.0 == d) {
                 Some(x) => x.1 += r.usd.unwrap_or(0.0),
                 None => days.push((d, r.usd.unwrap_or(0.0))),
@@ -1276,7 +1285,7 @@ fn spend(f: &mut Frame, area: Rect, v: &View, p: &SpendPanel, t: &Theme) {
         running += l.usd;
         let on = i == sel;
         let bg = if on { t.input } else { t.inset };
-        let when = l.first.with_timezone(&Local);
+        let when = l.first.with_timezone(&crate::view::offset());
         let time = if p.range == crate::overlay::SpendRange::Day {
             when.format("%H:%M").to_string()
         } else {
@@ -1833,7 +1842,9 @@ fn memory(f: &mut Frame, area: Rect, p: &MemoryPanel, t: &Theme) {
                 format!(
                     "{} · {}",
                     n.source,
-                    n.observed.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+                    n.observed
+                        .with_timezone(&crate::view::offset())
+                        .format("%Y-%m-%d %H:%M")
                 ),
                 t.muted(),
             )],
@@ -2153,7 +2164,7 @@ fn system(f: &mut Frame, area: Rect, v: &View, p: &SystemPanel, t: &Theme) {
                     format!(
                         "reeved has been recording since {}; the charts start there",
                         r.chart_since
-                            .with_timezone(&Local)
+                            .with_timezone(&crate::view::offset())
                             .format("%a %-d %b %H:%M")
                     ),
                     Style::default().fg(t.faint),
